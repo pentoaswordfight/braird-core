@@ -47,15 +47,15 @@ jobs:
         with:
           node-version: '24.15.0'
 
-      # Sparse, blobless clone of surfc/main — only the two inputs the extractor reads
-      # (supabase.js for the synced column set, supabase/migrations for the types).
-      - name: Fetch surfc/main sources (sparse)
+      # Shallow clone of surfc/main — the extractor reads only src/supabase.js (the synced
+      # column set) + supabase/migrations (the types). A plain depth-1 checkout is robust;
+      # sparse cone-mode rejects a single-file path, and the repo is small enough at depth 1.
+      - name: Fetch surfc/main sources
         if: steps.guard.outputs.ready == 'true'
         run: |
-          git clone --depth 1 --filter=blob:none --sparse \
+          git clone --depth 1 \
             "https://x-access-token:${{ secrets.SURFC_READ_PAT }}@github.com/pentoaswordfight/surfc.git" \
             /tmp/surfc
-          git -C /tmp/surfc sparse-checkout set src/supabase.js supabase/migrations
 
       - name: Assert sync-schema.json has not drifted from surfc/main
         if: steps.guard.outputs.ready == 'true'
