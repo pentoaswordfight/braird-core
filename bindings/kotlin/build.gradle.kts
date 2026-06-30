@@ -20,6 +20,15 @@ kotlin {
     compilerOptions { jvmTarget = JvmTarget.JVM_17 }
 }
 
+// Keep the Java compile tasks on the same JVM target as Kotlin. Without this,
+// compileTestJava defaults to the running JDK (21 in CI) while Kotlin targets 17,
+// and Gradle fails the build on the inconsistency. 17 bytecode runs on CI's JDK 21
+// and a local JDK 26 alike, so no toolchain download is needed.
+java {
+    sourceCompatibility = JavaVersion.VERSION_17
+    targetCompatibility = JavaVersion.VERSION_17
+}
+
 // Repo root (two levels up from bindings/kotlin) and the cargo output dir.
 val repoRoot = layout.projectDirectory.dir("../..").asFile
 val cargoTargetDir = repoRoot.resolve("target/release")
