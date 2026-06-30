@@ -1,0 +1,255 @@
+[
+  {
+    "id": "mk-wrap",
+    "op": "mk-wrap",
+    "inputs": {
+      "prf": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "mk": "1111111111111111111111111111111111111111111111111111111111111111",
+      "salt": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+      "iv": "404142434445464748494a4b"
+    },
+    "expected": {
+      "wrappedKey": "MuIJQt0viDTnoRdYfXTKVBoQ+Oq/wu4XmOTv/h2fwiy08SFlqWYt99OhzsqkW0z3",
+      "iv": "QEFCQ0RFRkdISUpL",
+      "salt": "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8="
+    }
+  },
+  {
+    "id": "mk-unwrap",
+    "op": "mk-unwrap",
+    "inputs": {
+      "prf": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "blob": {
+        "wrappedKey": "MuIJQt0viDTnoRdYfXTKVBoQ+Oq/wu4XmOTv/h2fwiy08SFlqWYt99OhzsqkW0z3",
+        "iv": "QEFCQ0RFRkdISUpL",
+        "salt": "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8="
+      }
+    },
+    "expected": {
+      "mk": "1111111111111111111111111111111111111111111111111111111111111111"
+    }
+  },
+  {
+    "id": "enc-v1[0]",
+    "op": "enc-v1",
+    "inputs": {
+      "mk": "1111111111111111111111111111111111111111111111111111111111111111",
+      "iv": "505152535455565758595a5b",
+      "plaintext": ""
+    },
+    "expected": {
+      "ciphertext": "enc:v1:UFFSU1RVVldYWVpb.bZnn4jGP8jFNdLAuxaTYXw=="
+    }
+  },
+  {
+    "id": "enc-v2[0]",
+    "op": "enc-v2",
+    "inputs": {
+      "mk": "1111111111111111111111111111111111111111111111111111111111111111",
+      "iv": "505152535455565758595a5b",
+      "noteId": "note-abc-123",
+      "plaintext": ""
+    },
+    "expected": {
+      "ciphertext": "enc:v2:UFFSU1RVVldYWVpb.N2JT7iAVGyWAUjYIVtxt0w=="
+    }
+  },
+  {
+    "id": "enc-v1[1]",
+    "op": "enc-v1",
+    "inputs": {
+      "mk": "1111111111111111111111111111111111111111111111111111111111111111",
+      "iv": "505152535455565758595a5b",
+      "plaintext": "hello world"
+    },
+    "expected": {
+      "ciphertext": "enc:v1:UFFSU1RVVldYWVpb.mRsXxIYxFLVb/+jTA0hbe+2ptQs8AnKc7m7l"
+    }
+  },
+  {
+    "id": "enc-v2[1]",
+    "op": "enc-v2",
+    "inputs": {
+      "mk": "1111111111111111111111111111111111111111111111111111111111111111",
+      "iv": "505152535455565758595a5b",
+      "noteId": "note-abc-123",
+      "plaintext": "hello world"
+    },
+    "expected": {
+      "ciphertext": "enc:v2:UFFSU1RVVldYWVpb.mRsXxIYxFLVb/+iA/RefSoS/m+kfl8vwv9ag"
+    }
+  },
+  {
+    "id": "enc-v1[2]",
+    "op": "enc-v1",
+    "inputs": {
+      "mk": "1111111111111111111111111111111111111111111111111111111111111111",
+      "iv": "505152535455565758595a5b",
+      "plaintext": "café ☕ 日本語 — naïve façade 🔐"
+    },
+    "expected": {
+      "ciphertext": "enc:v1:UFFSU1RVVldYWVpb.kh8da0AxgUK8s2qVRzN52CX97FnRIsTBcBmNcDINZohA3EPYFIjgf35MlOUiAb0zDbmKHThzek/S5Ug="
+    }
+  },
+  {
+    "id": "enc-v2[2]",
+    "op": "enc-v2",
+    "inputs": {
+      "mk": "1111111111111111111111111111111111111111111111111111111111111111",
+      "iv": "505152535455565758595a5b",
+      "noteId": "note-abc-123",
+      "plaintext": "café ☕ 日本語 — naïve façade 🔐"
+    },
+    "expected": {
+      "ciphertext": "enc:v2:UFFSU1RVVldYWVpb.kh8da0AxgUK8s2qVRzN52CX97FnRIsTBcBmNcDINZohA3EPYFIjgf35MlMBHnO7JUn6oPHuyPtRG2Ts="
+    }
+  },
+  {
+    "id": "content-tag",
+    "op": "content-tag",
+    "inputs": {
+      "mk": "1111111111111111111111111111111111111111111111111111111111111111",
+      "text": "hello world",
+      "bookId": "book-1"
+    },
+    "expected": {
+      "tag": "a6632b65607c8efb959f50d9767e862fcc231fc7cb64b4519abe393a96ccbb05"
+    }
+  },
+  {
+    "id": "content-tag-norm:combining-marks",
+    "op": "content-tag",
+    "inputs": {
+      "mk": "1111111111111111111111111111111111111111111111111111111111111111",
+      "text": "crème brûlée",
+      "bookId": "book-1"
+    },
+    "expected": {
+      "tag": "2018bc099fb0def60024dc43263114b1c67e19e82341ee8d36348283488f141f"
+    }
+  },
+  {
+    "id": "content-tag-norm:fullwidth-latin",
+    "op": "content-tag",
+    "inputs": {
+      "mk": "1111111111111111111111111111111111111111111111111111111111111111",
+      "text": "Ｔｈｅ Ｅｎｄ",
+      "bookId": "book-1"
+    },
+    "expected": {
+      "tag": "ea13fe604d22d0c04ace2f57c300b055947b705fc48807397c689f8397e57676"
+    }
+  },
+  {
+    "id": "content-tag-norm:c0-control-strip",
+    "op": "content-tag",
+    "inputs": {
+      "mk": "1111111111111111111111111111111111111111111111111111111111111111",
+      "text": "hi\u0001the\u0007re\u001f\u0000",
+      "bookId": "book-1"
+    },
+    "expected": {
+      "tag": "1f0ee580bc1e1c030ae199b840bc0991f36ec5f7b4293fb5c33e58f9015861fb"
+    }
+  },
+  {
+    "id": "content-tag-norm:trailing-punct-unicode",
+    "op": "content-tag",
+    "inputs": {
+      "mk": "1111111111111111111111111111111111111111111111111111111111111111",
+      "text": "the beginning…—",
+      "bookId": "book-1"
+    },
+    "expected": {
+      "tag": "fe02ba18996e0ed6cae1a2a8aeddd548b1d27e0b019f9bd58f3ff4faa4594862"
+    }
+  },
+  {
+    "id": "content-tag-norm:trailing-punct-fullwidth",
+    "op": "content-tag",
+    "inputs": {
+      "mk": "1111111111111111111111111111111111111111111111111111111111111111",
+      "text": "questions。？",
+      "bookId": "book-1"
+    },
+    "expected": {
+      "tag": "4e123935fa0c1fe7db9b222024437e502ffe1a13a46837aaf6ac7b99079bc5ba"
+    }
+  },
+  {
+    "id": "content-tag-norm:whitespace-collapse",
+    "op": "content-tag",
+    "inputs": {
+      "mk": "1111111111111111111111111111111111111111111111111111111111111111",
+      "text": "  hello\t\tworld\n\n  foo  ",
+      "bookId": "book-1"
+    },
+    "expected": {
+      "tag": "8132bdf26dc94f51e959620a572ad2978d045d2701ec7362cd7183fa7aa8ad8c"
+    }
+  },
+  {
+    "id": "content-tag-norm:mixed",
+    "op": "content-tag",
+    "inputs": {
+      "mk": "1111111111111111111111111111111111111111111111111111111111111111",
+      "text": "  Ｃafé\tDELUXE…  ",
+      "bookId": "book-1"
+    },
+    "expected": {
+      "tag": "6cc2da5fdf2c320b3730da8bfc8dc4fc6471e60a47780f1b72d18a035fead48f"
+    }
+  },
+  {
+    "id": "content-tag-norm:final-sigma",
+    "op": "content-tag",
+    "inputs": {
+      "mk": "1111111111111111111111111111111111111111111111111111111111111111",
+      "text": "ΟΔΥΣΣΕΥΣ",
+      "bookId": "book-1"
+    },
+    "expected": {
+      "tag": "6156022a6e4877b271be997fdd4244d4c47da888c11151edee46399632d39133"
+    }
+  },
+  {
+    "id": "content-tag-norm:german-eszett",
+    "op": "content-tag",
+    "inputs": {
+      "mk": "1111111111111111111111111111111111111111111111111111111111111111",
+      "text": "GRÜẞE ß",
+      "bookId": "book-1"
+    },
+    "expected": {
+      "tag": "b749eb87550c1457114323001d1e95944c70286fc6670b4cc3f4d50dad59208f"
+    }
+  },
+  {
+    "id": "pin-transfer",
+    "op": "pin-transfer",
+    "inputs": {
+      "mk": "1111111111111111111111111111111111111111111111111111111111111111",
+      "pin": "314159",
+      "salt": "606162636465666768696a6b6c6d6e6f",
+      "iv": "404142434445464748494a4b",
+      "iterations": 600000
+    },
+    "expected": {
+      "wrappedKey": "H4mRTOHhkD+BxI9vgBQQRyePo70muf5q1nmrEhg5MuWDk5vW5Qxv6EXC1PDLFLYF",
+      "iv": "QEFCQ0RFRkdISUpL",
+      "salt": "YGFiY2RlZmdoaWprbG1ubw=="
+    }
+  },
+  {
+    "id": "legacy-note",
+    "op": "legacy-note",
+    "inputs": {
+      "prf": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "iv": "505152535455565758595a5b",
+      "plaintext": "hello world"
+    },
+    "expected": {
+      "ciphertext": "enc:v1:UFFSU1RVVldYWVpb.Yjst92ViIQ8I7l45WtBNpafvlzx0jyFfat1R"
+    }
+  }
+]
