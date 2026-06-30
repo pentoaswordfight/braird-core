@@ -3,7 +3,9 @@
 //! this is its native counterpart, so PWA↔native coexistence round-trips every synced row.
 //!
 //! Source of truth (founder, SUR-723 Gate-1 remediation):
-//!   - the synced COLUMN SET is what `surfc/src/supabase.js` `upsert*`/`fetchSince` move;
+//!   - the synced COLUMN SET is what `surfc/src/supabase.js` `upsert*` payloads carry (the
+//!     authority — `fetchSince` does `select('*')`, so it pulls every column but does not
+//!     enumerate the set; a future server-stamped pull-only column is a SUR-725 concern);
 //!   - logical TYPES come from the Supabase migrations;
 //!   - both are captured in the vendored `vendored/schema/sync-schema.json` fixture, which
 //!     [`synced_schema`] mirrors exactly and `tests/schema_parity.rs` reconciles against
@@ -54,6 +56,10 @@ impl ColType {
 /// A synced table's shape: its name, primary-key column(s), and ordered `(column, type)` set.
 pub struct TableSchema {
     pub name: &'static str,
+    /// Primary key. Hand-maintained and verified against the migrations; NOT covered by the
+    /// drift guard (the fixture carries columns/types only). A surfc PK change won't be
+    /// flagged here — acceptable, since a PK change on these tables is a breaking cloud
+    /// migration. Revisit (encode PK in the fixture) if that assumption ever weakens.
     pub pk: &'static [&'static str],
     pub columns: &'static [(&'static str, ColType)],
 }

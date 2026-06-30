@@ -2,7 +2,7 @@ name: Synced-schema drift check
 
 # SUR-723 §7. Fails the build if the vendored synced-schema fixture diverges from
 # surfc/main — i.e. if a synced column was added, removed, or retyped in surfc's
-# `supabase.js` upsert*/fetchSince (the synced set) or its migrations (the types)
+# `supabase.js` upsert* payloads (the synced set) or its migrations (the types)
 # without the native SQLite mirror being re-vendored. This is the silent-desync guard:
 # without it, a new synced column (the `content_tag`/SUR-638 case) would round-trip in
 # the PWA but be dropped on native, undetectably.
@@ -16,13 +16,22 @@ name: Synced-schema drift check
 # Requires the SURFC_READ_PAT secret (cross-repo read-only PAT).
 
 on:
+  # Per-PR (SUR-723 Gate-2 remediation): re-derive the fixture from surfc/main on every PR
+  # to main — so a PR that edits the mirror (src/store.rs) WITHOUT touching the fixture is
+  # still cross-checked, and the "per-PR" guarantee is real. Cheap (clone + node ~10s).
+  pull_request:
+    branches: [main]
+  # On push to the guarded paths (a fixture / script / workflow change on any branch).
   push:
     paths:
       - 'vendored/schema/**'
       - 'scripts/extract-sync-schema.mjs'
       - '.github/workflows/schema-drift.yml'
+  # Weekly: the only trigger that catches surfc-side drift when NO PR here touches anything
+  # (surfc adds a synced column while this repo is static) — the cross-repo case a per-PR
+  # trigger alone cannot see.
   schedule:
-    - cron: '0 9 * * 1' # weekly Monday 09:00 UTC (with the crypto drift check)
+    - cron: '0 9 * * 1' # Monday 09:00 UTC (with the crypto drift check)
   workflow_dispatch:
 
 jobs:

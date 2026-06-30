@@ -1,7 +1,8 @@
 //! Schema-drift parity (SUR-723 §7): the native SQLite mirror's synced
 //! `(column, logical-type)` set must equal the vendored `sync-schema.json` — which is
-//! derived from `surfc/main`'s `supabase.js` `upsert*`/`fetchSince` (the synced column
-//! set) + the migrations (logical types) by `scripts/extract-sync-schema.mjs`.
+//! derived from `surfc/main`'s `supabase.js` `upsert*` payloads (the synced column set;
+//! `fetchSince` is `select('*')` and does not enumerate it) + the migrations (logical
+//! types) by `scripts/extract-sync-schema.mjs`.
 //!
 //! Two guards close the loop:
 //!   - the core descriptor [`synced_schema`] matches the vendored fixture (here), and
