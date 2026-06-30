@@ -1,6 +1,6 @@
 # ADR 0002 — Crypto backend: RustCrypto (pure Rust)
 
-- **Status:** Proposed (crypto-reviewer + founder sign-off pending — SUR-716 gate)
+- **Status:** Accepted (crypto-reviewer + founder sign-off, 2026-06-30 — SUR-716 gate)
 - **Date:** 2026-06-30
 - **Context tickets:** SUR-716 (Phase 1 impl), implements ADR 0001 (Rust+UniFFI, surfc#331)
 - **Supersedes / superseded by:** none

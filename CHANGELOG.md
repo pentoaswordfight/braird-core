@@ -6,6 +6,9 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+### Changed
+- ADR 0002 (crypto backend: RustCrypto over ring/aws-lc-rs) accepted — crypto-reviewer + founder sign-off (SUR-716 gate).
+
 ### Added
 - Repository scaffolding: `GATING.md` (all-spine GCE policy), `CLAUDE.md` (agent context),
   `README.md`, and CI workflows (`parity`, `vendored-drift`, `changelog-check`,
