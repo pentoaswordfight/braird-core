@@ -32,7 +32,10 @@ java {
 // Repo root (two levels up from bindings/kotlin) and the cargo output dir.
 val repoRoot = layout.projectDirectory.dir("../..").asFile
 val cargoTargetDir = repoRoot.resolve("target/release")
-val generatedDir = layout.buildDirectory.dir("generated/uniffi")
+// Generate the binding straight into the conventional main source root so it is always
+// on compileKotlin's source set (a build/generated srcDir registered NO-SOURCE). The
+// generated `uniffi/` subtree is gitignored.
+val generatedSrcDir = layout.projectDirectory.dir("src/main/kotlin").asFile
 
 val nativeLibName =
     if (System.getProperty("os.name").startsWith("Mac")) "libbraird_core.dylib" else "libbraird_core.so"
@@ -45,17 +48,15 @@ val cargoBuild by tasks.registering(Exec::class) {
 val uniffiBindgen by tasks.registering(Exec::class) {
     dependsOn(cargoBuild)
     workingDir = repoRoot
-    doFirst { generatedDir.get().asFile.mkdirs() }
+    doFirst { generatedSrcDir.mkdirs() }
     commandLine(
         "cargo", "run", "--quiet", "--bin", "uniffi-bindgen", "--",
         "generate",
         "--library", "target/release/$nativeLibName",
         "--language", "kotlin",
-        "--out-dir", generatedDir.get().asFile.absolutePath,
+        "--out-dir", generatedSrcDir.absolutePath,
     )
 }
-
-sourceSets.main { kotlin.srcDir(generatedDir) }
 
 tasks.named("compileKotlin") { dependsOn(uniffiBindgen) }
 
