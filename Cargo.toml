@@ -1,0 +1,64 @@
+# braird-core — shared Rust + UniFFI crypto core (Braird).
+#
+# Mirrors surfc/src/crypto/* + src/lib/text.js (normalizeForTag) byte-for-byte; the
+# JS WebCrypto implementation is the source of truth and the frozen
+# vendored/crypto-parity vectors are the contract.
+#
+# Frozen protocol constants are verbatim (SUR-680 allowlist): the `surfc-*` HKDF info
+# strings and the 600 000 PBKDF2 count are wire-format, not branding.
+[package]
+name = "braird-core"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "UNLICENSED"
+description = "Shared Rust+UniFFI crypto core (Braird)"
+
+[lib]
+name = "braird_core"
+# cdylib/staticlib → the UniFFI native bindings; lib (rlib) → the bindgen bin,
+# integration tests, and the wasm build.
+crate-type = ["cdylib", "staticlib", "lib"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+
+[features]
+# Determinism + raw-MK seams used ONLY by the parity harness. Built OFF for the
+# production cdylib/bindings so the with-raw-MK constructor, the fixed-salt/IV
+# overrides, and the raw-MK readback are ABSENT from the public binding
+# (naming-reviewer / crypto-reviewer BLOCKER: a public fixed-IV path is a
+# catastrophic GCM nonce-reuse footgun). `cargo test --all-features` turns it on.
+test-seams = []
+
+[dependencies]
+uniffi = { version = "0.28", features = ["cli"] }
+aes-gcm = "0.10"
+hkdf = "0.12"
+hmac = "0.12"
+sha2 = "0.10"
+pbkdf2 = "0.12"
+base64 = "0.22"
+hex = "0.4"
+zeroize = { version = "1", features = ["zeroize_derive"] }
+# NFKC + str::to_lowercase via std → Unicode 17.0, matching the V8/Node parity anchor.
+unicode-normalization = "0.1"
+# General_Category tables for \p{P} / \p{Zs} (real tables, not hand-coded ranges).
+# 1.1.0 is Unicode 16.0 — the one residual skew vs the 17.0 anchor; see src/normalize.rs.
+unicode-general-category = "1.1"
+thiserror = "1"
+getrandom = "0.2"
+
+# WASM (PWA service worker) sources randomness from the browser CSPRNG via getrandom's
+# `js` feature — covers the SUR-716 "WASM CSPRNG sourcing" reviewer condition.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+
+[dev-dependencies]
+serde_json = "1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
