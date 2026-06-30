@@ -1,0 +1,19 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock.orig
+
+# UniFFI / bindings build output
+/bindings/**/build
+/bindings/**/.gradle
+*.xcframework
+/out
+
+# Secrets — never commit
+.env
+.env.*
+!.env.example
+
+# OS / editor
+.DS_Store
+*.swp

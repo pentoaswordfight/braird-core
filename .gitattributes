@@ -1,0 +1,8 @@
+# Keep LF in the repo for everything text, regardless of contributor OS.
+* text=auto eol=lf
+
+# Shell scripts and CI YAML MUST be LF — CRLF breaks them in Linux/macOS runners.
+*.sh   text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.rs   text eol=lf

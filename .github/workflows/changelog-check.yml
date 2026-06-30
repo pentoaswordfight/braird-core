@@ -1,0 +1,44 @@
+name: Changelog Check
+
+# Enforces that every PR touching main includes a CHANGELOG.md entry.
+# The diff is computed against the merge-base of origin/main and HEAD so
+# force-pushes and rebases do not produce false negatives.
+#
+# Dependabot PRs are exempted: automated dependency bumps do not warrant a
+# changelog entry and would otherwise require a human workaround on every
+# dependabot run.
+#
+# Cloned from surfc/.github/workflows/changelog-check.yml.
+
+on:
+  pull_request:
+    branches:
+      - main
+    types:
+      - opened
+      - synchronize
+      - reopened
+
+jobs:
+  changelog-check:
+    name: CHANGELOG.md updated
+    runs-on: ubuntu-latest
+    if: github.actor != 'dependabot[bot]'
+
+    steps:
+      - name: Checkout repo (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check that CHANGELOG.md was updated
+        run: |
+          changed=$(git diff --name-only origin/main...HEAD)
+          echo "Files changed in this PR:"
+          echo "$changed"
+          if echo "$changed" | grep -q "^CHANGELOG\.md$"; then
+            echo "CHANGELOG.md is present in the diff — check passed."
+          else
+            echo "::error file=CHANGELOG.md::CHANGELOG.md was not updated in this PR. Add an entry under the [Unreleased] section at the top of CHANGELOG.md describing what changed and why. See https://keepachangelog.com for the expected format."
+            exit 1
+          fi

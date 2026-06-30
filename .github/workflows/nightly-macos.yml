@@ -1,0 +1,57 @@
+name: Nightly macOS (iOS bindings)
+
+# The ONLY Mac-gated leg. The crypto is gated per-PR on Linux (parity.yml); this
+# job covers what only macOS can build: the UniFFI Swift binding compiles, the
+# BrairdCore.xcframework packages, and the Swift round-trip passes through the FFI.
+# That is a packaging surface, not a crypto surface.
+#
+# macOS runners carry a 10x minute multiplier, so this runs nightly by default.
+# A PR that changes the binding surface can opt into an on-demand run by adding the
+# `touches-ffi` label, or via workflow_dispatch.
+
+on:
+  schedule:
+    - cron: '0 6 * * *'   # nightly 06:00 UTC
+  workflow_dispatch:
+  pull_request:
+    types: [labeled, synchronize]
+
+jobs:
+  ios:
+    name: Swift round-trip + xcframework
+    runs-on: macos-14
+    # Run on schedule / manual dispatch always; on PRs only when labelled touches-ffi.
+    if: >-
+      github.event_name != 'pull_request' ||
+      contains(github.event.pull_request.labels.*.name, 'touches-ffi')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Guard — skip until the crate exists
+        id: guard
+        run: |
+          if [ -f Cargo.toml ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "No Cargo.toml yet — scaffolding only, skipping the iOS build."
+          fi
+
+      - name: Install Rust toolchain (iOS targets)
+        if: steps.guard.outputs.ready == 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+
+      - name: Cache cargo
+        if: steps.guard.outputs.ready == 'true'
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build BrairdCore.xcframework
+        if: steps.guard.outputs.ready == 'true'
+        run: scripts/build-xcframework.sh
+
+      - name: Swift round-trip (FFI over the parity vectors)
+        if: steps.guard.outputs.ready == 'true'
+        working-directory: bindings/swift
+        run: swift test

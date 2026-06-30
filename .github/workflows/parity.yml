@@ -1,0 +1,97 @@
+name: Parity
+
+# Per-PR crypto-parity gate (Linux). The core is one Rust crate; Swift/Kotlin are
+# generated bindings over it, so ALL crypto parity is gated here per-PR — a PR
+# cannot merge crypto-broken. Only the iOS *packaging* leg is deferred to nightly
+# (see nightly-macos.yml).
+#
+# Path-filtered to crypto-relevant files AND guarded on the presence of Cargo.toml,
+# so the repo's scaffolding-only bootstrap commit (docs + workflows) stays green
+# until the crate lands.
+
+on:
+  push:
+    branches: [main]
+    paths: ['Cargo.toml', 'Cargo.lock', 'build.rs', 'src/**', 'tests/**', 'vendored/**', '**/*.udl']
+  pull_request:
+    branches: [main]
+    paths: ['Cargo.toml', 'Cargo.lock', 'build.rs', 'src/**', 'tests/**', 'vendored/**', '**/*.udl']
+  workflow_dispatch:
+
+jobs:
+  parity:
+    name: cargo test + clippy + wasm + normalization fuzz
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Guard — skip until the crate exists
+        id: guard
+        run: |
+          if [ -f Cargo.toml ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "No Cargo.toml yet — scaffolding only, skipping the parity build."
+          fi
+
+      - name: Install Rust toolchain
+        if: steps.guard.outputs.ready == 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo
+        if: steps.guard.outputs.ready == 'true'
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        if: steps.guard.outputs.ready == 'true'
+        run: cargo fmt --all --check
+
+      - name: Clippy (warnings = errors)
+        if: steps.guard.outputs.ready == 'true'
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Parity tests (10 in-scope + normalization vectors, foreign-decrypt, rewrap, seal)
+        if: steps.guard.outputs.ready == 'true'
+        run: cargo test --all-features
+
+      - name: WASM build check (CSPRNG via getrandom `js`)
+        if: steps.guard.outputs.ready == 'true'
+        run: cargo build --target wasm32-unknown-unknown
+
+  kotlin-roundtrip:
+    name: Kotlin/JVM round-trip
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Guard — skip until the bindings exist
+        id: guard
+        run: |
+          if [ -d bindings/kotlin ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "No bindings/kotlin yet — skipping the Kotlin round-trip."
+          fi
+
+      # JVM is cross-platform, so Android-binding parity runs per-PR here on Linux —
+      # it does NOT wait for the nightly macOS job. Steps activate once bindings land.
+      - name: Set up JDK
+        if: steps.guard.outputs.ready == 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Install Rust toolchain
+        if: steps.guard.outputs.ready == 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Kotlin/JVM round-trip (uniffi bindings over the same vectors)
+        if: steps.guard.outputs.ready == 'true'
+        working-directory: bindings/kotlin
+        run: ./gradlew test --no-daemon

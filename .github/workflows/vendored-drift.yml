@@ -1,0 +1,59 @@
+name: Vendored parity-vector drift check
+
+# Fails the build if the parity vectors vendored here diverge from surfc/main.
+# The core must reproduce surfc's frozen vectors bit-identically, so the vectors
+# are the single source of truth and live in surfc; this repo vendors a copy and
+# this gate proves the copy has not drifted.
+#
+# Cloned from surfc-evals/.github/workflows/prompt-drift.yml (the proven pattern).
+# Requires the SURFC_READ_PAT secret (cross-repo read-only PAT).
+
+on:
+  push:
+    paths:
+      - 'vendored/**'
+  schedule:
+    - cron: '0 9 * * 1'   # weekly Monday 09:00 UTC
+  workflow_dispatch:
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Guard — skip until the vectors are vendored
+        id: guard
+        run: |
+          if [ -f vendored/crypto-parity/vectors.json ] && [ -f vendored/crypto-parity/inputs.json ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "No vendored/crypto-parity vectors yet — nothing to drift-check."
+          fi
+
+      - name: Fetch source-of-truth from surfc/main
+        if: steps.guard.outputs.ready == 'true'
+        run: |
+          for f in inputs.json vectors.json; do
+            curl -fsSL \
+              -H "Authorization: token ${{ secrets.SURFC_READ_PAT }}" \
+              "https://raw.githubusercontent.com/pentoaswordfight/surfc/main/test/fixtures/crypto-parity/${f}" \
+              -o "/tmp/${f}"
+          done
+
+      - name: Assert vectors.json has not drifted
+        if: steps.guard.outputs.ready == 'true'
+        run: |
+          diff vendored/crypto-parity/vectors.json /tmp/vectors.json || {
+            echo "::error::vendored/crypto-parity/vectors.json has drifted from surfc/main — re-vendor the fixture"
+            exit 1
+          }
+
+      - name: Assert inputs.json has not drifted
+        if: steps.guard.outputs.ready == 'true'
+        run: |
+          diff vendored/crypto-parity/inputs.json /tmp/inputs.json || {
+            echo "::error::vendored/crypto-parity/inputs.json has drifted from surfc/main — re-vendor the fixture"
+            exit 1
+          }

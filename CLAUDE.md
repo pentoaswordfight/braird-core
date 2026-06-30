@@ -1,0 +1,99 @@
+# CLAUDE.md — braird-core
+
+Agent context for **braird-core** — the shared Rust + UniFFI cryptographic core for
+Braird's native iOS/Android clients and the PWA's WASM build. Read this and
+[`GATING.md`](GATING.md) before changing anything.
+
+## What this repo is
+
+One Rust crate that owns Braird's end-to-end-encryption primitives, exposed over UniFFI as
+a stateful `Vault` handle to Swift (iOS) and Kotlin (Android), and compiled to WASM for the
+PWA's MV3 service worker. It is the single implementation of the crypto that every Braird
+client shares.
+
+**The contract is byte-for-byte parity with the surfc PWA.** This core mirrors
+`surfc/src/crypto/*` and `surfc/src/lib/text.js` (`normalizeForTag`). A note encrypted by
+the PWA must decrypt on native (and vice-versa) — *PWA↔native coexistence*. A core that
+passes its own round-trip but diverges by one byte silently locks users out of their notes.
+That is why parity vectors, not functional tests, are the real gate.
+
+- **Source of truth (mirror, don't reinvent):**
+  `surfc/src/crypto/{keyManager,noteEncryption,contentTag,deviceTransfer,byteEncryption}.js`
+  + `surfc/src/lib/text.js` (`normalizeForTag`).
+- **Parity oracle:** `surfc/test/fixtures/crypto-parity/{inputs,vectors}.json`, vendored
+  here under `vendored/crypto-parity/` and drift-guarded against `surfc/main`.
+- **Decision record:** ADR 0001 (Rust+UniFFI, in `surfc/docs/architecture/`, surfc#331);
+  ADR 0002 here records the crypto backend (RustCrypto).
+
+## Crypto rules — always follow these
+
+- **Mirror the constants verbatim.** HKDF info strings `surfc-master-key-wrap-v1` and
+  `surfc-content-tag-v1`; PBKDF2 = **600 000** iters; **standard** base64 (not URL-safe);
+  12-byte IV; 32-byte MK; `enc:v1` (no AAD) / `enc:v2` (AAD = UTF-8 noteId); the embedding
+  seal's `0x02` header (AAD = noteId). These are wire-format protocol constants, not
+  branding — they stay `surfc-*` despite the Braird rename (SUR-680 allowlist).
+- **The content-tag HMAC subkey is 64 bytes, not 32.** WebCrypto's `deriveKey` with no
+  `length` defaults the HMAC key to the SHA-256 block size (64). A 32-byte port produces a
+  wrong-but-plausible tag. The known-answer vector locks this.
+- **`normalizeForTag` order is load-bearing:** NFKC → lowercase → collapse `\s+`→`' '` →
+  strip `\p{Cc}` → trim → strip trailing `\p{P}+` → trim. Use **real Unicode-property
+  tables** pinned to the V8 Unicode version of the oracle (see `docs/adr/` / `vendored/`),
+  not hand-coded ranges. This is the highest residual parity risk — see the differential
+  fuzz in CI.
+- **The MK never crosses the FFI as raw bytes.** The `Vault` owns it as `Zeroizing<[u8;32]>`;
+  hosts call `vault.encrypt_note(...)` etc. Never return raw key bytes, never log them,
+  zeroize after use.
+- **Test seams stay out of the public binding.** `with_raw_mk` and any `wrap_with_prf`
+  IV/salt override are `#[cfg(test)]` / `__test`-gated. Production generates salt/IV
+  internally. A leaked override = GCM nonce-reuse footgun = `crypto-reviewer` BLOCKER.
+- **`legacy-note` (`surfc-note-encryption-v1`) is out of scope** — the core neither produces
+  nor decrypts it (10 of 11 vectors). It stays a JS-only regression in surfc.
+
+## Layout (as it lands)
+
+- `src/` — the crate: `key_manager`, `note_encryption`, `content_tag`, `normalize`,
+  `byte_encryption`, `vault` (the FFI handle), `lib.rs` (UniFFI scaffolding).
+- `*.udl` or `#[uniffi::export]` — the public binding surface.
+- `tests/parity.rs` — the Rust parity harness (mirrors surfc's `crypto-parity.test.js`).
+- `bindings/{swift,kotlin}/` — generated bindings + round-trip tests; `BrairdCore.xcframework`.
+- `vendored/crypto-parity/` — parity vectors vendored from `surfc/main`, drift-guarded.
+- `docs/adr/` — architecture decision records.
+- `.github/workflows/` — `parity.yml` (per-PR Linux + WASM + fuzz), `vendored-drift.yml`,
+  `changelog-check.yml`, `nightly-macos.yml` (iOS Swift + xcframework).
+
+## Toolchain & commands (develop on macOS)
+
+The full toolchain runs on **macOS** (founder decision — Swift/Kotlin/iOS can't build on the
+Windows dev box). The surfc-side vector leg + drafting are Windows-safe.
+
+```bash
+cargo test                         # parity harness (10 + normalization vectors, foreign-decrypt, rewrap, seal)
+cargo build --target wasm32-unknown-unknown   # WASM build (getrandom `js` feature for MV3)
+cargo run --bin uniffi-bindgen ... # generate Swift + Kotlin bindings
+./gradlew test                     # Kotlin/JVM round-trip
+swift test                         # Swift round-trip
+scripts/build-xcframework.sh       # → BrairdCore.xcframework
+```
+
+CI: per-PR parity + Kotlin/JVM + WASM on Linux; iOS Swift + xcframework **nightly** on
+macOS (10× minute multiplier; opt a binding-surface PR in via the `touches-ffi` label or
+`workflow_dispatch`).
+
+## Gating
+
+This repo is **all spine — GCE**. Before proposing any change, read
+[`GATING.md`](GATING.md). The gate: parity green + vendored-drift green + `crypto-reviewer`
+(+ `naming-reviewer` for binding changes) pass + founder sign-off + `CHANGELOG.md`
+`[Unreleased]` entry. You are an **agent under the gate**, not autonomous — write your plan,
+name the persona(s), propose changes. **Do not merge.**
+
+## Workflow
+
+- **No stacked PRs.** Branch every change off `origin/main`
+  (`git checkout -b feature/short-desc origin/main`), never off another feature branch;
+  every PR's base is `main`. If a branch needs `main` merged in, **STOP and flag the
+  founder** — do not rebase/merge `main` yourself.
+- Conventional Commits; reference the `SUR-XXX` ticket where relevant.
+- Never commit `.env`, the `SURFC_READ_PAT`, or any credential. CI references secrets by
+  name only.
+- After merge, the parity contract is the regression net — keep it green.
