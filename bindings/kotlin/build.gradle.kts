@@ -1,8 +1,16 @@
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
-// Kotlin/JVM round-trip over the UniFFI bindings. This build is self-contained for CI:
-// it compiles the Rust cdylib and regenerates the Kotlin binding (Rust is on PATH in
-// the parity workflow), then runs the JNA-backed test against the vendored vectors.
+// Kotlin/JVM round-trip over the UniFFI binding. The generated binding
+// (src/main/kotlin/uniffi/braird_core/braird_core.kt) is COMMITTED — wiring a
+// generate-into-srcDir task proved unreliable (compileKotlin snapshotted the source
+// before the task populated it → NO-SOURCE). CI builds the cdylib and runs the
+// JNA-backed test against it; UniFFI's runtime checksum guard fails loudly if the
+// committed binding and the freshly-built lib ever diverge.
+//
+// Regenerate after any crate FFI change:
+//   cargo build --release && cargo run --bin uniffi-bindgen -- generate \
+//     --library target/release/libbraird_core.<dylib|so> --language kotlin \
+//     --out-dir bindings/kotlin/src/main/kotlin
 plugins {
     kotlin("jvm") version "2.4.0"
 }
@@ -29,40 +37,18 @@ java {
     targetCompatibility = JavaVersion.VERSION_17
 }
 
-// Repo root (two levels up from bindings/kotlin) and the cargo output dir.
 val repoRoot = layout.projectDirectory.dir("../..").asFile
 val cargoTargetDir = repoRoot.resolve("target/release")
-// Generate the binding straight into the conventional main source root so it is always
-// on compileKotlin's source set (a build/generated srcDir registered NO-SOURCE). The
-// generated `uniffi/` subtree is gitignored.
-val generatedSrcDir = layout.projectDirectory.dir("src/main/kotlin").asFile
 
-val nativeLibName =
-    if (System.getProperty("os.name").startsWith("Mac")) "libbraird_core.dylib" else "libbraird_core.so"
-
+// Build the cdylib that JNA loads at test time (libbraird_core.{so,dylib}).
 val cargoBuild by tasks.registering(Exec::class) {
     workingDir = repoRoot
     commandLine("cargo", "build", "--release")
 }
 
-val uniffiBindgen by tasks.registering(Exec::class) {
-    dependsOn(cargoBuild)
-    workingDir = repoRoot
-    doFirst { generatedSrcDir.mkdirs() }
-    commandLine(
-        "cargo", "run", "--quiet", "--bin", "uniffi-bindgen", "--",
-        "generate",
-        "--library", "target/release/$nativeLibName",
-        "--language", "kotlin",
-        "--out-dir", generatedSrcDir.absolutePath,
-    )
-}
-
-tasks.named("compileKotlin") { dependsOn(uniffiBindgen) }
-
 tasks.test {
     dependsOn(cargoBuild)
     useJUnitPlatform()
-    // JNA resolves the `braird_core` component to libbraird_core.{dylib,so} here.
+    // JNA resolves the `braird_core` component to libbraird_core.{so,dylib} here.
     systemProperty("jna.library.path", cargoTargetDir.absolutePath)
 }
