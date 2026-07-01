@@ -7,6 +7,12 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 ## [Unreleased]
 
 ### Changed
+- **GATING.md §3.1 row order (SUR-724).** Reordered so the specific rows (sync engine,
+  bindings, crypto-parity) precede the general `src/**` catch-all, and added `src/http.rs`
+  to the sync row. The line's classifier (`gce/src/classify-paths.ts`) is **first-match**, so
+  `src/**` listed first shadowed the sync/binding rows and silently dropped `sync-reviewer` /
+  `naming-reviewer` from persona selection. Prose replaced the "overlay" workaround with the
+  ordering rule.
 - **GATING.md restructured for the GCE line (SUR-728).** Moved the path→pattern→gate table
   from §2 to **§3** with the canonical four columns (Path · Pattern · Primary gate · Fallback
   gate), so the line's classifier `gce/src/read-gating.ts` — which parses §3 **only** — reads

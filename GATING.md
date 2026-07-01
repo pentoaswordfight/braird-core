@@ -63,10 +63,10 @@ repo by name (`shared/personas/<name>.md`).
 
 | Path | Pattern | Primary gate | Fallback gate (until primary exists) |
 |---|---|---|---|
-| `src/**`, `tests/**`, `Cargo.toml`, `Cargo.lock` — the crate, every line of crypto, and the parity harness (`tests/parity.rs`; a harness that lies is worse than none) | **GCE only** | Parity eval green — the 10 in-scope + the normalization vectors **bit-identical**, foreign-ciphertext decrypt passes — + founder sign-off | Founder sign-off after a `crypto-reviewer` pass + a manual round-trip against a real `surfc`-written ciphertext |
-| The **sync engine + local store** (Phase 2, SUR-659) — `src/store.rs`, `src/sync/**`, `src/outbox.rs`, `vendored/schema/**`, `scripts/extract-sync-schema.mjs` | **GCE only** | Schema-drift guard green — `vendored/schema/**` reconciles against `surfc/main`'s synced schema (`tests/schema_parity.rs` + `.github/workflows/schema-drift.yml`) — + founder sign-off | Founder sign-off after `sync-reviewer` (engine, PWA↔native coexistence, schema drift) **+** `crypto-reviewer` (the seal-at-flush boundary — note text must never leave unencrypted, SUR-724) pass |
+| The **sync engine + local store** (Phase 2, SUR-659) — `src/store.rs`, `src/sync/**`, `src/outbox.rs`, `src/http.rs`, `vendored/schema/**`, `scripts/extract-sync-schema.mjs` | **GCE only** | Schema-drift guard green — `vendored/schema/**` reconciles against `surfc/main`'s synced schema (`tests/schema_parity.rs` + `.github/workflows/schema-drift.yml`) — + founder sign-off | Founder sign-off after `sync-reviewer` (engine, PWA↔native coexistence, schema drift) **+** `crypto-reviewer` (the seal-at-flush boundary — note text must never leave unencrypted, SUR-724) pass |
 | `bindings/**`, `src/bin/uniffi-bindgen.rs` — the generated Swift/Kotlin surface + its round-trip tests (the public API devs consume) | **GCE only** | Swift **and** Kotlin round-trip parity green + founder sign-off | Founder sign-off after `naming-reviewer` (the API *word*) **+** `crypto-reviewer` (the seam) pass |
 | `vendored/crypto-parity/**` — the crypto parity vectors vendored from `surfc/main` | **GCE only** | Vendored-drift guard green — byte-identical to `surfc/main` (§4) — + founder sign-off | `crypto-reviewer` confirms the vectors against `surfc/main` |
+| `src/**`, `tests/**`, `Cargo.toml`, `Cargo.lock` — the crate, every line of crypto, and the parity harness (`tests/parity.rs`; a harness that lies is worse than none). **Catch-all — kept LAST so the specific rows above win first-match** | **GCE only** | Parity eval green — the 10 in-scope + the normalization vectors **bit-identical**, foreign-ciphertext decrypt passes — + founder sign-off | Founder sign-off after a `crypto-reviewer` pass + a manual round-trip against a real `surfc`-written ciphertext |
 
 ### 3.2 Meta / docs / CI paths
 
@@ -76,14 +76,19 @@ repo by name (`shared/personas/<name>.md`).
 | `.github/workflows/**` — the parity / vendored-drift / schema-drift / changelog / nightly gates themselves | **GCE only** | Founder sign-off — these set the rules | — |
 | `GATING.md` (this file), `CLAUDE.md`, `README.md`, `CHANGELOG.md` | **GCE only** | Founder sign-off | — |
 
-**Reviewer overlays the path globs can't isolate.** The `src/**` row is the most general,
-so the line's classifier (first-match) attributes a change under `src/` to it. Two surfaces
-inside `src/` need an **extra** reviewer that path-globbing can't separate out, so treat them
-as overlays on top of `crypto-reviewer`:
-- a change to `src/store.rs` / `src/sync/**` / `src/outbox.rs` (or the schema fixture) pulls
-  in **`sync-reviewer`** (the sync/store row);
-- a change to an exported **type / method / error name** in a `#[uniffi::export]` item
-  (chiefly `src/vault.rs`, `src/lib.rs` — this crate has no `.udl`) pulls in **`naming-reviewer`**.
+**Row order matters — specific rows precede the general `src/**` catch-all.** The line's
+classifier (`gce/src/classify-paths.ts`) is **first-match**: it attributes each touched path
+to the *first* §3 row whose globs match, and stops. So the specific surfaces inside `src/`
+are listed **above** the `src/**` row, and first-match isolates them correctly:
+- `src/store.rs` / `src/sync/**` / `src/outbox.rs` / `src/http.rs` (or the schema fixture)
+  → the sync/store row → **`sync-reviewer`** (its gate also names `crypto-reviewer`);
+- an exported **type / method / error name** in a `#[uniffi::export]` item (chiefly
+  `src/vault.rs`, `src/lib.rs` — this crate has no `.udl`) lands in `bindings/**` /
+  `src/bin/uniffi-bindgen.rs` → the binding row → **`naming-reviewer`** + `crypto-reviewer`.
+
+Keep `src/**` **last**. Moving it up would shadow the specific rows and silently drop their
+reviewer — the sync-engine slice reviewed without `sync-reviewer` (SUR-724 caught this: the
+classifier honours order, not the prose, so the prose can't substitute for the ordering).
 
 **Test-only seams are a `crypto-reviewer` / `naming-reviewer` BLOCKER if they reach the
 public binding.** `with_raw_mk` (construct-from-raw-hex) and any IV/salt override on
