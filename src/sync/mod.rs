@@ -28,7 +28,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Map, Value};
 
-use crate::store::Store;
+use crate::store::{synced_table_names, Store};
 use crate::vault::Vault;
 use http::{user_id_from_jwt, PostgrestClient};
 
@@ -200,6 +200,166 @@ impl SyncEngine {
         self.stage_write("notes", &id, row)
     }
 
+    /// Enqueue a custom-idea upsert (SUR-726). Plaintext metadata only (mirrors `upsertIdea`);
+    /// `description` defaults to `""` when absent (the PWA's `|| ''`). `updated_at` stamped at enqueue.
+    pub fn enqueue_custom_idea(
+        &self,
+        id: String,
+        name: String,
+        description: Option<String>,
+        created_at: i64,
+        deleted: bool,
+    ) -> Result<(), SyncError> {
+        let now = epoch_ms();
+        let mut row = Map::new();
+        row.insert("id".into(), json!(id));
+        row.insert("name".into(), json!(name));
+        row.insert("description".into(), json!(description.unwrap_or_default()));
+        row.insert("created_at".into(), json!(created_at));
+        row.insert("updated_at".into(), json!(now));
+        row.insert("deleted".into(), json!(deleted));
+        self.stage_write("custom_ideas", &id, row)
+    }
+
+    /// Enqueue a note-link upsert (SUR-726) — a parent→child annotation edge. Plaintext only;
+    /// `relation_type` defaults to `"handwritten_annotation"` (mirrors the surfc column default). A
+    /// remove is the same call with `deleted: true` (tombstone). Row-per-edge on a random pk (a
+    /// "bag" in the SUR-737 convergence contract): concurrent adds of the same logical edge do NOT
+    /// dedup — unlike memberships' deterministic pk.
+    pub fn enqueue_note_link(
+        &self,
+        id: String,
+        from_note_id: String,
+        to_note_id: String,
+        relation_type: Option<String>,
+        created_at: i64,
+        deleted: bool,
+    ) -> Result<(), SyncError> {
+        let now = epoch_ms();
+        let mut row = Map::new();
+        row.insert("id".into(), json!(id));
+        row.insert("from_note_id".into(), json!(from_note_id));
+        row.insert("to_note_id".into(), json!(to_note_id));
+        row.insert(
+            "relation_type".into(),
+            json!(relation_type.unwrap_or_else(|| "handwritten_annotation".into())),
+        );
+        row.insert("created_at".into(), json!(created_at));
+        row.insert("updated_at".into(), json!(now));
+        row.insert("deleted".into(), json!(deleted));
+        self.stage_write("note_links", &id, row)
+    }
+
+    /// Enqueue a lens upsert (SUR-726) — ONE authored query. Plaintext; `leaf_ids` is a cloud
+    /// `text[]` (JSON array on the wire), whole-row LWW (SUR-737 — no leaf union). `combinator` /
+    /// `threshold` default to `"AND"` / `100` (mirrors `upsertLens`'s `|| 'AND'` / `?? 100`). No
+    /// client-side range check on threshold — the server CHECK (0..=100) enforces it, like the PWA.
+    #[allow(clippy::too_many_arguments)]
+    pub fn enqueue_lens(
+        &self,
+        id: String,
+        name: String,
+        leaf_ids: Vec<String>,
+        combinator: Option<String>,
+        threshold: Option<i64>,
+        created_at: i64,
+        deleted: bool,
+    ) -> Result<(), SyncError> {
+        let now = epoch_ms();
+        let mut row = Map::new();
+        row.insert("id".into(), json!(id));
+        row.insert("name".into(), json!(name));
+        row.insert("leaf_ids".into(), json!(leaf_ids));
+        row.insert(
+            "combinator".into(),
+            json!(combinator.unwrap_or_else(|| "AND".into())),
+        );
+        row.insert("threshold".into(), json!(threshold.unwrap_or(100)));
+        row.insert("created_at".into(), json!(created_at));
+        row.insert("updated_at".into(), json!(now));
+        row.insert("deleted".into(), json!(deleted));
+        self.stage_write("lenses", &id, row)
+    }
+
+    /// Enqueue a collection upsert (SUR-726). Plaintext metadata only.
+    pub fn enqueue_collection(
+        &self,
+        id: String,
+        name: String,
+        created_at: i64,
+        deleted: bool,
+    ) -> Result<(), SyncError> {
+        let now = epoch_ms();
+        let mut row = Map::new();
+        row.insert("id".into(), json!(id));
+        row.insert("name".into(), json!(name));
+        row.insert("created_at".into(), json!(created_at));
+        row.insert("updated_at".into(), json!(now));
+        row.insert("deleted".into(), json!(deleted));
+        self.stage_write("collections", &id, row)
+    }
+
+    /// Enqueue a collection-membership upsert (SUR-726) — a note↔collection pair. The pk is DERIVED
+    /// here via [`membership_id`] (collection first), never taken from the host, so two devices
+    /// adding the same pair converge to ONE row (SUR-737 OR-set add). A remove is the same call with
+    /// `deleted: true`. `created_at` is always carried (the server column is NOT NULL, no default).
+    pub fn enqueue_collection_membership(
+        &self,
+        note_id: String,
+        collection_id: String,
+        created_at: i64,
+        deleted: bool,
+    ) -> Result<(), SyncError> {
+        let now = epoch_ms();
+        let id = crate::store::membership_id(&collection_id, &note_id);
+        let mut row = Map::new();
+        row.insert("id".into(), json!(id));
+        row.insert("note_id".into(), json!(note_id));
+        row.insert("collection_id".into(), json!(collection_id));
+        row.insert("created_at".into(), json!(created_at));
+        row.insert("updated_at".into(), json!(now));
+        row.insert("deleted".into(), json!(deleted));
+        self.stage_write("collection_memberships", &id, row)
+    }
+
+    /// Enqueue a note-signals upsert (SUR-726) — per-note behavioural counters, keyed by `note_id`
+    /// (there is NO separate `id` column; the payload carries `note_id` only, matching
+    /// `upsertNoteSignals`). Whole-row LWW; concurrent increments are lossy but self-heal (SUR-737,
+    /// ratified — derived data). Params follow the descriptor column order.
+    ///
+    /// CONTRACT (mirror of surfc's `ensureNoteSignals`): hosts must NOT enqueue a fresh "birth" row.
+    /// A birth row is local-only lazy-init; pushing one would clobber another device's earned counters
+    /// under whole-row LWW. Enqueue only on a genuine behavioural change.
+    #[allow(clippy::too_many_arguments)]
+    pub fn enqueue_note_signals(
+        &self,
+        note_id: String,
+        source_prior: f64,
+        return_visits: i64,
+        has_annotation: bool,
+        stitch_spawns: i64,
+        exposure_recency_at: i64,
+        engagement_recency_at: i64,
+        importance: f64,
+        created_at: i64,
+        deleted: bool,
+    ) -> Result<(), SyncError> {
+        let now = epoch_ms();
+        let mut row = Map::new();
+        row.insert("note_id".into(), json!(note_id));
+        row.insert("source_prior".into(), json!(source_prior));
+        row.insert("return_visits".into(), json!(return_visits));
+        row.insert("has_annotation".into(), json!(has_annotation));
+        row.insert("stitch_spawns".into(), json!(stitch_spawns));
+        row.insert("exposure_recency_at".into(), json!(exposure_recency_at));
+        row.insert("engagement_recency_at".into(), json!(engagement_recency_at));
+        row.insert("importance".into(), json!(importance));
+        row.insert("created_at".into(), json!(created_at));
+        row.insert("updated_at".into(), json!(now));
+        row.insert("deleted".into(), json!(deleted));
+        self.stage_write("note_signals", &note_id, row)
+    }
+
     /// Push every queued write to Supabase (books-first, remap, notes; failed stay queued).
     /// Synchronous FFI — the async PostgREST calls run on the owned runtime via `block_on`.
     pub fn flush(&self) -> Result<FlushSummary, SyncError> {
@@ -220,8 +380,8 @@ impl SyncEngine {
         })
     }
 
-    /// Pull incrementally from Supabase for the in-scope tables (`books` + `notes` this slice; the
-    /// other six follow in SUR-726 by extending `TABLES`). Merges last-write-wins by `updated_at`,
+    /// Pull incrementally from Supabase for **all eight synced tables** (SUR-726 —
+    /// [`synced_table_names`] is the one source of the pull scope). Merges last-write-wins by `updated_at`,
     /// applies tombstones without resurrecting soft-deleted rows, **rebases the outbox** (drops a
     /// queued local edit a newer remote row beat — SUR-736 — and reports it in `superseded`,
     /// SUR-738), and advances each per-table cursor to a lookback watermark (`now()` minus
@@ -234,7 +394,7 @@ impl SyncEngine {
     /// [`SyncEngine::sync`] (pull-then-flush) for the one-call path. (This does NOT fix SUR-740 — a
     /// flush destroying a newer SERVER row before a pull can see it is the server's job, PR-3.)
     pub fn pull(&self) -> Result<PullSummary, SyncError> {
-        const TABLES: &[&str] = &["books", "notes"];
+        let tables = synced_table_names();
         let store = lock!(self.store);
         let client = lock!(self.client);
         if client.access_token().is_none() {
@@ -251,12 +411,12 @@ impl SyncEngine {
         let now = epoch_ms().saturating_sub(PULL_CURSOR_OVERLAP_MS);
         let result = self
             .runtime
-            .block_on(pull::pull(&store, &*client, TABLES, now))
+            .block_on(pull::pull(&store, &*client, &tables, now))
             .map_err(SyncError::Flush)?;
         // Every requested table failing (e.g. offline / bad token) is a real error — surface it
         // rather than a misleading "pulled 0". A PARTIAL failure stays Ok (per-table isolation:
         // the failed table's cursor is untouched and re-pulls next call).
-        if result.failed_tables.len() == TABLES.len() {
+        if result.failed_tables.len() == tables.len() {
             return Err(SyncError::Flush(format!(
                 "pull failed for all tables: {}",
                 result.failed_tables.join(", ")
@@ -287,7 +447,7 @@ impl SyncEngine {
     /// nothing, and the host retries. (This still does NOT fix SUR-740 — a flush destroying a newer
     /// SERVER row before this pull could see it is the server's job, PR-3.)
     pub fn sync(&self) -> Result<SyncSummary, SyncError> {
-        const TABLES: &[&str] = &["books", "notes"];
+        let tables = synced_table_names();
         let store = lock!(self.store);
         let client = lock!(self.client);
         let token = client.access_token().ok_or_else(|| {
@@ -298,7 +458,7 @@ impl SyncEngine {
         let now = epoch_ms().saturating_sub(PULL_CURSOR_OVERLAP_MS);
         let (pull, flush) = self
             .runtime
-            .block_on(pull_then_flush(&store, &*client, &user_id, TABLES, now))
+            .block_on(pull_then_flush(&store, &*client, &user_id, &tables, now))
             .map_err(SyncError::Flush)?;
         Ok(SyncSummary {
             pull: PullSummary {
@@ -376,6 +536,15 @@ pub async fn pull_then_flush<S: http::PostgrestSink>(
 /// watermark the cursor tracks, distinct from the client `updated_at` used for LWW — is SUR-739.
 /// Tunable: larger = fewer misses, more re-fetch per pull (bounded by pagination, SUR-652).
 const PULL_CURSOR_OVERLAP_MS: i64 = 24 * 60 * 60 * 1000; // 24h — covers a full offline day (e.g. a flight)
+
+/// Derive a `collection_memberships` primary key from its `(collection_id, note_id)` pair — the
+/// FFI-exported mirror of surfc's `membershipId(collectionId, noteId)`, so a host can look up or
+/// join local membership rows by the same deterministic id the sync layer writes (SUR-726). Thin
+/// wrapper over [`crate::store::membership_id`]; collection id first.
+#[uniffi::export]
+pub fn membership_id(collection_id: String, note_id: String) -> String {
+    crate::store::membership_id(&collection_id, &note_id)
+}
 
 /// Epoch milliseconds — the PWA `Date.now()` unit the cloud data is stamped in. `SystemTime`
 /// before the epoch is impossible on a sane clock; clamp to 0 rather than panic.
@@ -562,6 +731,159 @@ mod tests {
             Store::open(db_path).unwrap().outbox_items().unwrap().len(),
             1,
             "the queued write is untouched — sync returned before it could flush"
+        );
+    }
+
+    // ── SUR-726 enqueue wire shapes (mirror the surfc upsert* payloads) ────────
+
+    fn engine_at(db_path: &str) -> Arc<SyncEngine> {
+        SyncEngine::open(
+            db_path.into(),
+            "https://x.supabase.co".into(),
+            "anon".into(),
+            Vault::generate(),
+        )
+        .unwrap()
+    }
+
+    /// The single queued outbox row (fails if there isn't exactly one). See [`crate::store::OutboxRow`].
+    fn only_row(db_path: &str) -> crate::store::OutboxRow {
+        let mut rows = Store::open(db_path).unwrap().outbox_items().unwrap();
+        assert_eq!(rows.len(), 1, "expected exactly one queued row");
+        rows.pop().unwrap()
+    }
+
+    #[test]
+    fn enqueue_note_signals_keys_note_id_and_omits_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        engine_at(db_path)
+            .enqueue_note_signals("nA".into(), 0.5, 3, true, 1, 100, 200, 0.9, 10, false)
+            .unwrap();
+
+        let (_, table, record_id, payload_json, _) = only_row(db_path);
+        assert_eq!(table, "note_signals");
+        assert_eq!(
+            record_id.as_deref(),
+            Some("nA"),
+            "outbox record_id = note_id (the collapse key)"
+        );
+        let payload: Value = serde_json::from_str(&payload_json).unwrap();
+        assert_eq!(payload["note_id"], json!("nA"));
+        assert!(
+            payload.get("id").is_none(),
+            "note_signals payload must NOT carry an `id` key (PostgREST rejects unknown columns)"
+        );
+        assert_eq!(payload["return_visits"], json!(3));
+        assert_eq!(payload["has_annotation"], json!(true));
+        assert!(
+            Store::open(db_path)
+                .unwrap()
+                .get_row("note_signals", "nA")
+                .unwrap()
+                .is_some(),
+            "the local synced row is keyed by note_id too"
+        );
+    }
+
+    #[test]
+    fn enqueue_collection_membership_derives_the_deterministic_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        engine_at(db_path)
+            .enqueue_collection_membership("noteX".into(), "colY".into(), 10, false)
+            .unwrap();
+
+        let (_, table, record_id, payload_json, _) = only_row(db_path);
+        assert_eq!(table, "collection_memberships");
+        assert_eq!(
+            record_id.as_deref(),
+            Some("colY:noteX"),
+            "id derived collection-first — the host can't supply a divergent one"
+        );
+        let payload: Value = serde_json::from_str(&payload_json).unwrap();
+        assert_eq!(payload["id"], json!("colY:noteX"));
+        assert_eq!(payload["note_id"], json!("noteX"));
+        assert_eq!(payload["collection_id"], json!("colY"));
+    }
+
+    #[test]
+    fn enqueue_lens_applies_wire_defaults_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        engine_at(db_path)
+            .enqueue_lens(
+                "l1".into(),
+                "L".into(),
+                vec!["a".into(), "b".into()],
+                None,
+                None,
+                10,
+                false,
+            )
+            .unwrap();
+
+        let payload: Value = serde_json::from_str(&only_row(db_path).3).unwrap();
+        assert_eq!(
+            payload["leaf_ids"],
+            json!(["a", "b"]),
+            "leaf_ids rides as a JSON array (cloud text[])"
+        );
+        assert_eq!(payload["combinator"], json!("AND"), "default combinator");
+        assert_eq!(payload["threshold"], json!(100), "default threshold");
+    }
+
+    #[test]
+    fn enqueue_note_link_defaults_relation_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        engine_at(db_path)
+            .enqueue_note_link("nl1".into(), "from1".into(), "to1".into(), None, 10, false)
+            .unwrap();
+
+        let payload: Value = serde_json::from_str(&only_row(db_path).3).unwrap();
+        assert_eq!(payload["relation_type"], json!("handwritten_annotation"));
+        assert_eq!(payload["from_note_id"], json!("from1"));
+        assert_eq!(payload["to_note_id"], json!("to1"));
+    }
+
+    #[test]
+    fn enqueue_custom_idea_defaults_empty_description() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        engine_at(db_path)
+            .enqueue_custom_idea("ci1".into(), "Idea".into(), None, 10, false)
+            .unwrap();
+
+        let payload: Value = serde_json::from_str(&only_row(db_path).3).unwrap();
+        assert_eq!(payload["name"], json!("Idea"));
+        assert_eq!(
+            payload["description"],
+            json!(""),
+            "absent description → \"\""
+        );
+    }
+
+    #[test]
+    fn membership_id_matches_the_oracle_colon_join() {
+        // Byte-exact mirror of surfc `membershipId(collectionId, noteId)`: `${collection}:${note}`.
+        assert_eq!(membership_id("c1".into(), "n1".into()), "c1:n1");
+        assert_eq!(
+            membership_id(
+                "11111111-1111-4111-8111-111111111111".into(),
+                "22222222-2222-4222-8222-222222222222".into()
+            ),
+            "11111111-1111-4111-8111-111111111111:22222222-2222-4222-8222-222222222222"
+        );
+        // Argument order is load-bearing (collection FIRST) — the reversed pair differs.
+        assert_ne!(
+            membership_id("a".into(), "b".into()),
+            membership_id("b".into(), "a".into())
         );
     }
 }

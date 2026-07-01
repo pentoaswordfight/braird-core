@@ -752,6 +752,20 @@ internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 // A JNA Library to expose the extern-C FFI definitions.
 // This is an implementation detail which will be called internally by the public API.
 
@@ -779,7 +793,19 @@ internal interface UniffiLib : Library {
     ): Pointer
     fun uniffi_braird_core_fn_method_syncengine_enqueue_book(`ptr`: Pointer,`id`: RustBuffer.ByValue,`title`: RustBuffer.ByValue,`author`: RustBuffer.ByValue,`createdAt`: Long,`deleted`: Byte,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
+    fun uniffi_braird_core_fn_method_syncengine_enqueue_collection(`ptr`: Pointer,`id`: RustBuffer.ByValue,`name`: RustBuffer.ByValue,`createdAt`: Long,`deleted`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    fun uniffi_braird_core_fn_method_syncengine_enqueue_collection_membership(`ptr`: Pointer,`noteId`: RustBuffer.ByValue,`collectionId`: RustBuffer.ByValue,`createdAt`: Long,`deleted`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    fun uniffi_braird_core_fn_method_syncengine_enqueue_custom_idea(`ptr`: Pointer,`id`: RustBuffer.ByValue,`name`: RustBuffer.ByValue,`description`: RustBuffer.ByValue,`createdAt`: Long,`deleted`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    fun uniffi_braird_core_fn_method_syncengine_enqueue_lens(`ptr`: Pointer,`id`: RustBuffer.ByValue,`name`: RustBuffer.ByValue,`leafIds`: RustBuffer.ByValue,`combinator`: RustBuffer.ByValue,`threshold`: RustBuffer.ByValue,`createdAt`: Long,`deleted`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
     fun uniffi_braird_core_fn_method_syncengine_enqueue_note(`ptr`: Pointer,`id`: RustBuffer.ByValue,`bookId`: RustBuffer.ByValue,`plaintext`: RustBuffer.ByValue,`page`: RustBuffer.ByValue,`tags`: RustBuffer.ByValue,`createdAt`: Long,`deleted`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    fun uniffi_braird_core_fn_method_syncengine_enqueue_note_link(`ptr`: Pointer,`id`: RustBuffer.ByValue,`fromNoteId`: RustBuffer.ByValue,`toNoteId`: RustBuffer.ByValue,`relationType`: RustBuffer.ByValue,`createdAt`: Long,`deleted`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    fun uniffi_braird_core_fn_method_syncengine_enqueue_note_signals(`ptr`: Pointer,`noteId`: RustBuffer.ByValue,`sourcePrior`: Double,`returnVisits`: Long,`hasAnnotation`: Byte,`stitchSpawns`: Long,`exposureRecencyAt`: Long,`engagementRecencyAt`: Long,`importance`: Double,`createdAt`: Long,`deleted`: Byte,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     fun uniffi_braird_core_fn_method_syncengine_flush(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
@@ -814,6 +840,8 @@ internal interface UniffiLib : Library {
     fun uniffi_braird_core_fn_method_vault_seal_bytes(`ptr`: Pointer,`bytes`: RustBuffer.ByValue,`aad`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_vault_wrap_with_prf(`ptr`: Pointer,`prf`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_braird_core_fn_func_membership_id(`collectionId`: RustBuffer.ByValue,`noteId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     fun ffi_braird_core_rustbuffer_alloc(`size`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
@@ -927,9 +955,23 @@ internal interface UniffiLib : Library {
     ): Unit
     fun ffi_braird_core_rust_future_complete_void(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
+    fun uniffi_braird_core_checksum_func_membership_id(
+    ): Short
     fun uniffi_braird_core_checksum_method_syncengine_enqueue_book(
     ): Short
+    fun uniffi_braird_core_checksum_method_syncengine_enqueue_collection(
+    ): Short
+    fun uniffi_braird_core_checksum_method_syncengine_enqueue_collection_membership(
+    ): Short
+    fun uniffi_braird_core_checksum_method_syncengine_enqueue_custom_idea(
+    ): Short
+    fun uniffi_braird_core_checksum_method_syncengine_enqueue_lens(
+    ): Short
     fun uniffi_braird_core_checksum_method_syncengine_enqueue_note(
+    ): Short
+    fun uniffi_braird_core_checksum_method_syncengine_enqueue_note_link(
+    ): Short
+    fun uniffi_braird_core_checksum_method_syncengine_enqueue_note_signals(
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_flush(
     ): Short
@@ -980,16 +1022,37 @@ private fun uniffiCheckContractApiVersion(lib: UniffiLib) {
 
 @Suppress("UNUSED_PARAMETER")
 private fun uniffiCheckApiChecksums(lib: UniffiLib) {
+    if (lib.uniffi_braird_core_checksum_func_membership_id() != 9610.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_book() != 22816.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_collection() != 43786.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_collection_membership() != 42356.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_custom_idea() != 46286.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_lens() != 60504.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_note() != 25351.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_note_link() != 53465.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_note_signals() != 33526.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_braird_core_checksum_method_syncengine_flush() != 39156.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_braird_core_checksum_method_syncengine_pull() != 4639.toShort()) {
+    if (lib.uniffi_braird_core_checksum_method_syncengine_pull() != 18621.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_set_access_token() != 47386.toShort()) {
@@ -1124,6 +1187,29 @@ public object FfiConverterLong: FfiConverter<Long, Long> {
 
     override fun write(value: Long, buf: ByteBuffer) {
         buf.putLong(value)
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterDouble: FfiConverter<Double, Double> {
+    override fun lift(value: Double): Double {
+        return value
+    }
+
+    override fun read(buf: ByteBuffer): Double {
+        return buf.getDouble()
+    }
+
+    override fun lower(value: Double): Double {
+        return value
+    }
+
+    override fun allocationSize(value: Double) = 8UL
+
+    override fun write(value: Double, buf: ByteBuffer) {
+        buf.putDouble(value)
     }
 }
 
@@ -1404,6 +1490,33 @@ public interface SyncEngineInterface {
     fun `enqueueBook`(`id`: kotlin.String, `title`: kotlin.String, `author`: kotlin.String?, `createdAt`: kotlin.Long, `deleted`: kotlin.Boolean)
     
     /**
+     * Enqueue a collection upsert (SUR-726). Plaintext metadata only.
+     */
+    fun `enqueueCollection`(`id`: kotlin.String, `name`: kotlin.String, `createdAt`: kotlin.Long, `deleted`: kotlin.Boolean)
+    
+    /**
+     * Enqueue a collection-membership upsert (SUR-726) — a note↔collection pair. The pk is DERIVED
+     * here via [`membership_id`] (collection first), never taken from the host, so two devices
+     * adding the same pair converge to ONE row (SUR-737 OR-set add). A remove is the same call with
+     * `deleted: true`. `created_at` is always carried (the server column is NOT NULL, no default).
+     */
+    fun `enqueueCollectionMembership`(`noteId`: kotlin.String, `collectionId`: kotlin.String, `createdAt`: kotlin.Long, `deleted`: kotlin.Boolean)
+    
+    /**
+     * Enqueue a custom-idea upsert (SUR-726). Plaintext metadata only (mirrors `upsertIdea`);
+     * `description` defaults to `""` when absent (the PWA's `|| ''`). `updated_at` stamped at enqueue.
+     */
+    fun `enqueueCustomIdea`(`id`: kotlin.String, `name`: kotlin.String, `description`: kotlin.String?, `createdAt`: kotlin.Long, `deleted`: kotlin.Boolean)
+    
+    /**
+     * Enqueue a lens upsert (SUR-726) — ONE authored query. Plaintext; `leaf_ids` is a cloud
+     * `text[]` (JSON array on the wire), whole-row LWW (SUR-737 — no leaf union). `combinator` /
+     * `threshold` default to `"AND"` / `100` (mirrors `upsertLens`'s `|| 'AND'` / `?? 100`). No
+     * client-side range check on threshold — the server CHECK (0..=100) enforces it, like the PWA.
+     */
+    fun `enqueueLens`(`id`: kotlin.String, `name`: kotlin.String, `leafIds`: List<kotlin.String>, `combinator`: kotlin.String?, `threshold`: kotlin.Long?, `createdAt`: kotlin.Long, `deleted`: kotlin.Boolean)
+    
+    /**
      * Enqueue a note upsert — the seal-at-write path. `text` is the PLAINTEXT; it is sealed here
      * (enc:v2, AAD = note id) and `content_tag` is computed here FROM the plaintext (both while
      * the plaintext is in hand). The stored outbox payload holds only the ciphertext + the tag.
@@ -1419,14 +1532,35 @@ public interface SyncEngineInterface {
     fun `enqueueNote`(`id`: kotlin.String, `bookId`: kotlin.String?, `plaintext`: kotlin.String, `page`: kotlin.String?, `tags`: List<kotlin.String>, `createdAt`: kotlin.Long, `deleted`: kotlin.Boolean)
     
     /**
+     * Enqueue a note-link upsert (SUR-726) — a parent→child annotation edge. Plaintext only;
+     * `relation_type` defaults to `"handwritten_annotation"` (mirrors the surfc column default). A
+     * remove is the same call with `deleted: true` (tombstone). Row-per-edge on a random pk (a
+     * "bag" in the SUR-737 convergence contract): concurrent adds of the same logical edge do NOT
+     * dedup — unlike memberships' deterministic pk.
+     */
+    fun `enqueueNoteLink`(`id`: kotlin.String, `fromNoteId`: kotlin.String, `toNoteId`: kotlin.String, `relationType`: kotlin.String?, `createdAt`: kotlin.Long, `deleted`: kotlin.Boolean)
+    
+    /**
+     * Enqueue a note-signals upsert (SUR-726) — per-note behavioural counters, keyed by `note_id`
+     * (there is NO separate `id` column; the payload carries `note_id` only, matching
+     * `upsertNoteSignals`). Whole-row LWW; concurrent increments are lossy but self-heal (SUR-737,
+     * ratified — derived data). Params follow the descriptor column order.
+     *
+     * CONTRACT (mirror of surfc's `ensureNoteSignals`): hosts must NOT enqueue a fresh "birth" row.
+     * A birth row is local-only lazy-init; pushing one would clobber another device's earned counters
+     * under whole-row LWW. Enqueue only on a genuine behavioural change.
+     */
+    fun `enqueueNoteSignals`(`noteId`: kotlin.String, `sourcePrior`: kotlin.Double, `returnVisits`: kotlin.Long, `hasAnnotation`: kotlin.Boolean, `stitchSpawns`: kotlin.Long, `exposureRecencyAt`: kotlin.Long, `engagementRecencyAt`: kotlin.Long, `importance`: kotlin.Double, `createdAt`: kotlin.Long, `deleted`: kotlin.Boolean)
+    
+    /**
      * Push every queued write to Supabase (books-first, remap, notes; failed stay queued).
      * Synchronous FFI — the async PostgREST calls run on the owned runtime via `block_on`.
      */
     fun `flush`(): FlushSummary
     
     /**
-     * Pull incrementally from Supabase for the in-scope tables (`books` + `notes` this slice; the
-     * other six follow in SUR-726 by extending `TABLES`). Merges last-write-wins by `updated_at`,
+     * Pull incrementally from Supabase for **all eight synced tables** (SUR-726 —
+     * [`synced_table_names`] is the one source of the pull scope). Merges last-write-wins by `updated_at`,
      * applies tombstones without resurrecting soft-deleted rows, **rebases the outbox** (drops a
      * queued local edit a newer remote row beat — SUR-736 — and reports it in `superseded`,
      * SUR-738), and advances each per-table cursor to a lookback watermark (`now()` minus
@@ -1576,6 +1710,73 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
 
     
     /**
+     * Enqueue a collection upsert (SUR-726). Plaintext metadata only.
+     */
+    @Throws(SyncException::class)override fun `enqueueCollection`(`id`: kotlin.String, `name`: kotlin.String, `createdAt`: kotlin.Long, `deleted`: kotlin.Boolean)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(SyncException) { _status ->
+    UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_enqueue_collection(
+        it, FfiConverterString.lower(`id`),FfiConverterString.lower(`name`),FfiConverterLong.lower(`createdAt`),FfiConverterBoolean.lower(`deleted`),_status)
+}
+    }
+    
+    
+
+    
+    /**
+     * Enqueue a collection-membership upsert (SUR-726) — a note↔collection pair. The pk is DERIVED
+     * here via [`membership_id`] (collection first), never taken from the host, so two devices
+     * adding the same pair converge to ONE row (SUR-737 OR-set add). A remove is the same call with
+     * `deleted: true`. `created_at` is always carried (the server column is NOT NULL, no default).
+     */
+    @Throws(SyncException::class)override fun `enqueueCollectionMembership`(`noteId`: kotlin.String, `collectionId`: kotlin.String, `createdAt`: kotlin.Long, `deleted`: kotlin.Boolean)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(SyncException) { _status ->
+    UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_enqueue_collection_membership(
+        it, FfiConverterString.lower(`noteId`),FfiConverterString.lower(`collectionId`),FfiConverterLong.lower(`createdAt`),FfiConverterBoolean.lower(`deleted`),_status)
+}
+    }
+    
+    
+
+    
+    /**
+     * Enqueue a custom-idea upsert (SUR-726). Plaintext metadata only (mirrors `upsertIdea`);
+     * `description` defaults to `""` when absent (the PWA's `|| ''`). `updated_at` stamped at enqueue.
+     */
+    @Throws(SyncException::class)override fun `enqueueCustomIdea`(`id`: kotlin.String, `name`: kotlin.String, `description`: kotlin.String?, `createdAt`: kotlin.Long, `deleted`: kotlin.Boolean)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(SyncException) { _status ->
+    UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_enqueue_custom_idea(
+        it, FfiConverterString.lower(`id`),FfiConverterString.lower(`name`),FfiConverterOptionalString.lower(`description`),FfiConverterLong.lower(`createdAt`),FfiConverterBoolean.lower(`deleted`),_status)
+}
+    }
+    
+    
+
+    
+    /**
+     * Enqueue a lens upsert (SUR-726) — ONE authored query. Plaintext; `leaf_ids` is a cloud
+     * `text[]` (JSON array on the wire), whole-row LWW (SUR-737 — no leaf union). `combinator` /
+     * `threshold` default to `"AND"` / `100` (mirrors `upsertLens`'s `|| 'AND'` / `?? 100`). No
+     * client-side range check on threshold — the server CHECK (0..=100) enforces it, like the PWA.
+     */
+    @Throws(SyncException::class)override fun `enqueueLens`(`id`: kotlin.String, `name`: kotlin.String, `leafIds`: List<kotlin.String>, `combinator`: kotlin.String?, `threshold`: kotlin.Long?, `createdAt`: kotlin.Long, `deleted`: kotlin.Boolean)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(SyncException) { _status ->
+    UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_enqueue_lens(
+        it, FfiConverterString.lower(`id`),FfiConverterString.lower(`name`),FfiConverterSequenceString.lower(`leafIds`),FfiConverterOptionalString.lower(`combinator`),FfiConverterOptionalLong.lower(`threshold`),FfiConverterLong.lower(`createdAt`),FfiConverterBoolean.lower(`deleted`),_status)
+}
+    }
+    
+    
+
+    
+    /**
      * Enqueue a note upsert — the seal-at-write path. `text` is the PLAINTEXT; it is sealed here
      * (enc:v2, AAD = note id) and `content_tag` is computed here FROM the plaintext (both while
      * the plaintext is in hand). The stored outbox payload holds only the ciphertext + the tag.
@@ -1601,6 +1802,47 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
 
     
     /**
+     * Enqueue a note-link upsert (SUR-726) — a parent→child annotation edge. Plaintext only;
+     * `relation_type` defaults to `"handwritten_annotation"` (mirrors the surfc column default). A
+     * remove is the same call with `deleted: true` (tombstone). Row-per-edge on a random pk (a
+     * "bag" in the SUR-737 convergence contract): concurrent adds of the same logical edge do NOT
+     * dedup — unlike memberships' deterministic pk.
+     */
+    @Throws(SyncException::class)override fun `enqueueNoteLink`(`id`: kotlin.String, `fromNoteId`: kotlin.String, `toNoteId`: kotlin.String, `relationType`: kotlin.String?, `createdAt`: kotlin.Long, `deleted`: kotlin.Boolean)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(SyncException) { _status ->
+    UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_enqueue_note_link(
+        it, FfiConverterString.lower(`id`),FfiConverterString.lower(`fromNoteId`),FfiConverterString.lower(`toNoteId`),FfiConverterOptionalString.lower(`relationType`),FfiConverterLong.lower(`createdAt`),FfiConverterBoolean.lower(`deleted`),_status)
+}
+    }
+    
+    
+
+    
+    /**
+     * Enqueue a note-signals upsert (SUR-726) — per-note behavioural counters, keyed by `note_id`
+     * (there is NO separate `id` column; the payload carries `note_id` only, matching
+     * `upsertNoteSignals`). Whole-row LWW; concurrent increments are lossy but self-heal (SUR-737,
+     * ratified — derived data). Params follow the descriptor column order.
+     *
+     * CONTRACT (mirror of surfc's `ensureNoteSignals`): hosts must NOT enqueue a fresh "birth" row.
+     * A birth row is local-only lazy-init; pushing one would clobber another device's earned counters
+     * under whole-row LWW. Enqueue only on a genuine behavioural change.
+     */
+    @Throws(SyncException::class)override fun `enqueueNoteSignals`(`noteId`: kotlin.String, `sourcePrior`: kotlin.Double, `returnVisits`: kotlin.Long, `hasAnnotation`: kotlin.Boolean, `stitchSpawns`: kotlin.Long, `exposureRecencyAt`: kotlin.Long, `engagementRecencyAt`: kotlin.Long, `importance`: kotlin.Double, `createdAt`: kotlin.Long, `deleted`: kotlin.Boolean)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(SyncException) { _status ->
+    UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_enqueue_note_signals(
+        it, FfiConverterString.lower(`noteId`),FfiConverterDouble.lower(`sourcePrior`),FfiConverterLong.lower(`returnVisits`),FfiConverterBoolean.lower(`hasAnnotation`),FfiConverterLong.lower(`stitchSpawns`),FfiConverterLong.lower(`exposureRecencyAt`),FfiConverterLong.lower(`engagementRecencyAt`),FfiConverterDouble.lower(`importance`),FfiConverterLong.lower(`createdAt`),FfiConverterBoolean.lower(`deleted`),_status)
+}
+    }
+    
+    
+
+    
+    /**
      * Push every queued write to Supabase (books-first, remap, notes; failed stay queued).
      * Synchronous FFI — the async PostgREST calls run on the owned runtime via `block_on`.
      */
@@ -1618,8 +1860,8 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
 
     
     /**
-     * Pull incrementally from Supabase for the in-scope tables (`books` + `notes` this slice; the
-     * other six follow in SUR-726 by extending `TABLES`). Merges last-write-wins by `updated_at`,
+     * Pull incrementally from Supabase for **all eight synced tables** (SUR-726 —
+     * [`synced_table_names`] is the one source of the pull scope). Merges last-write-wins by `updated_at`,
      * applies tombstones without resurrecting soft-deleted rows, **rebases the outbox** (drops a
      * queued local edit a newer remote row beat — SUR-736 — and reports it in `superseded`,
      * SUR-738), and advances each per-table cursor to a lookback watermark (`now()` minus
@@ -2551,6 +2793,38 @@ public object FfiConverterTypeSyncError : FfiConverterRustBuffer<SyncException> 
 /**
  * @suppress
  */
+public object FfiConverterOptionalLong: FfiConverterRustBuffer<kotlin.Long?> {
+    override fun read(buf: ByteBuffer): kotlin.Long? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterLong.read(buf)
+    }
+
+    override fun allocationSize(value: kotlin.Long?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterLong.allocationSize(value)
+        }
+    }
+
+    override fun write(value: kotlin.Long?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterLong.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
 public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?> {
     override fun read(buf: ByteBuffer): kotlin.String? {
         if (buf.get().toInt() == 0) {
@@ -2632,4 +2906,19 @@ public object FfiConverterSequenceTypeSupersededEdit: FfiConverterRustBuffer<Lis
         }
     }
 }
+        /**
+         * Derive a `collection_memberships` primary key from its `(collection_id, note_id)` pair — the
+         * FFI-exported mirror of surfc's `membershipId(collectionId, noteId)`, so a host can look up or
+         * join local membership rows by the same deterministic id the sync layer writes (SUR-726). Thin
+         * wrapper over [`crate::store::membership_id`]; collection id first.
+         */ fun `membershipId`(`collectionId`: kotlin.String, `noteId`: kotlin.String): kotlin.String {
+            return FfiConverterString.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_braird_core_fn_func_membership_id(
+        FfiConverterString.lower(`collectionId`),FfiConverterString.lower(`noteId`),_status)
+}
+    )
+    }
+    
+
 

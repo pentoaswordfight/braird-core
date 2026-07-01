@@ -431,6 +431,22 @@ fileprivate struct FfiConverterInt64: FfiConverterPrimitive {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterDouble: FfiConverterPrimitive {
+    typealias FfiType = Double
+    typealias SwiftType = Double
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Double {
+        return try lift(readDouble(&buf))
+    }
+
+    public static func write(_ value: Double, into buf: inout [UInt8]) {
+        writeDouble(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterBool : FfiConverter {
     typealias FfiType = Int8
     typealias SwiftType = Bool
@@ -530,6 +546,33 @@ public protocol SyncEngineProtocol : AnyObject {
     func enqueueBook(id: String, title: String, author: String?, createdAt: Int64, deleted: Bool) throws 
     
     /**
+     * Enqueue a collection upsert (SUR-726). Plaintext metadata only.
+     */
+    func enqueueCollection(id: String, name: String, createdAt: Int64, deleted: Bool) throws 
+    
+    /**
+     * Enqueue a collection-membership upsert (SUR-726) — a note↔collection pair. The pk is DERIVED
+     * here via [`membership_id`] (collection first), never taken from the host, so two devices
+     * adding the same pair converge to ONE row (SUR-737 OR-set add). A remove is the same call with
+     * `deleted: true`. `created_at` is always carried (the server column is NOT NULL, no default).
+     */
+    func enqueueCollectionMembership(noteId: String, collectionId: String, createdAt: Int64, deleted: Bool) throws 
+    
+    /**
+     * Enqueue a custom-idea upsert (SUR-726). Plaintext metadata only (mirrors `upsertIdea`);
+     * `description` defaults to `""` when absent (the PWA's `|| ''`). `updated_at` stamped at enqueue.
+     */
+    func enqueueCustomIdea(id: String, name: String, description: String?, createdAt: Int64, deleted: Bool) throws 
+    
+    /**
+     * Enqueue a lens upsert (SUR-726) — ONE authored query. Plaintext; `leaf_ids` is a cloud
+     * `text[]` (JSON array on the wire), whole-row LWW (SUR-737 — no leaf union). `combinator` /
+     * `threshold` default to `"AND"` / `100` (mirrors `upsertLens`'s `|| 'AND'` / `?? 100`). No
+     * client-side range check on threshold — the server CHECK (0..=100) enforces it, like the PWA.
+     */
+    func enqueueLens(id: String, name: String, leafIds: [String], combinator: String?, threshold: Int64?, createdAt: Int64, deleted: Bool) throws 
+    
+    /**
      * Enqueue a note upsert — the seal-at-write path. `text` is the PLAINTEXT; it is sealed here
      * (enc:v2, AAD = note id) and `content_tag` is computed here FROM the plaintext (both while
      * the plaintext is in hand). The stored outbox payload holds only the ciphertext + the tag.
@@ -545,14 +588,35 @@ public protocol SyncEngineProtocol : AnyObject {
     func enqueueNote(id: String, bookId: String?, plaintext: String, page: String?, tags: [String], createdAt: Int64, deleted: Bool) throws 
     
     /**
+     * Enqueue a note-link upsert (SUR-726) — a parent→child annotation edge. Plaintext only;
+     * `relation_type` defaults to `"handwritten_annotation"` (mirrors the surfc column default). A
+     * remove is the same call with `deleted: true` (tombstone). Row-per-edge on a random pk (a
+     * "bag" in the SUR-737 convergence contract): concurrent adds of the same logical edge do NOT
+     * dedup — unlike memberships' deterministic pk.
+     */
+    func enqueueNoteLink(id: String, fromNoteId: String, toNoteId: String, relationType: String?, createdAt: Int64, deleted: Bool) throws 
+    
+    /**
+     * Enqueue a note-signals upsert (SUR-726) — per-note behavioural counters, keyed by `note_id`
+     * (there is NO separate `id` column; the payload carries `note_id` only, matching
+     * `upsertNoteSignals`). Whole-row LWW; concurrent increments are lossy but self-heal (SUR-737,
+     * ratified — derived data). Params follow the descriptor column order.
+     *
+     * CONTRACT (mirror of surfc's `ensureNoteSignals`): hosts must NOT enqueue a fresh "birth" row.
+     * A birth row is local-only lazy-init; pushing one would clobber another device's earned counters
+     * under whole-row LWW. Enqueue only on a genuine behavioural change.
+     */
+    func enqueueNoteSignals(noteId: String, sourcePrior: Double, returnVisits: Int64, hasAnnotation: Bool, stitchSpawns: Int64, exposureRecencyAt: Int64, engagementRecencyAt: Int64, importance: Double, createdAt: Int64, deleted: Bool) throws 
+    
+    /**
      * Push every queued write to Supabase (books-first, remap, notes; failed stay queued).
      * Synchronous FFI — the async PostgREST calls run on the owned runtime via `block_on`.
      */
     func flush() throws  -> FlushSummary
     
     /**
-     * Pull incrementally from Supabase for the in-scope tables (`books` + `notes` this slice; the
-     * other six follow in SUR-726 by extending `TABLES`). Merges last-write-wins by `updated_at`,
+     * Pull incrementally from Supabase for **all eight synced tables** (SUR-726 —
+     * [`synced_table_names`] is the one source of the pull scope). Merges last-write-wins by `updated_at`,
      * applies tombstones without resurrecting soft-deleted rows, **rebases the outbox** (drops a
      * queued local edit a newer remote row beat — SUR-736 — and reports it in `superseded`,
      * SUR-738), and advances each per-table cursor to a lookback watermark (`now()` minus
@@ -685,6 +749,69 @@ open func enqueueBook(id: String, title: String, author: String?, createdAt: Int
 }
     
     /**
+     * Enqueue a collection upsert (SUR-726). Plaintext metadata only.
+     */
+open func enqueueCollection(id: String, name: String, createdAt: Int64, deleted: Bool)throws  {try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_braird_core_fn_method_syncengine_enqueue_collection(self.uniffiClonePointer(),
+        FfiConverterString.lower(id),
+        FfiConverterString.lower(name),
+        FfiConverterInt64.lower(createdAt),
+        FfiConverterBool.lower(deleted),$0
+    )
+}
+}
+    
+    /**
+     * Enqueue a collection-membership upsert (SUR-726) — a note↔collection pair. The pk is DERIVED
+     * here via [`membership_id`] (collection first), never taken from the host, so two devices
+     * adding the same pair converge to ONE row (SUR-737 OR-set add). A remove is the same call with
+     * `deleted: true`. `created_at` is always carried (the server column is NOT NULL, no default).
+     */
+open func enqueueCollectionMembership(noteId: String, collectionId: String, createdAt: Int64, deleted: Bool)throws  {try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_braird_core_fn_method_syncengine_enqueue_collection_membership(self.uniffiClonePointer(),
+        FfiConverterString.lower(noteId),
+        FfiConverterString.lower(collectionId),
+        FfiConverterInt64.lower(createdAt),
+        FfiConverterBool.lower(deleted),$0
+    )
+}
+}
+    
+    /**
+     * Enqueue a custom-idea upsert (SUR-726). Plaintext metadata only (mirrors `upsertIdea`);
+     * `description` defaults to `""` when absent (the PWA's `|| ''`). `updated_at` stamped at enqueue.
+     */
+open func enqueueCustomIdea(id: String, name: String, description: String?, createdAt: Int64, deleted: Bool)throws  {try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_braird_core_fn_method_syncengine_enqueue_custom_idea(self.uniffiClonePointer(),
+        FfiConverterString.lower(id),
+        FfiConverterString.lower(name),
+        FfiConverterOptionString.lower(description),
+        FfiConverterInt64.lower(createdAt),
+        FfiConverterBool.lower(deleted),$0
+    )
+}
+}
+    
+    /**
+     * Enqueue a lens upsert (SUR-726) — ONE authored query. Plaintext; `leaf_ids` is a cloud
+     * `text[]` (JSON array on the wire), whole-row LWW (SUR-737 — no leaf union). `combinator` /
+     * `threshold` default to `"AND"` / `100` (mirrors `upsertLens`'s `|| 'AND'` / `?? 100`). No
+     * client-side range check on threshold — the server CHECK (0..=100) enforces it, like the PWA.
+     */
+open func enqueueLens(id: String, name: String, leafIds: [String], combinator: String?, threshold: Int64?, createdAt: Int64, deleted: Bool)throws  {try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_braird_core_fn_method_syncengine_enqueue_lens(self.uniffiClonePointer(),
+        FfiConverterString.lower(id),
+        FfiConverterString.lower(name),
+        FfiConverterSequenceString.lower(leafIds),
+        FfiConverterOptionString.lower(combinator),
+        FfiConverterOptionInt64.lower(threshold),
+        FfiConverterInt64.lower(createdAt),
+        FfiConverterBool.lower(deleted),$0
+    )
+}
+}
+    
+    /**
      * Enqueue a note upsert — the seal-at-write path. `text` is the PLAINTEXT; it is sealed here
      * (enc:v2, AAD = note id) and `content_tag` is computed here FROM the plaintext (both while
      * the plaintext is in hand). The stored outbox payload holds only the ciphertext + the tag.
@@ -711,6 +838,51 @@ open func enqueueNote(id: String, bookId: String?, plaintext: String, page: Stri
 }
     
     /**
+     * Enqueue a note-link upsert (SUR-726) — a parent→child annotation edge. Plaintext only;
+     * `relation_type` defaults to `"handwritten_annotation"` (mirrors the surfc column default). A
+     * remove is the same call with `deleted: true` (tombstone). Row-per-edge on a random pk (a
+     * "bag" in the SUR-737 convergence contract): concurrent adds of the same logical edge do NOT
+     * dedup — unlike memberships' deterministic pk.
+     */
+open func enqueueNoteLink(id: String, fromNoteId: String, toNoteId: String, relationType: String?, createdAt: Int64, deleted: Bool)throws  {try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_braird_core_fn_method_syncengine_enqueue_note_link(self.uniffiClonePointer(),
+        FfiConverterString.lower(id),
+        FfiConverterString.lower(fromNoteId),
+        FfiConverterString.lower(toNoteId),
+        FfiConverterOptionString.lower(relationType),
+        FfiConverterInt64.lower(createdAt),
+        FfiConverterBool.lower(deleted),$0
+    )
+}
+}
+    
+    /**
+     * Enqueue a note-signals upsert (SUR-726) — per-note behavioural counters, keyed by `note_id`
+     * (there is NO separate `id` column; the payload carries `note_id` only, matching
+     * `upsertNoteSignals`). Whole-row LWW; concurrent increments are lossy but self-heal (SUR-737,
+     * ratified — derived data). Params follow the descriptor column order.
+     *
+     * CONTRACT (mirror of surfc's `ensureNoteSignals`): hosts must NOT enqueue a fresh "birth" row.
+     * A birth row is local-only lazy-init; pushing one would clobber another device's earned counters
+     * under whole-row LWW. Enqueue only on a genuine behavioural change.
+     */
+open func enqueueNoteSignals(noteId: String, sourcePrior: Double, returnVisits: Int64, hasAnnotation: Bool, stitchSpawns: Int64, exposureRecencyAt: Int64, engagementRecencyAt: Int64, importance: Double, createdAt: Int64, deleted: Bool)throws  {try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_braird_core_fn_method_syncengine_enqueue_note_signals(self.uniffiClonePointer(),
+        FfiConverterString.lower(noteId),
+        FfiConverterDouble.lower(sourcePrior),
+        FfiConverterInt64.lower(returnVisits),
+        FfiConverterBool.lower(hasAnnotation),
+        FfiConverterInt64.lower(stitchSpawns),
+        FfiConverterInt64.lower(exposureRecencyAt),
+        FfiConverterInt64.lower(engagementRecencyAt),
+        FfiConverterDouble.lower(importance),
+        FfiConverterInt64.lower(createdAt),
+        FfiConverterBool.lower(deleted),$0
+    )
+}
+}
+    
+    /**
      * Push every queued write to Supabase (books-first, remap, notes; failed stay queued).
      * Synchronous FFI — the async PostgREST calls run on the owned runtime via `block_on`.
      */
@@ -722,8 +894,8 @@ open func flush()throws  -> FlushSummary {
 }
     
     /**
-     * Pull incrementally from Supabase for the in-scope tables (`books` + `notes` this slice; the
-     * other six follow in SUR-726 by extending `TABLES`). Merges last-write-wins by `updated_at`,
+     * Pull incrementally from Supabase for **all eight synced tables** (SUR-726 —
+     * [`synced_table_names`] is the one source of the pull scope). Merges last-write-wins by `updated_at`,
      * applies tombstones without resurrecting soft-deleted rows, **rebases the outbox** (drops a
      * queued local edit a newer remote row beat — SUR-736 — and reports it in `superseded`,
      * SUR-738), and advances each per-table cursor to a lookback watermark (`now()` minus
@@ -1652,6 +1824,30 @@ extension SyncError: Foundation.LocalizedError {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionInt64: FfiConverterRustBuffer {
+    typealias SwiftType = Int64?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterInt64.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterInt64.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionString: FfiConverterRustBuffer {
     typealias SwiftType = String?
 
@@ -1722,6 +1918,20 @@ fileprivate struct FfiConverterSequenceTypeSupersededEdit: FfiConverterRustBuffe
         return seq
     }
 }
+/**
+ * Derive a `collection_memberships` primary key from its `(collection_id, note_id)` pair — the
+ * FFI-exported mirror of surfc's `membershipId(collectionId, noteId)`, so a host can look up or
+ * join local membership rows by the same deterministic id the sync layer writes (SUR-726). Thin
+ * wrapper over [`crate::store::membership_id`]; collection id first.
+ */
+public func membershipId(collectionId: String, noteId: String) -> String {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_braird_core_fn_func_membership_id(
+        FfiConverterString.lower(collectionId),
+        FfiConverterString.lower(noteId),$0
+    )
+})
+}
 
 private enum InitializationResult {
     case ok
@@ -1738,16 +1948,37 @@ private var initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
+    if (uniffi_braird_core_checksum_func_membership_id() != 9610) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_braird_core_checksum_method_syncengine_enqueue_book() != 22816) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_braird_core_checksum_method_syncengine_enqueue_collection() != 43786) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_braird_core_checksum_method_syncengine_enqueue_collection_membership() != 42356) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_braird_core_checksum_method_syncengine_enqueue_custom_idea() != 46286) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_braird_core_checksum_method_syncengine_enqueue_lens() != 60504) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_enqueue_note() != 25351) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_braird_core_checksum_method_syncengine_enqueue_note_link() != 53465) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_braird_core_checksum_method_syncengine_enqueue_note_signals() != 33526) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_braird_core_checksum_method_syncengine_flush() != 39156) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_braird_core_checksum_method_syncengine_pull() != 4639) {
+    if (uniffi_braird_core_checksum_method_syncengine_pull() != 18621) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_set_access_token() != 47386) {

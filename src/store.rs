@@ -293,6 +293,26 @@ pub fn synced_schema() -> &'static [TableSchema] {
     ]
 }
 
+/// The synced tables in dependency (topological) order — every FK parent precedes its children.
+/// Derived from [`synced_schema`] so the pull scope (SUR-726 fans out to all eight) and the flush
+/// order both follow the descriptor: a ninth table joins both by being added to `synced_schema`
+/// once. The schema order IS a valid topo order — verified against the surfc FKs: `notes.book_id`
+/// → books; `note_links.{from,to}_note_id` → notes; `collection_memberships.{note_id,collection_id}`
+/// → notes/collections; `note_signals.note_id` → notes (each parent listed earlier).
+pub fn synced_table_names() -> Vec<&'static str> {
+    synced_schema().iter().map(|t| t.name).collect()
+}
+
+/// The deterministic primary key of a `collection_memberships` row — the byte-exact mirror of
+/// surfc's `membershipId(collectionId, noteId)` (`src/db.js`): a plain `collection:note` join,
+/// **collection id first**. Deriving it (rather than taking a host-supplied id) is what makes two
+/// devices adding the same note to the same collection converge to ONE row — the SUR-737 OR-set
+/// add. Assumes neither id contains a `:` (they are server uuids / stable slugs; the PWA only logs
+/// a dev warning on a stray colon, and this does not re-validate — same assumption as the oracle).
+pub fn membership_id(collection_id: &str, note_id: &str) -> String {
+    format!("{collection_id}:{note_id}")
+}
+
 /// The local-only / derived stores (parent SUR-659 §1) — present in the mirror but
 /// **never synced** and **exempt from the drift guard**: `meta` is the config + the
 /// per-table sync cursors (a KV store), `outbox` the pending-write queue keyed

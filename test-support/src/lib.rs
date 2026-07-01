@@ -125,3 +125,25 @@ pub fn select(env: &SupabaseEnv, access_token: &str, table: &str, query: &str) -
         .json()
         .expect("select body")
 }
+
+/// Upsert rows for the authenticated user in the PWA wire shape — the seed seam for the SUR-726
+/// coexistence matrix, where a test needs FULL column sets the partial `enqueue_*` FFI can't yet
+/// carry (a book's cover fields, a note's `image_path`/`source_meta`/…). `rows` is a JSON array of
+/// snake_case column objects; `on_conflict` is the pk column. Uses `resolution=merge-duplicates`,
+/// mirroring the client upsert (`sync::http::post_upsert`).
+pub fn upsert(env: &SupabaseEnv, access_token: &str, table: &str, on_conflict: &str, rows: &Value) {
+    reqwest::blocking::Client::new()
+        .post(format!(
+            "{}/rest/v1/{}?on_conflict={}",
+            env.url, table, on_conflict
+        ))
+        .header("apikey", &env.anon_key)
+        .header("Authorization", format!("Bearer {access_token}"))
+        .header("Content-Type", "application/json")
+        .header("Prefer", "resolution=merge-duplicates")
+        .json(rows)
+        .send()
+        .expect("upsert send")
+        .error_for_status()
+        .expect("upsert status");
+}
