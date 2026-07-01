@@ -7,6 +7,14 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 ## [Unreleased]
 
 ### Changed
+- **GATING.md restructured for the GCE line (SUR-728).** Moved the path→pattern→gate table
+  from §2 to **§3** with the canonical four columns (Path · Pattern · Primary gate · Fallback
+  gate), so the line's classifier `gce/src/read-gating.ts` — which parses §3 **only** — reads
+  braird-core's gates (a §2 table was invisible to it, silently ungating the repo). All seven
+  rows preserved, including the SUR-723 sync/store row; grounded to `main` (dropped the
+  non-existent `*.udl` / `build.rs`; the binding surface is `#[uniffi::export]`). `CLAUDE.md`
+  Layout grounded to match. Verified: the gce parser reads 7 §3 rows and all named personas
+  (`crypto-reviewer`, `sync-reviewer`, `naming-reviewer`, `architecture-decision-reviewer`) resolve.
 - ADR 0002 (crypto backend: RustCrypto over ring/aws-lc-rs) accepted — crypto-reviewer + founder sign-off (SUR-716 gate).
 - **GATING.md:** activated `sync-reviewer` (Phase 2) — added the sync-engine/local-store path row (`src/store.rs`, `src/sync/**`, `vendored/schema/**`, `scripts/extract-sync-schema.mjs`) and removed it from "Not yet in scope" (SUR-723).
 - **ADR 0002:** recorded the `rusqlite` (bundled SQLite) dependency choice as a decision note — reversible/routine, folded into the existing core-impl ADR rather than a standalone one (SUR-723).
