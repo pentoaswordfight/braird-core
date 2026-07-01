@@ -115,23 +115,82 @@ impl PostgrestClient {
         }
         Ok(())
     }
+
+    /// Fetch every row of `table` with `updated_at >= cursor`, ordered ascending — the incremental
+    /// pull read (SUR-725 / SUR-659c). Mirrors surfc `fetchSince` (`.from(table).select('*')
+    /// .gte('updated_at', since)`): **inclusive** on the boundary, so a row stamped exactly at the
+    /// cursor re-pulls (idempotent under the caller's last-write-wins merge — the deliberate mirror
+    /// of the oracle's `.gte`, not the ticket prose's `>`). Returns the raw PostgREST row objects
+    /// (snake_case); RLS scopes them to the token's user, and (per the soft-delete invariant) the
+    /// owner sees their own tombstones so `deleted:1` rows come back too.
+    pub async fn get_since(
+        &self,
+        table: &str,
+        cursor: i64,
+    ) -> Result<Vec<Value>, Box<dyn std::error::Error + Send + Sync>> {
+        let token = self
+            .access_token
+            .as_deref()
+            .ok_or("no access token set — call set_access_token before pull")?;
+
+        let url = format!(
+            "{}/rest/v1/{}?updated_at=gte.{}&order=updated_at.asc",
+            self.base_url, table, cursor
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert("apikey", HeaderValue::from_str(&self.anon_key)?);
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}"))?,
+        );
+
+        let resp = self.http.get(&url).headers(headers).send().await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(Box::new(PostgrestError {
+                status: status.as_u16(),
+                body,
+            }));
+        }
+        // ponytail: single request, no pagination — mirrors the JS `fetchSince` oracle. PostgREST
+        // caps every response at `max_rows` (DEFAULT 1000), so an account whose per-table delta
+        // exceeds the cap pulls only the first page, and `pull_table` then advances the cursor past
+        // the rest — permanently skipping them. This is a REAL defect shared with the PWA (already
+        // hit there at ~1.6k notes), tracked by SUR-652: the durable fix pages with `Range` /
+        // `Content-Range` under a stable `updated_at,id` order until a short page, THEN advances the
+        // cursor. Out of scope for this slice (the notes+books coexistence proof runs well under the
+        // cap); fix it in SUR-652 across the PWA + this core together.
+        Ok(resp.json::<Vec<Value>>().await?)
+    }
 }
 
-/// The upsert sink [`push::flush`](super::push::flush) writes through. `PostgrestClient` is the
-/// production impl (a real reqwest POST); a `#[cfg(test)]` stub lets the flush orchestration
-/// (books-first ordering, failed-parent guard, remap-persist) be unit-tested without a live
-/// Supabase — the SUR-724 Gate-2 testability concern.
+/// The PostgREST seam [`push::flush`](super::push::flush) and [`pull`](super::pull) drive.
+/// `PostgrestClient` is the production impl (real reqwest POST/GET); a `#[cfg(test)]` stub lets
+/// the flush/pull orchestration be unit-tested without a live Supabase — the SUR-724 Gate-2
+/// testability concern, extended to pull in SUR-725.
 ///
-/// `async fn` in a trait is fine here: the flush runs single-threaded on the engine's
+/// `async fn` in a trait is fine here: flush and pull both run single-threaded on the engine's
 /// current-thread runtime, so the returned futures never need to be `Send`.
 #[allow(async_fn_in_trait)]
 pub trait PostgrestSink {
     async fn upsert(&self, table: &str, on_conflict: &str, rows: &Value) -> Result<(), String>;
+
+    /// Fetch `table` rows with `updated_at >= cursor` (incremental pull, SUR-725).
+    async fn fetch_since(&self, table: &str, cursor: i64) -> Result<Vec<Value>, String>;
 }
 
 impl PostgrestSink for PostgrestClient {
     async fn upsert(&self, table: &str, on_conflict: &str, rows: &Value) -> Result<(), String> {
         self.post_upsert(table, on_conflict, rows)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn fetch_since(&self, table: &str, cursor: i64) -> Result<Vec<Value>, String> {
+        self.get_since(table, cursor)
             .await
             .map_err(|e| e.to_string())
     }

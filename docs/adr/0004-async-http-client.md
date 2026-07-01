@@ -1,8 +1,13 @@
-# ADR 0001 — Async HTTP client: reqwest + tokio current_thread + rustls
+# ADR 0004 — Async HTTP client: reqwest + tokio current_thread + rustls
 
 **Date:** 2026-06-30  
 **Status:** Accepted  
 **Ticket:** SUR-659 (decision), SUR-724 (first implementation)
+
+> **Renumbered 0001 → 0004 (SUR-725).** "ADR 0001" is the repo-founding Rust+UniFFI decision
+> (surfc#331, in `surfc/docs/architecture/`), referenced unqualified across this repo
+> (`GATING.md`, ADR 0002/0003, `src/store.rs`). SUR-724 (PR#7) mistakenly landed this HTTP-client
+> ADR as a *local* 0001, colliding with that meaning; renumbered to the next free local ADR.
 
 ---
 

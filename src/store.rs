@@ -5,17 +5,20 @@
 //! Source of truth (founder, SUR-723 Gate-1 remediation):
 //!   - the synced COLUMN SET is what `surfc/src/supabase.js` `upsert*` payloads carry (the
 //!     authority — `fetchSince` does `select('*')`, so it pulls every column but does not
-//!     enumerate the set; a future server-stamped pull-only column is a SUR-725 concern);
+//!     enumerate the set; SUR-725 verified `user_id` is the only server-only column pull sees,
+//!     and `apply_row` projects it — plus any future additive column — out);
 //!   - logical TYPES come from the Supabase migrations;
 //!   - both are captured in the vendored `vendored/schema/sync-schema.json` fixture, which
 //!     [`synced_schema`] mirrors exactly and `tests/schema_parity.rs` reconciles against
 //!     (CI re-derives the fixture from surfc/main via `scripts/extract-sync-schema.mjs`).
 //!
 //! `user_id` is auth-injected at push (the device's own user), never stored — exactly as
-//! the Dexie local store omits it. The sync methods (outbox flush, pull) that read/write
-//! these tables arrive in SUR-724/725; this slice lands the schema + the drift guard only.
+//! the Dexie local store omits it. The sync methods that read/write these tables landed in
+//! SUR-724 (outbox flush) + SUR-725 (`get_row` / `apply_row` + the per-table pull cursor).
 
-use rusqlite::Connection;
+use rusqlite::types::Value as SqlValue;
+use rusqlite::{Connection, OptionalExtension};
+use serde_json::{Map, Value};
 
 /// One `outbox` row read back by [`Store::outbox_items`]: `(id, table_name, record_id,
 /// payload_json, created_at)`. Aliased so the 5-tuple stays readable at the call site (and
@@ -70,6 +73,67 @@ pub struct TableSchema {
 }
 
 use ColType::{Bool, Int, Json, Real, Text};
+
+/// The descriptor for one synced table by name, or `None` if `name` is not a synced table.
+/// The read/write helpers (`get_row` / `apply_row`) and the pull loop use this to stay
+/// table-generic — SUR-726 fans out to the other six stores by extending the pull table list,
+/// not by touching these helpers.
+pub fn table_schema(name: &str) -> Option<&'static TableSchema> {
+    synced_schema().iter().find(|t| t.name == name)
+}
+
+/// Descriptor lookup that fails loudly for a non-synced table (a caller bug, not a data error).
+fn schema_or_err(table: &str) -> rusqlite::Result<&'static TableSchema> {
+    table_schema(table).ok_or_else(|| {
+        rusqlite::Error::InvalidParameterName(format!("unknown synced table: {table}"))
+    })
+}
+
+/// Coerce one incoming JSON column value to the SQLite value for its declared [`ColType`].
+/// Absent / null → SQL NULL. `Json` columns (`tags`, `source_meta`) are stored as their JSON
+/// TEXT (≡ the cloud `jsonb`/`text[]`). Off-type values fall back to NULL rather than guessing.
+fn json_to_sql(v: Option<&Value>, ty: ColType) -> SqlValue {
+    match v {
+        None | Some(Value::Null) => SqlValue::Null,
+        Some(val) => match ty {
+            ColType::Text => match val {
+                Value::String(s) => SqlValue::Text(s.clone()),
+                _ => SqlValue::Null,
+            },
+            ColType::Int => val
+                .as_i64()
+                .map(SqlValue::Integer)
+                .unwrap_or(SqlValue::Null),
+            ColType::Bool => match val {
+                Value::Bool(b) => SqlValue::Integer(*b as i64),
+                Value::Number(n) => SqlValue::Integer((n.as_f64().unwrap_or(0.0) != 0.0) as i64),
+                _ => SqlValue::Null,
+            },
+            ColType::Real => val.as_f64().map(SqlValue::Real).unwrap_or(SqlValue::Null),
+            ColType::Json => SqlValue::Text(val.to_string()),
+        },
+    }
+}
+
+/// Inverse of [`json_to_sql`]: a stored SQLite value back to JSON for its declared [`ColType`].
+/// `Bool` reads 0/1 back as a JSON bool; `Json` re-parses the stored TEXT to its array/object.
+fn sql_to_json(sv: SqlValue, ty: ColType) -> Value {
+    match sv {
+        SqlValue::Null => Value::Null,
+        SqlValue::Integer(i) => match ty {
+            ColType::Bool => Value::Bool(i != 0),
+            _ => Value::Number(i.into()),
+        },
+        SqlValue::Real(f) => serde_json::Number::from_f64(f)
+            .map(Value::Number)
+            .unwrap_or(Value::Null),
+        SqlValue::Text(s) => match ty {
+            ColType::Json => serde_json::from_str(&s).unwrap_or(Value::Null),
+            _ => Value::String(s),
+        },
+        SqlValue::Blob(_) => Value::Null, // no blob columns in the synced tables
+    }
+}
 
 /// The 8 synced stores (parent SUR-659 §1), mirroring the vendored fixture exactly.
 /// Every row carries `updated_at` (epoch bigint) + a `deleted` soft-delete flag.
@@ -236,9 +300,17 @@ fn create_table_sql(t: &TableSchema) -> String {
     )
 }
 
-// ponytail: no secondary indexes here — none are queried in this slice. The
-// `updated_at` (pull) and outbox `(table, record_id)` (collapse) indexes land with the
-// queries that use them in SUR-724/725, where their cost is justified by a read path.
+/// `CREATE INDEX IF NOT EXISTS` on `updated_at` for a synced table — the incremental-pull
+/// read path (`fetchSince`'s `updated_at >= cursor`, SUR-725). Mirrors surfc's server-side
+/// `*_updated_at_idx` indexes (migrations 0006/0034/0042/0043/0047). ponytail: the outbox
+/// `(table, record_id)` collapse index is still not added — collapse reads the whole queue,
+/// so no index earns its cost there yet.
+fn create_updated_at_index_sql(t: &TableSchema) -> String {
+    format!(
+        "CREATE INDEX IF NOT EXISTS {0}_updated_at_idx ON {0}(updated_at);",
+        t.name,
+    )
+}
 
 /// The on-device SQLite store: the 8 synced tables + the 4 local-only stores.
 pub struct Store {
@@ -267,6 +339,7 @@ impl Store {
     fn init_schema(&self) -> rusqlite::Result<()> {
         for t in synced_schema() {
             self.conn.execute_batch(&create_table_sql(t))?;
+            self.conn.execute_batch(&create_updated_at_index_sql(t))?;
         }
         for ddl in LOCAL_ONLY_DDL {
             self.conn.execute_batch(ddl)?;
@@ -368,6 +441,86 @@ impl Store {
         )?;
         Ok(())
     }
+
+    // ── synced-table read/write + pull cursors (SUR-725) ──────────────────────
+    // The inverse of the outbox path: `apply_row` merges a remote row INTO a synced table
+    // (pull), and `get_row` reads one back (the pull LWW compare + host/test introspection).
+    // Both are descriptor-driven, so they cover all 8 synced stores for the SUR-726 fan-out.
+
+    /// Read one synced-table row by primary key as a JSON object (descriptor columns only,
+    /// coerced back to JSON per [`ColType`]), or `None` if absent. The pull merge reads
+    /// `updated_at` off this for its last-write-wins decision.
+    pub fn get_row(&self, table: &str, id: &str) -> rusqlite::Result<Option<Map<String, Value>>> {
+        let schema = schema_or_err(table)?;
+        let col_list = schema
+            .columns
+            .iter()
+            .map(|(n, _)| *n)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT {col_list} FROM {} WHERE {} = ?1",
+            schema.name, schema.pk[0]
+        );
+        self.conn
+            .query_row(&sql, [id], |row| {
+                let mut map = Map::new();
+                for (i, (name, ty)) in schema.columns.iter().enumerate() {
+                    let sv: SqlValue = row.get(i)?;
+                    map.insert((*name).to_string(), sql_to_json(sv, *ty));
+                }
+                Ok(map)
+            })
+            .optional()
+    }
+
+    /// Upsert a remote row into a synced table (the pull sink). The row is **projected onto the
+    /// descriptor's known columns** — `user_id` (the one server-only column on the wire) and any
+    /// future additive server column are dropped, and `Json` columns are stored as TEXT. A stray
+    /// unknown key would otherwise make the generated INSERT reference a non-existent column and
+    /// fail the whole pull. `INSERT OR REPLACE` is a full-row replace (last-write-wins is decided
+    /// by the caller before this runs), mirroring the JS `db.<table>.put({...})`.
+    pub fn apply_row(&self, table: &str, row: &Map<String, Value>) -> rusqlite::Result<()> {
+        let schema = schema_or_err(table)?;
+        let cols: Vec<&str> = schema.columns.iter().map(|(n, _)| *n).collect();
+        let values: Vec<SqlValue> = schema
+            .columns
+            .iter()
+            .map(|(name, ty)| json_to_sql(row.get(*name), *ty))
+            .collect();
+        let placeholders = (1..=cols.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "INSERT OR REPLACE INTO {} ({}) VALUES ({placeholders})",
+            schema.name,
+            cols.join(", "),
+        );
+        self.conn
+            .execute(&sql, rusqlite::params_from_iter(values))?;
+        Ok(())
+    }
+
+    /// The per-table incremental-pull cursor (epoch-ms watermark), or `None` on the first pull.
+    /// Local-only (in `meta`, keyed `sync:cursor:<table>`) — an intentional divergence from the
+    /// PWA's single global `meta.lastSyncAt` (founder, SUR-659): each table advances independently
+    /// so one table's fetch failure never skips another's changes.
+    pub fn get_sync_cursor(&self, table: &str) -> rusqlite::Result<Option<i64>> {
+        Ok(self
+            .meta_get(&sync_cursor_key(table))?
+            .and_then(|s| s.parse::<i64>().ok()))
+    }
+
+    /// Advance a per-table pull cursor (called only after that table's merge succeeds).
+    pub fn set_sync_cursor(&self, table: &str, cursor: i64) -> rusqlite::Result<()> {
+        self.meta_set(&sync_cursor_key(table), &cursor.to_string())
+    }
+}
+
+/// The `meta` key holding a table's incremental-pull cursor.
+fn sync_cursor_key(table: &str) -> String {
+    format!("sync:cursor:{table}")
 }
 
 #[cfg(test)]
@@ -452,5 +605,120 @@ mod tests {
             store.meta_get("bookIdRemap").unwrap().as_deref(),
             Some(r#"{"a":"server-1"}"#)
         );
+    }
+
+    // ── SUR-725 synced-table read/write + pull cursors ────────────────────────
+
+    #[test]
+    fn apply_row_then_get_row_roundtrips_all_coltypes() {
+        use serde_json::json;
+        let store = Store::open_in_memory().unwrap();
+        // A notes row exercising every ColType: Text, Json (tags array), Bool (deleted), Int.
+        let row = json!({
+            "id": "n1",
+            "book_id": "b1",
+            "text": "enc:v2:cipher",
+            "page": "12",
+            "tags": ["philosophy", "ethics"],
+            "source_meta": { "author": "Plato" },
+            "content_tag": "abc123",
+            "created_at": 1_700_000_000_000_i64,
+            "updated_at": 1_700_000_000_500_i64,
+            "deleted": false
+        });
+        store.apply_row("notes", row.as_object().unwrap()).unwrap();
+
+        let got = store.get_row("notes", "n1").unwrap().expect("row present");
+        assert_eq!(got["text"], json!("enc:v2:cipher"));
+        assert_eq!(got["tags"], json!(["philosophy", "ethics"]), "Json → array");
+        assert_eq!(got["source_meta"], json!({ "author": "Plato" }));
+        assert_eq!(got["updated_at"], json!(1_700_000_000_500_i64), "Int");
+        assert_eq!(got["deleted"], json!(false), "Bool 0/1 → JSON bool");
+        // A column absent from the incoming row lands as null (additive-nullable).
+        assert_eq!(got["image_path"], Value::Null);
+    }
+
+    #[test]
+    fn apply_row_projects_out_user_id_and_unknown_columns() {
+        use serde_json::json;
+        let store = Store::open_in_memory().unwrap();
+        // `select('*')` returns `user_id` (the one server-only column) — apply_row must drop it
+        // (and any future additive server column) rather than fail on an unknown column.
+        let row = json!({
+            "id": "b1",
+            "user_id": "00000000-0000-0000-0000-000000000000",
+            "title": "Apology",
+            "author": "Plato",
+            "created_at": 1_i64,
+            "updated_at": 2_i64,
+            "deleted": false,
+            "some_future_server_column": "ignored"
+        });
+        store.apply_row("books", row.as_object().unwrap()).unwrap();
+        let got = store.get_row("books", "b1").unwrap().expect("row present");
+        assert_eq!(got["title"], json!("Apology"));
+        assert!(!got.contains_key("user_id"), "user_id not stored locally");
+        assert!(!got.contains_key("some_future_server_column"));
+    }
+
+    #[test]
+    fn apply_row_is_a_full_row_replace_on_conflict() {
+        use serde_json::json;
+        let store = Store::open_in_memory().unwrap();
+        store
+            .apply_row(
+                "books",
+                json!({ "id": "b1", "title": "Old", "updated_at": 1_i64, "deleted": false })
+                    .as_object()
+                    .unwrap(),
+            )
+            .unwrap();
+        store
+            .apply_row(
+                "books",
+                json!({ "id": "b1", "title": "New", "updated_at": 2_i64, "deleted": false })
+                    .as_object()
+                    .unwrap(),
+            )
+            .unwrap();
+        let got = store.get_row("books", "b1").unwrap().unwrap();
+        assert_eq!(got["title"], json!("New"));
+        assert_eq!(got["updated_at"], json!(2_i64));
+    }
+
+    #[test]
+    fn get_row_absent_is_none() {
+        let store = Store::open_in_memory().unwrap();
+        assert!(store.get_row("notes", "nope").unwrap().is_none());
+    }
+
+    #[test]
+    fn sync_cursor_defaults_none_then_roundtrips_per_table() {
+        let store = Store::open_in_memory().unwrap();
+        assert_eq!(store.get_sync_cursor("notes").unwrap(), None);
+        store.set_sync_cursor("notes", 1_700_000_000_000).unwrap();
+        assert_eq!(
+            store.get_sync_cursor("notes").unwrap(),
+            Some(1_700_000_000_000)
+        );
+        // Per-table isolation: advancing notes must not touch the books cursor.
+        assert_eq!(store.get_sync_cursor("books").unwrap(), None);
+    }
+
+    #[test]
+    fn synced_tables_have_updated_at_index() {
+        let store = Store::open_in_memory().unwrap();
+        for t in synced_schema() {
+            let idx = format!("{}_updated_at_idx", t.name);
+            let n: i64 = store
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type='index' AND name=?1",
+                    [&idx],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "missing {idx}");
+        }
     }
 }

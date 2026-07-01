@@ -210,6 +210,11 @@ mod tests {
                 _ => Ok(()),
             }
         }
+
+        // The push tests never pull; the flush path only drives `upsert`.
+        async fn fetch_since(&self, _table: &str, _cursor: i64) -> Result<Vec<Value>, String> {
+            Ok(Vec::new())
+        }
     }
 
     fn sink(fail_table: Option<&str>) -> VecSink {
