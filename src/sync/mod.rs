@@ -284,7 +284,7 @@ impl SyncEngine {
 /// until a full re-pull (reset the cursor to 0). The complete fix — a server-assigned monotonic
 /// watermark the cursor tracks, distinct from the client `updated_at` used for LWW — is SUR-739.
 /// Tunable: larger = fewer misses, more re-fetch per pull (bounded by pagination, SUR-652).
-const PULL_CURSOR_OVERLAP_MS: i64 = 60 * 60 * 1000; // 1 hour
+const PULL_CURSOR_OVERLAP_MS: i64 = 24 * 60 * 60 * 1000; // 24h — covers a full offline day (e.g. a flight)
 
 /// Epoch milliseconds — the PWA `Date.now()` unit the cloud data is stamped in. `SystemTime`
 /// before the epoch is impossible on a sane clock; clamp to 0 rather than panic.
