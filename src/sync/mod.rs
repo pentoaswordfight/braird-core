@@ -50,14 +50,36 @@ pub struct FlushSummary {
     pub still_queued: u32,
 }
 
+/// One local edit the pull dropped because a strictly-newer remote row won last-write-wins
+/// (SUR-736/738) — so a host can tell the user their offline edit was superseded. Not an
+/// *unresolved* conflict: the remote already won under LWW. `discarded_updated_at` is the newest
+/// dropped outbox stamp; `winning_updated_at` is the remote stamp that beat it. Ids + timestamps
+/// only — never payload contents (E2EE: nothing decrypted or logged here).
+#[derive(Debug, PartialEq, uniffi::Record)]
+pub struct SupersededEdit {
+    pub table: String,
+    pub record_id: String,
+    pub discarded_updated_at: i64,
+    pub winning_updated_at: i64,
+}
+
 /// The result of a pull across the FFI: rows seen, rows merged (last-write-wins winners +
-/// applied tombstones), and incoming deletes skipped as "don't-resurrect" (a delete for a row
-/// this device never had).
+/// applied tombstones), incoming deletes skipped as "don't-resurrect" (a delete for a row this
+/// device never had), and the local edits dropped as stale by the outbox rebase (SUR-736/738 —
+/// hosts read `superseded.len()` for the count).
 #[derive(Debug, uniffi::Record)]
 pub struct PullSummary {
     pub pulled: u32,
     pub merged: u32,
     pub skipped_tombstones: u32,
+    pub superseded: Vec<SupersededEdit>,
+}
+
+/// The result of [`SyncEngine::sync`] — one pull then one flush, reported together.
+#[derive(Debug, uniffi::Record)]
+pub struct SyncSummary {
+    pub pull: PullSummary,
+    pub flush: FlushSummary,
 }
 
 /// The on-device sync engine. Owns the SQLite [`Store`], the [`PostgrestClient`], the crypto
@@ -200,18 +222,17 @@ impl SyncEngine {
 
     /// Pull incrementally from Supabase for the in-scope tables (`books` + `notes` this slice; the
     /// other six follow in SUR-726 by extending `TABLES`). Merges last-write-wins by `updated_at`,
-    /// applies tombstones without resurrecting soft-deleted rows, and advances each per-table
-    /// cursor to a lookback watermark (`now()` minus [`PULL_CURSOR_OVERLAP_MS`], SUR-739 — so a
-    /// delayed/offline flush isn't skipped). Synchronous FFI — the async GETs run on the owned
-    /// runtime via `block_on`, exactly like `flush`. Note text stays ciphertext at rest (never
-    /// decrypted on pull); the host decrypts on demand via `Vault::decrypt_note`.
+    /// applies tombstones without resurrecting soft-deleted rows, **rebases the outbox** (drops a
+    /// queued local edit a newer remote row beat — SUR-736 — and reports it in `superseded`,
+    /// SUR-738), and advances each per-table cursor to a lookback watermark (`now()` minus
+    /// [`PULL_CURSOR_OVERLAP_MS`], SUR-739 — so a delayed/offline flush isn't skipped). Synchronous
+    /// FFI — the async GETs run on the owned runtime via `block_on`, exactly like `flush`. Note text
+    /// stays ciphertext at rest (never decrypted on pull); the host decrypts via `Vault::decrypt_note`.
     ///
-    /// **Call `flush()` BEFORE `pull()`** (as the PWA's `syncFromCloud` does). If a local edit is
-    /// still queued in the outbox and a pull merges a strictly-newer remote row for that record,
-    /// the stale outbox entry survives and the next unconditional `flush()` would re-push it over
-    /// the newer server row — a lost remote edit. Flushing first empties the outbox, closing the
-    /// window. The durable fix (rebase the outbox on an LWW win, or a `sync()` that enforces the
-    /// order) is tracked in SUR-736.
+    /// Call order is now safe either way for SUR-736: the rebase drops a stale queued edit as it
+    /// merges the newer remote row, so a following `flush()` can't re-push it. Prefer
+    /// [`SyncEngine::sync`] (pull-then-flush) for the one-call path. (This does NOT fix SUR-740 — a
+    /// flush destroying a newer SERVER row before a pull can see it is the server's job, PR-3.)
     pub fn pull(&self) -> Result<PullSummary, SyncError> {
         const TABLES: &[&str] = &["books", "notes"];
         let store = lock!(self.store);
@@ -245,6 +266,51 @@ impl SyncEngine {
             pulled: result.pulled as u32,
             merged: result.merged as u32,
             skipped_tombstones: result.skipped_tombstones as u32,
+            superseded: result.superseded,
+        })
+    }
+
+    /// Pull, then flush — the one-call convergence path (SUR-736). Pulls FIRST, then flushes.
+    ///
+    /// **Deliberate divergence from the oracle** (surfc's `syncFromCloud` flushes first): with the
+    /// outbox rebase (SUR-736), pulling first fetches the server's newer row and rebases the stale
+    /// local edit out of the outbox, so the following flush pushes nothing stale. Flushing FIRST
+    /// would re-push the stale edit over the newer server row before the pull could see it — the 736
+    /// lost edit. Same class of documented divergence as the per-table cursor.
+    ///
+    /// **The flush is aborted unless the pull was fully clean.** If ANY table's pull failed (partial
+    /// OR total), `sync()` returns an error and does NOT flush. A failed table never rebased its
+    /// outbox (its cursor is unadvanced), so flushing it could re-push a stale edit over a newer
+    /// server row this pull didn't fetch — reopening SUR-736 for that table. This is stricter than
+    /// calling `pull()` + `flush()` separately (where a partial pull is `Ok` and a subsequent flush
+    /// runs) — the strictness is the point: `sync()` guarantees rebase-protected convergence or
+    /// nothing, and the host retries. (This still does NOT fix SUR-740 — a flush destroying a newer
+    /// SERVER row before this pull could see it is the server's job, PR-3.)
+    pub fn sync(&self) -> Result<SyncSummary, SyncError> {
+        const TABLES: &[&str] = &["books", "notes"];
+        let store = lock!(self.store);
+        let client = lock!(self.client);
+        let token = client.access_token().ok_or_else(|| {
+            SyncError::Flush("no access token set — call set_access_token before sync".into())
+        })?;
+        let user_id = user_id_from_jwt(token)
+            .map_err(|e| SyncError::Flush(format!("bad access token: {e}")))?;
+        let now = epoch_ms().saturating_sub(PULL_CURSOR_OVERLAP_MS);
+        let (pull, flush) = self
+            .runtime
+            .block_on(pull_then_flush(&store, &*client, &user_id, TABLES, now))
+            .map_err(SyncError::Flush)?;
+        Ok(SyncSummary {
+            pull: PullSummary {
+                pulled: pull.pulled as u32,
+                merged: pull.merged as u32,
+                skipped_tombstones: pull.skipped_tombstones as u32,
+                superseded: pull.superseded,
+            },
+            flush: FlushSummary {
+                pushed: flush.ok.len() as u32,
+                still_queued: flush.failed.len() as u32,
+            },
         })
     }
 }
@@ -272,6 +338,31 @@ impl SyncEngine {
             .stage_local_write(table, record_id, row, epoch_ms())
             .map_err(|e| SyncError::Store(e.to_string()))
     }
+}
+
+/// Pull then flush, aborting the flush unless the pull was **fully clean** (SUR-736). Shared by
+/// [`SyncEngine::sync`] and the sync integration test (which drives it with a stub sink — the
+/// concrete `PostgrestClient` inside `SyncEngine` can't be made to fail one table but not another).
+/// If ANY table's pull failed (partial or total), returns `Err` and does NOT flush: a failed table
+/// never rebased its outbox, so flushing it could re-push a stale edit over a newer server row this
+/// pull didn't fetch (reopening SUR-736). On a fully-clean pull, flushes and returns both results.
+pub async fn pull_then_flush<S: http::PostgrestSink>(
+    store: &Store,
+    sink: &S,
+    user_id: &str,
+    tables: &[&str],
+    now_ms: i64,
+) -> Result<(pull::PullResult, push::FlushResult), String> {
+    let pulled = pull::pull(store, sink, tables, now_ms).await?;
+    if !pulled.failed_tables.is_empty() {
+        return Err(format!(
+            "pull failed for {} — aborting flush so a stale edit can't re-push over a newer server \
+             row (SUR-736); retry sync",
+            pulled.failed_tables.join(", ")
+        ));
+    }
+    let flushed = push::flush(store, sink, user_id).await?;
+    Ok((pulled, flushed))
 }
 
 /// Lookback the pull cursor keeps behind wall-clock `now()` when it advances (SUR-725 review /
@@ -439,6 +530,38 @@ mod tests {
             row["cover_url"],
             json!("https://cover"),
             "cover survives a partial edit (merge, not full-replace)"
+        );
+    }
+
+    #[test]
+    fn sync_aborts_with_the_pull_error_and_does_not_swallow_it() {
+        // sync() must surface a failure rather than swallow it into an Ok flush. With no access token
+        // it errors immediately (no network), before any flush, so this is deterministic; the queued
+        // write is left untouched. (The partial-pull-failure abort — a table failing mid-pull — is
+        // tested in tests/sync_736_integration.rs via `pull_then_flush` with a stub sink, since a
+        // real PostgrestClient can't be made to fail one table but not another.)
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = SyncEngine::open(
+            db_path.into(),
+            "https://x.supabase.co".into(),
+            "anon".into(),
+            Vault::generate(),
+        )
+        .unwrap();
+        engine
+            .enqueue_book("b1".into(), "T".into(), None, 0, false)
+            .unwrap();
+
+        assert!(
+            engine.sync().is_err(),
+            "sync surfaces the pull error rather than proceeding to flush"
+        );
+        assert_eq!(
+            Store::open(db_path).unwrap().outbox_items().unwrap().len(),
+            1,
+            "the queued write is untouched — sync returned before it could flush"
         );
     }
 }

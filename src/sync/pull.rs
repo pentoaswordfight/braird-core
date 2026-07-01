@@ -17,11 +17,19 @@
 //!     any client-timestamp cursor is incomplete under long-delayed flushes, and the durable fix (a
 //!     server-assigned monotonic watermark, distinct from the LWW `updated_at`) is **SUR-739**.
 //!
+//! Outbox rebase on an LWW win (SUR-736/738): when a pull applies a strictly-newer remote row for
+//! a record that still has a queued local edit, that stale outbox entry is dropped in the SAME
+//! transaction as the apply (via [`Store::apply_row_rebasing_outbox`]) — otherwise the next flush
+//! would re-push the losing edit over the newer server row (a lost remote edit). Each record with a
+//! dropped entry is reported as a [`SupersededEdit`] (the local edit lost LWW and was dropped;
+//! full server-side conflict detection is out of scope — SUR-738 ratifies the client-side signal).
+//!
 //! Source of truth: surfc `src/supabase.js` (`fetchSince`) + `src/db.js` (`mergeCloudRecords`).
 
 use serde_json::Value;
 
 use super::http::PostgrestSink;
+use super::SupersededEdit;
 use crate::store::{table_schema, Store};
 
 /// Counts across a whole pull (one or more tables). `failed_tables` are the tables whose fetch or
@@ -32,6 +40,8 @@ pub struct PullResult {
     pub pulled: usize,
     pub merged: usize,
     pub skipped_tombstones: usize,
+    /// Local edits dropped because a strictly-newer remote row won LWW (SUR-736/738).
+    pub superseded: Vec<SupersededEdit>,
     pub failed_tables: Vec<String>,
 }
 
@@ -40,6 +50,7 @@ struct TableStats {
     pulled: usize,
     merged: usize,
     skipped_tombstones: usize,
+    superseded: Vec<SupersededEdit>,
 }
 
 /// Pull `tables` incrementally. `now_ms` is the watermark each succeeding table's cursor advances
@@ -60,6 +71,7 @@ pub async fn pull<S: PostgrestSink>(
                 result.pulled += stats.pulled;
                 result.merged += stats.merged;
                 result.skipped_tombstones += stats.skipped_tombstones;
+                result.superseded.extend(stats.superseded);
             }
             Err(e) => {
                 // ponytail: log the dropped table — a silent failure would read as "nothing to
@@ -124,10 +136,22 @@ async fn pull_table<S: PostgrestSink>(
             Some(local_ts) => incoming_updated > local_ts,
         };
         if should_apply {
-            store
-                .apply_row(table, obj)
+            // Apply the winner AND drop any now-stale queued edit for this record atomically
+            // (SUR-736) — leaving it would let the next flush re-push it over this newer row.
+            let dropped = store
+                .apply_row_rebasing_outbox(table, obj, incoming_updated)
                 .map_err(|e| format!("apply {table}/{id}: {e}"))?;
             stats.merged += 1;
+            // A dropped entry = a local edit superseded by the remote winner (SUR-738). Key it by
+            // the newest discarded stamp.
+            if let Some(discarded) = dropped.iter().map(|(_, ts)| *ts).max() {
+                stats.superseded.push(SupersededEdit {
+                    table: table.to_string(),
+                    record_id: id.to_string(),
+                    discarded_updated_at: discarded,
+                    winning_updated_at: incoming_updated,
+                });
+            }
         }
     }
 
@@ -144,6 +168,7 @@ async fn pull_table<S: PostgrestSink>(
 mod tests {
     use super::*;
     use crate::store::Store;
+    use crate::sync::SupersededEdit;
     use serde_json::json;
     use std::collections::HashMap;
 
@@ -194,6 +219,19 @@ mod tests {
 
     fn apply_local(store: &Store, table: &str, row: Value) {
         store.apply_row(table, row.as_object().unwrap()).unwrap();
+    }
+
+    /// Queue a pending outbox entry for `notes/id` stamped `ts` (the offline-first shape: a local
+    /// write leaves both a synced row and an outbox row). Returns the outbox id.
+    fn enqueue_pending(store: &Store, id: &str, ts: i64) -> i64 {
+        store
+            .enqueue(
+                "notes",
+                id,
+                &json!({ "id": id, "updated_at": ts }).to_string(),
+                ts,
+            )
+            .unwrap()
     }
 
     #[test]
@@ -335,5 +373,171 @@ mod tests {
         let sink = MapSink::new().with("notes", vec![]);
         block(pull(&store, &sink, &["notes"], 5000)).unwrap();
         assert_eq!(store.get_sync_cursor("notes").unwrap(), Some(5000));
+    }
+
+    // ── SUR-736/738 outbox rebase on an LWW win + conflict signal ─────────────
+
+    #[test]
+    fn rebase_drops_stale_pending_edit_and_surfaces_conflict() {
+        // (1) pending T1, incoming T2 > T1 → row = remote, outbox drained, one conflict surfaced.
+        let store = Store::open_in_memory().unwrap();
+        apply_local(&store, "notes", note("n1", 1000, false, "local"));
+        enqueue_pending(&store, "n1", 1000);
+        let sink = MapSink::new().with("notes", vec![note("n1", 2000, false, "remote")]);
+
+        let res = block(pull(&store, &sink, &["notes"], 9000)).unwrap();
+
+        assert_eq!(res.merged, 1);
+        assert_eq!(
+            res.superseded,
+            vec![SupersededEdit {
+                table: "notes".into(),
+                record_id: "n1".into(),
+                discarded_updated_at: 1000,
+                winning_updated_at: 2000,
+            }]
+        );
+        assert!(
+            store.outbox_items().unwrap().is_empty(),
+            "the stale queued edit is rebased away — the next flush can't re-push it (SUR-736)"
+        );
+        assert_eq!(
+            store.get_row("notes", "n1").unwrap().unwrap()["text"],
+            json!("remote")
+        );
+    }
+
+    #[test]
+    fn newer_local_edit_blocks_rebase_and_keeps_pending() {
+        // (2) pending T3, incoming T2 < T3 → no apply, outbox intact, no conflict.
+        let store = Store::open_in_memory().unwrap();
+        apply_local(&store, "notes", note("n1", 3000, false, "local-newer"));
+        enqueue_pending(&store, "n1", 3000);
+        let sink = MapSink::new().with("notes", vec![note("n1", 2000, false, "remote-older")]);
+
+        let res = block(pull(&store, &sink, &["notes"], 9000)).unwrap();
+
+        assert_eq!(res.merged, 0);
+        assert!(res.superseded.is_empty());
+        assert_eq!(
+            store.outbox_items().unwrap().len(),
+            1,
+            "pending edit survives"
+        );
+        assert_eq!(
+            store.get_row("notes", "n1").unwrap().unwrap()["text"],
+            json!("local-newer")
+        );
+    }
+
+    #[test]
+    fn tie_keeps_local_and_does_not_rebase() {
+        // (3) incoming == local row ts → keep local, outbox intact (rebase never runs).
+        let store = Store::open_in_memory().unwrap();
+        apply_local(&store, "notes", note("n1", 2000, false, "local"));
+        enqueue_pending(&store, "n1", 2000);
+        let sink = MapSink::new().with("notes", vec![note("n1", 2000, false, "remote-tie")]);
+
+        let res = block(pull(&store, &sink, &["notes"], 9000)).unwrap();
+
+        assert_eq!(res.merged, 0);
+        assert!(res.superseded.is_empty());
+        assert_eq!(store.outbox_items().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn incoming_tombstone_rebases_a_pending_edit() {
+        // (4) incoming tombstone T2 over pending edit T1 → tombstone applied, entry dropped.
+        let store = Store::open_in_memory().unwrap();
+        apply_local(&store, "notes", note("n1", 1000, false, "local-live"));
+        enqueue_pending(&store, "n1", 1000);
+        let sink = MapSink::new().with("notes", vec![note("n1", 2000, true, "")]);
+
+        let res = block(pull(&store, &sink, &["notes"], 9000)).unwrap();
+
+        assert_eq!(res.merged, 1);
+        assert_eq!(res.superseded.len(), 1);
+        assert_eq!(
+            store.get_row("notes", "n1").unwrap().unwrap()["deleted"],
+            json!(true)
+        );
+        assert!(
+            store.outbox_items().unwrap().is_empty(),
+            "the pending edit is dropped by the newer delete"
+        );
+    }
+
+    #[test]
+    fn incoming_live_edit_rebases_a_pending_delete() {
+        // (5) pending delete T1 vs incoming live edit T2 → live row applied, delete dropped.
+        // Symmetric with `stale_tombstone_does_not_revive_a_newer_local_row` — a newer edit beats
+        // an older delete; this is LWW, not a resurrection violation (resurrection is a delete for a
+        // row this device never had, guarded separately).
+        let store = Store::open_in_memory().unwrap();
+        apply_local(&store, "notes", note("n1", 1000, true, ""));
+        enqueue_pending(&store, "n1", 1000);
+        let sink = MapSink::new().with("notes", vec![note("n1", 2000, false, "remote-live")]);
+
+        let res = block(pull(&store, &sink, &["notes"], 9000)).unwrap();
+
+        assert_eq!(res.merged, 1);
+        assert_eq!(res.superseded.len(), 1);
+        let row = store.get_row("notes", "n1").unwrap().unwrap();
+        assert_eq!(
+            row["deleted"],
+            json!(false),
+            "newer live edit beats older delete"
+        );
+        assert_eq!(row["text"], json!("remote-live"));
+        assert!(
+            store.outbox_items().unwrap().is_empty(),
+            "pending delete dropped"
+        );
+    }
+
+    #[test]
+    fn multiple_pending_entries_survive_when_incoming_loses_lww() {
+        // (6) pending T1 + T3, incoming T2 → no apply (T2 < local T3), both entries survive.
+        let store = Store::open_in_memory().unwrap();
+        apply_local(&store, "notes", note("n1", 3000, false, "local-latest"));
+        enqueue_pending(&store, "n1", 1000);
+        enqueue_pending(&store, "n1", 3000);
+        let sink = MapSink::new().with("notes", vec![note("n1", 2000, false, "remote-middle")]);
+
+        let res = block(pull(&store, &sink, &["notes"], 9000)).unwrap();
+
+        assert_eq!(res.merged, 0, "incoming T2 < local T3 → no apply");
+        assert!(res.superseded.is_empty());
+        assert_eq!(
+            store.outbox_items().unwrap().len(),
+            2,
+            "both pending entries survive"
+        );
+    }
+
+    #[test]
+    fn pull_does_not_panic_on_a_malformed_pending_payload() {
+        // (7) malformed pending payload → left queued, pull succeeds, no conflict, no panic.
+        let store = Store::open_in_memory().unwrap();
+        apply_local(&store, "notes", note("n1", 1000, false, "local"));
+        store.enqueue("notes", "n1", "not json", 1000).unwrap();
+        let sink = MapSink::new().with("notes", vec![note("n1", 2000, false, "remote")]);
+
+        let res = block(pull(&store, &sink, &["notes"], 9000)).unwrap();
+
+        assert_eq!(res.merged, 1);
+        assert!(
+            res.superseded.is_empty(),
+            "an unparseable entry can't be proven stale → not surfaced"
+        );
+        assert_eq!(
+            store.outbox_items().unwrap().len(),
+            1,
+            "the malformed entry is left queued"
+        );
+        assert_eq!(
+            store.get_row("notes", "n1").unwrap().unwrap()["text"],
+            json!("remote")
+        );
     }
 }

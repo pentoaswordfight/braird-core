@@ -399,6 +399,62 @@ fileprivate class UniffiHandleMap<T> {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterUInt32: FfiConverterPrimitive {
+    typealias FfiType = UInt32
+    typealias SwiftType = UInt32
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UInt32 {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterInt64: FfiConverterPrimitive {
+    typealias FfiType = Int64
+    typealias SwiftType = Int64
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Int64 {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: Int64, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterBool : FfiConverter {
+    typealias FfiType = Int8
+    typealias SwiftType = Bool
+
+    public static func lift(_ value: Int8) throws -> Bool {
+        return value != 0
+    }
+
+    public static func lower(_ value: Bool) -> Int8 {
+        return value ? 1 : 0
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Bool {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: Bool, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterString: FfiConverter {
     typealias SwiftType = String
     typealias FfiType = RustBuffer
@@ -453,6 +509,328 @@ fileprivate struct FfiConverterData: FfiConverterRustBuffer {
         writeInt(&buf, len)
         writeBytes(&buf, value)
     }
+}
+
+
+
+
+/**
+ * The on-device sync engine. Owns the SQLite [`Store`], the [`PostgrestClient`], the crypto
+ * [`Vault`] (for seal-at-write), and a tokio current-thread runtime. `Arc<SyncEngine>` is the
+ * UniFFI handle; the interior `Mutex`es make it `Send + Sync` for Swift/Kotlin callers on any
+ * thread (same shape as `Vault`).
+ */
+public protocol SyncEngineProtocol : AnyObject {
+    
+    /**
+     * Enqueue a book upsert. `updated_at` is stamped in epoch ms at enqueue (never omitted —
+     * the migration default is 0). Plaintext metadata only, no encryption branch (like the PWA
+     * `upsertBook`).
+     */
+    func enqueueBook(id: String, title: String, author: String?, createdAt: Int64, deleted: Bool) throws 
+    
+    /**
+     * Enqueue a note upsert — the seal-at-write path. `text` is the PLAINTEXT; it is sealed here
+     * (enc:v2, AAD = note id) and `content_tag` is computed here FROM the plaintext (both while
+     * the plaintext is in hand). The stored outbox payload holds only the ciphertext + the tag.
+     *
+     * STALE-TAG EDGE (deliberate, mirrors surfc — do not "fix"): the content_tag bakes in the
+     * note's `book_id`, but the flush repoints `book_id` via `bookIdRemap` after an offline
+     * book-merge. So a merged note's tag reflects the PRE-merge book_id. The JS never recomputes
+     * the tag at flush (`flushOutbox` doesn't touch it), and we CAN'T recompute at flush anyway —
+     * under seal-at-write there is no plaintext left. We leave the tag as-is: the rare
+     * stale-tag-after-offline-merge self-heals on the note's next edit (which re-enqueues with a
+     * freshly-computed tag). The tag is never NULL because it is computed pre-seal, from plaintext.
+     */
+    func enqueueNote(id: String, bookId: String?, plaintext: String, page: String?, tags: [String], createdAt: Int64, deleted: Bool) throws 
+    
+    /**
+     * Push every queued write to Supabase (books-first, remap, notes; failed stay queued).
+     * Synchronous FFI — the async PostgREST calls run on the owned runtime via `block_on`.
+     */
+    func flush() throws  -> FlushSummary
+    
+    /**
+     * Pull incrementally from Supabase for the in-scope tables (`books` + `notes` this slice; the
+     * other six follow in SUR-726 by extending `TABLES`). Merges last-write-wins by `updated_at`,
+     * applies tombstones without resurrecting soft-deleted rows, **rebases the outbox** (drops a
+     * queued local edit a newer remote row beat — SUR-736 — and reports it in `superseded`,
+     * SUR-738), and advances each per-table cursor to a lookback watermark (`now()` minus
+     * [`PULL_CURSOR_OVERLAP_MS`], SUR-739 — so a delayed/offline flush isn't skipped). Synchronous
+     * FFI — the async GETs run on the owned runtime via `block_on`, exactly like `flush`. Note text
+     * stays ciphertext at rest (never decrypted on pull); the host decrypts via `Vault::decrypt_note`.
+     *
+     * Call order is now safe either way for SUR-736: the rebase drops a stale queued edit as it
+     * merges the newer remote row, so a following `flush()` can't re-push it. Prefer
+     * [`SyncEngine::sync`] (pull-then-flush) for the one-call path. (This does NOT fix SUR-740 — a
+     * flush destroying a newer SERVER row before a pull can see it is the server's job, PR-3.)
+     */
+    func pull() throws  -> PullSummary
+    
+    /**
+     * Hand the core a GoTrue-issued access token (JWT). The core makes its OWN authenticated
+     * PostgREST calls with it; the `user_id` stamped on each row is the token's `sub` claim.
+     */
+    func setAccessToken(jwt: String) 
+    
+    /**
+     * Pull, then flush — the one-call convergence path (SUR-736). Pulls FIRST, then flushes.
+     *
+     * **Deliberate divergence from the oracle** (surfc's `syncFromCloud` flushes first): with the
+     * outbox rebase (SUR-736), pulling first fetches the server's newer row and rebases the stale
+     * local edit out of the outbox, so the following flush pushes nothing stale. Flushing FIRST
+     * would re-push the stale edit over the newer server row before the pull could see it — the 736
+     * lost edit. Same class of documented divergence as the per-table cursor.
+     *
+     * **The flush is aborted unless the pull was fully clean.** If ANY table's pull failed (partial
+     * OR total), `sync()` returns an error and does NOT flush. A failed table never rebased its
+     * outbox (its cursor is unadvanced), so flushing it could re-push a stale edit over a newer
+     * server row this pull didn't fetch — reopening SUR-736 for that table. This is stricter than
+     * calling `pull()` + `flush()` separately (where a partial pull is `Ok` and a subsequent flush
+     * runs) — the strictness is the point: `sync()` guarantees rebase-protected convergence or
+     * nothing, and the host retries. (This still does NOT fix SUR-740 — a flush destroying a newer
+     * SERVER row before this pull could see it is the server's job, PR-3.)
+     */
+    func sync() throws  -> SyncSummary
+    
+}
+
+/**
+ * The on-device sync engine. Owns the SQLite [`Store`], the [`PostgrestClient`], the crypto
+ * [`Vault`] (for seal-at-write), and a tokio current-thread runtime. `Arc<SyncEngine>` is the
+ * UniFFI handle; the interior `Mutex`es make it `Send + Sync` for Swift/Kotlin callers on any
+ * thread (same shape as `Vault`).
+ */
+open class SyncEngine:
+    SyncEngineProtocol {
+    fileprivate let pointer: UnsafeMutableRawPointer!
+
+    /// Used to instantiate a [FFIObject] without an actual pointer, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoPointer {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+    required public init(unsafeFromRawPointer pointer: UnsafeMutableRawPointer) {
+        self.pointer = pointer
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noPointer: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing [Pointer] the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noPointer: NoPointer) {
+        self.pointer = nil
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiClonePointer() -> UnsafeMutableRawPointer {
+        return try! rustCall { uniffi_braird_core_fn_clone_syncengine(self.pointer, $0) }
+    }
+    // No primary constructor declared for this class.
+
+    deinit {
+        guard let pointer = pointer else {
+            return
+        }
+
+        try! rustCall { uniffi_braird_core_fn_free_syncengine(pointer, $0) }
+    }
+
+    
+    /**
+     * Open the engine over a store at `db_path`, targeting the Supabase project at
+     * `supabase_url` with the public `anon_key`. The [`Vault`] is the caller's unlocked handle
+     * (seal-at-write needs the MK). No access token yet — the host hands one over via
+     * [`SyncEngine::set_access_token`] once GoTrue has issued it.
+     */
+public static func `open`(dbPath: String, supabaseUrl: String, anonKey: String, vault: Vault)throws  -> SyncEngine {
+    return try  FfiConverterTypeSyncEngine.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_braird_core_fn_constructor_syncengine_open(
+        FfiConverterString.lower(dbPath),
+        FfiConverterString.lower(supabaseUrl),
+        FfiConverterString.lower(anonKey),
+        FfiConverterTypeVault.lower(vault),$0
+    )
+})
+}
+    
+
+    
+    /**
+     * Enqueue a book upsert. `updated_at` is stamped in epoch ms at enqueue (never omitted —
+     * the migration default is 0). Plaintext metadata only, no encryption branch (like the PWA
+     * `upsertBook`).
+     */
+open func enqueueBook(id: String, title: String, author: String?, createdAt: Int64, deleted: Bool)throws  {try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_braird_core_fn_method_syncengine_enqueue_book(self.uniffiClonePointer(),
+        FfiConverterString.lower(id),
+        FfiConverterString.lower(title),
+        FfiConverterOptionString.lower(author),
+        FfiConverterInt64.lower(createdAt),
+        FfiConverterBool.lower(deleted),$0
+    )
+}
+}
+    
+    /**
+     * Enqueue a note upsert — the seal-at-write path. `text` is the PLAINTEXT; it is sealed here
+     * (enc:v2, AAD = note id) and `content_tag` is computed here FROM the plaintext (both while
+     * the plaintext is in hand). The stored outbox payload holds only the ciphertext + the tag.
+     *
+     * STALE-TAG EDGE (deliberate, mirrors surfc — do not "fix"): the content_tag bakes in the
+     * note's `book_id`, but the flush repoints `book_id` via `bookIdRemap` after an offline
+     * book-merge. So a merged note's tag reflects the PRE-merge book_id. The JS never recomputes
+     * the tag at flush (`flushOutbox` doesn't touch it), and we CAN'T recompute at flush anyway —
+     * under seal-at-write there is no plaintext left. We leave the tag as-is: the rare
+     * stale-tag-after-offline-merge self-heals on the note's next edit (which re-enqueues with a
+     * freshly-computed tag). The tag is never NULL because it is computed pre-seal, from plaintext.
+     */
+open func enqueueNote(id: String, bookId: String?, plaintext: String, page: String?, tags: [String], createdAt: Int64, deleted: Bool)throws  {try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_braird_core_fn_method_syncengine_enqueue_note(self.uniffiClonePointer(),
+        FfiConverterString.lower(id),
+        FfiConverterOptionString.lower(bookId),
+        FfiConverterString.lower(plaintext),
+        FfiConverterOptionString.lower(page),
+        FfiConverterSequenceString.lower(tags),
+        FfiConverterInt64.lower(createdAt),
+        FfiConverterBool.lower(deleted),$0
+    )
+}
+}
+    
+    /**
+     * Push every queued write to Supabase (books-first, remap, notes; failed stay queued).
+     * Synchronous FFI — the async PostgREST calls run on the owned runtime via `block_on`.
+     */
+open func flush()throws  -> FlushSummary {
+    return try  FfiConverterTypeFlushSummary.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_braird_core_fn_method_syncengine_flush(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * Pull incrementally from Supabase for the in-scope tables (`books` + `notes` this slice; the
+     * other six follow in SUR-726 by extending `TABLES`). Merges last-write-wins by `updated_at`,
+     * applies tombstones without resurrecting soft-deleted rows, **rebases the outbox** (drops a
+     * queued local edit a newer remote row beat — SUR-736 — and reports it in `superseded`,
+     * SUR-738), and advances each per-table cursor to a lookback watermark (`now()` minus
+     * [`PULL_CURSOR_OVERLAP_MS`], SUR-739 — so a delayed/offline flush isn't skipped). Synchronous
+     * FFI — the async GETs run on the owned runtime via `block_on`, exactly like `flush`. Note text
+     * stays ciphertext at rest (never decrypted on pull); the host decrypts via `Vault::decrypt_note`.
+     *
+     * Call order is now safe either way for SUR-736: the rebase drops a stale queued edit as it
+     * merges the newer remote row, so a following `flush()` can't re-push it. Prefer
+     * [`SyncEngine::sync`] (pull-then-flush) for the one-call path. (This does NOT fix SUR-740 — a
+     * flush destroying a newer SERVER row before a pull can see it is the server's job, PR-3.)
+     */
+open func pull()throws  -> PullSummary {
+    return try  FfiConverterTypePullSummary.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_braird_core_fn_method_syncengine_pull(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * Hand the core a GoTrue-issued access token (JWT). The core makes its OWN authenticated
+     * PostgREST calls with it; the `user_id` stamped on each row is the token's `sub` claim.
+     */
+open func setAccessToken(jwt: String) {try! rustCall() {
+    uniffi_braird_core_fn_method_syncengine_set_access_token(self.uniffiClonePointer(),
+        FfiConverterString.lower(jwt),$0
+    )
+}
+}
+    
+    /**
+     * Pull, then flush — the one-call convergence path (SUR-736). Pulls FIRST, then flushes.
+     *
+     * **Deliberate divergence from the oracle** (surfc's `syncFromCloud` flushes first): with the
+     * outbox rebase (SUR-736), pulling first fetches the server's newer row and rebases the stale
+     * local edit out of the outbox, so the following flush pushes nothing stale. Flushing FIRST
+     * would re-push the stale edit over the newer server row before the pull could see it — the 736
+     * lost edit. Same class of documented divergence as the per-table cursor.
+     *
+     * **The flush is aborted unless the pull was fully clean.** If ANY table's pull failed (partial
+     * OR total), `sync()` returns an error and does NOT flush. A failed table never rebased its
+     * outbox (its cursor is unadvanced), so flushing it could re-push a stale edit over a newer
+     * server row this pull didn't fetch — reopening SUR-736 for that table. This is stricter than
+     * calling `pull()` + `flush()` separately (where a partial pull is `Ok` and a subsequent flush
+     * runs) — the strictness is the point: `sync()` guarantees rebase-protected convergence or
+     * nothing, and the host retries. (This still does NOT fix SUR-740 — a flush destroying a newer
+     * SERVER row before this pull could see it is the server's job, PR-3.)
+     */
+open func sync()throws  -> SyncSummary {
+    return try  FfiConverterTypeSyncSummary.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_braird_core_fn_method_syncengine_sync(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSyncEngine: FfiConverter {
+
+    typealias FfiType = UnsafeMutableRawPointer
+    typealias SwiftType = SyncEngine
+
+    public static func lift(_ pointer: UnsafeMutableRawPointer) throws -> SyncEngine {
+        return SyncEngine(unsafeFromRawPointer: pointer)
+    }
+
+    public static func lower(_ value: SyncEngine) -> UnsafeMutableRawPointer {
+        return value.uniffiClonePointer()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SyncEngine {
+        let v: UInt64 = try readInt(&buf)
+        // The Rust code won't compile if a pointer won't fit in a UInt64.
+        // We have to go via `UInt` because that's the thing that's the size of a pointer.
+        let ptr = UnsafeMutableRawPointer(bitPattern: UInt(truncatingIfNeeded: v))
+        if (ptr == nil) {
+            throw UniffiInternalError.unexpectedNullPointer
+        }
+        return try lift(ptr!)
+    }
+
+    public static func write(_ value: SyncEngine, into buf: inout [UInt8]) {
+        // This fiddling is because `Int` is the thing that's the same size as a pointer.
+        // The Rust code won't compile if a pointer won't fit in a `UInt64`.
+        writeInt(&buf, UInt64(bitPattern: Int64(Int(bitPattern: lower(value)))))
+    }
+}
+
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSyncEngine_lift(_ pointer: UnsafeMutableRawPointer) throws -> SyncEngine {
+    return try FfiConverterTypeSyncEngine.lift(pointer)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSyncEngine_lower(_ value: SyncEngine) -> UnsafeMutableRawPointer {
+    return FfiConverterTypeSyncEngine.lower(value)
 }
 
 
@@ -745,6 +1123,321 @@ public func FfiConverterTypeVault_lower(_ value: Vault) -> UnsafeMutableRawPoint
 
 
 /**
+ * The result of a flush across the FFI: how many outbox ids were pushed vs. left queued.
+ */
+public struct FlushSummary {
+    public var pushed: UInt32
+    public var stillQueued: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(pushed: UInt32, stillQueued: UInt32) {
+        self.pushed = pushed
+        self.stillQueued = stillQueued
+    }
+}
+
+
+
+extension FlushSummary: Equatable, Hashable {
+    public static func ==(lhs: FlushSummary, rhs: FlushSummary) -> Bool {
+        if lhs.pushed != rhs.pushed {
+            return false
+        }
+        if lhs.stillQueued != rhs.stillQueued {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(pushed)
+        hasher.combine(stillQueued)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFlushSummary: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FlushSummary {
+        return
+            try FlushSummary(
+                pushed: FfiConverterUInt32.read(from: &buf), 
+                stillQueued: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FlushSummary, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.pushed, into: &buf)
+        FfiConverterUInt32.write(value.stillQueued, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFlushSummary_lift(_ buf: RustBuffer) throws -> FlushSummary {
+    return try FfiConverterTypeFlushSummary.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFlushSummary_lower(_ value: FlushSummary) -> RustBuffer {
+    return FfiConverterTypeFlushSummary.lower(value)
+}
+
+
+/**
+ * The result of a pull across the FFI: rows seen, rows merged (last-write-wins winners +
+ * applied tombstones), incoming deletes skipped as "don't-resurrect" (a delete for a row this
+ * device never had), and the local edits dropped as stale by the outbox rebase (SUR-736/738 —
+ * hosts read `superseded.len()` for the count).
+ */
+public struct PullSummary {
+    public var pulled: UInt32
+    public var merged: UInt32
+    public var skippedTombstones: UInt32
+    public var superseded: [SupersededEdit]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(pulled: UInt32, merged: UInt32, skippedTombstones: UInt32, superseded: [SupersededEdit]) {
+        self.pulled = pulled
+        self.merged = merged
+        self.skippedTombstones = skippedTombstones
+        self.superseded = superseded
+    }
+}
+
+
+
+extension PullSummary: Equatable, Hashable {
+    public static func ==(lhs: PullSummary, rhs: PullSummary) -> Bool {
+        if lhs.pulled != rhs.pulled {
+            return false
+        }
+        if lhs.merged != rhs.merged {
+            return false
+        }
+        if lhs.skippedTombstones != rhs.skippedTombstones {
+            return false
+        }
+        if lhs.superseded != rhs.superseded {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(pulled)
+        hasher.combine(merged)
+        hasher.combine(skippedTombstones)
+        hasher.combine(superseded)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePullSummary: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PullSummary {
+        return
+            try PullSummary(
+                pulled: FfiConverterUInt32.read(from: &buf), 
+                merged: FfiConverterUInt32.read(from: &buf), 
+                skippedTombstones: FfiConverterUInt32.read(from: &buf), 
+                superseded: FfiConverterSequenceTypeSupersededEdit.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PullSummary, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.pulled, into: &buf)
+        FfiConverterUInt32.write(value.merged, into: &buf)
+        FfiConverterUInt32.write(value.skippedTombstones, into: &buf)
+        FfiConverterSequenceTypeSupersededEdit.write(value.superseded, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePullSummary_lift(_ buf: RustBuffer) throws -> PullSummary {
+    return try FfiConverterTypePullSummary.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePullSummary_lower(_ value: PullSummary) -> RustBuffer {
+    return FfiConverterTypePullSummary.lower(value)
+}
+
+
+/**
+ * One local edit the pull dropped because a strictly-newer remote row won last-write-wins
+ * (SUR-736/738) — so a host can tell the user their offline edit was superseded. Not an
+ * *unresolved* conflict: the remote already won under LWW. `discarded_updated_at` is the newest
+ * dropped outbox stamp; `winning_updated_at` is the remote stamp that beat it. Ids + timestamps
+ * only — never payload contents (E2EE: nothing decrypted or logged here).
+ */
+public struct SupersededEdit {
+    public var table: String
+    public var recordId: String
+    public var discardedUpdatedAt: Int64
+    public var winningUpdatedAt: Int64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(table: String, recordId: String, discardedUpdatedAt: Int64, winningUpdatedAt: Int64) {
+        self.table = table
+        self.recordId = recordId
+        self.discardedUpdatedAt = discardedUpdatedAt
+        self.winningUpdatedAt = winningUpdatedAt
+    }
+}
+
+
+
+extension SupersededEdit: Equatable, Hashable {
+    public static func ==(lhs: SupersededEdit, rhs: SupersededEdit) -> Bool {
+        if lhs.table != rhs.table {
+            return false
+        }
+        if lhs.recordId != rhs.recordId {
+            return false
+        }
+        if lhs.discardedUpdatedAt != rhs.discardedUpdatedAt {
+            return false
+        }
+        if lhs.winningUpdatedAt != rhs.winningUpdatedAt {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(table)
+        hasher.combine(recordId)
+        hasher.combine(discardedUpdatedAt)
+        hasher.combine(winningUpdatedAt)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSupersededEdit: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SupersededEdit {
+        return
+            try SupersededEdit(
+                table: FfiConverterString.read(from: &buf), 
+                recordId: FfiConverterString.read(from: &buf), 
+                discardedUpdatedAt: FfiConverterInt64.read(from: &buf), 
+                winningUpdatedAt: FfiConverterInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SupersededEdit, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.table, into: &buf)
+        FfiConverterString.write(value.recordId, into: &buf)
+        FfiConverterInt64.write(value.discardedUpdatedAt, into: &buf)
+        FfiConverterInt64.write(value.winningUpdatedAt, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSupersededEdit_lift(_ buf: RustBuffer) throws -> SupersededEdit {
+    return try FfiConverterTypeSupersededEdit.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSupersededEdit_lower(_ value: SupersededEdit) -> RustBuffer {
+    return FfiConverterTypeSupersededEdit.lower(value)
+}
+
+
+/**
+ * The result of [`SyncEngine::sync`] — one pull then one flush, reported together.
+ */
+public struct SyncSummary {
+    public var pull: PullSummary
+    public var flush: FlushSummary
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(pull: PullSummary, flush: FlushSummary) {
+        self.pull = pull
+        self.flush = flush
+    }
+}
+
+
+
+extension SyncSummary: Equatable, Hashable {
+    public static func ==(lhs: SyncSummary, rhs: SyncSummary) -> Bool {
+        if lhs.pull != rhs.pull {
+            return false
+        }
+        if lhs.flush != rhs.flush {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(pull)
+        hasher.combine(flush)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSyncSummary: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SyncSummary {
+        return
+            try SyncSummary(
+                pull: FfiConverterTypePullSummary.read(from: &buf), 
+                flush: FfiConverterTypeFlushSummary.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SyncSummary, into buf: inout [UInt8]) {
+        FfiConverterTypePullSummary.write(value.pull, into: &buf)
+        FfiConverterTypeFlushSummary.write(value.flush, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSyncSummary_lift(_ buf: RustBuffer) throws -> SyncSummary {
+    return try FfiConverterTypeSyncSummary.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSyncSummary_lower(_ value: SyncSummary) -> RustBuffer {
+    return FfiConverterTypeSyncSummary.lower(value)
+}
+
+
+/**
  * A stored `prf-v1` / PIN-transfer wrapped-key blob — base64 fields, exactly the
  * JS `{ wrappedKey, iv, salt }` shape. Standard base64, NOT url-safe (frozen).
  */
@@ -886,6 +1579,76 @@ extension CryptoError: Foundation.LocalizedError {
     }
 }
 
+
+/**
+ * Errors that cross the FFI from the sync engine. Coarse like [`crate::CryptoError`]: enough
+ * for a host to distinguish "couldn't open the store" from "the flush hit the network", never
+ * leaking key material or per-record server detail.
+ */
+public enum SyncError {
+
+    
+    
+    case Store(String
+    )
+    case Flush(String
+    )
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSyncError: FfiConverterRustBuffer {
+    typealias SwiftType = SyncError
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SyncError {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        
+
+        
+        case 1: return .Store(
+            try FfiConverterString.read(from: &buf)
+            )
+        case 2: return .Flush(
+            try FfiConverterString.read(from: &buf)
+            )
+
+         default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: SyncError, into buf: inout [UInt8]) {
+        switch value {
+
+        
+
+        
+        
+        case let .Store(v1):
+            writeInt(&buf, Int32(1))
+            FfiConverterString.write(v1, into: &buf)
+            
+        
+        case let .Flush(v1):
+            writeInt(&buf, Int32(2))
+            FfiConverterString.write(v1, into: &buf)
+            
+        }
+    }
+}
+
+
+extension SyncError: Equatable, Hashable {}
+
+extension SyncError: Foundation.LocalizedError {
+    public var errorDescription: String? {
+        String(reflecting: self)
+    }
+}
+
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
@@ -910,6 +1673,56 @@ fileprivate struct FfiConverterOptionString: FfiConverterRustBuffer {
     }
 }
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceString: FfiConverterRustBuffer {
+    typealias SwiftType = [String]
+
+    public static func write(_ value: [String], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterString.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [String] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [String]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterString.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeSupersededEdit: FfiConverterRustBuffer {
+    typealias SwiftType = [SupersededEdit]
+
+    public static func write(_ value: [SupersededEdit], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeSupersededEdit.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [SupersededEdit] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [SupersededEdit]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeSupersededEdit.read(from: &buf))
+        }
+        return seq
+    }
+}
+
 private enum InitializationResult {
     case ok
     case contractVersionMismatch
@@ -924,6 +1737,24 @@ private var initializationResult: InitializationResult = {
     let scaffolding_contract_version = ffi_braird_core_uniffi_contract_version()
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
+    }
+    if (uniffi_braird_core_checksum_method_syncengine_enqueue_book() != 22816) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_braird_core_checksum_method_syncengine_enqueue_note() != 25351) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_braird_core_checksum_method_syncengine_flush() != 39156) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_braird_core_checksum_method_syncengine_pull() != 4639) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_braird_core_checksum_method_syncengine_set_access_token() != 47386) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_braird_core_checksum_method_syncengine_sync() != 38790) {
+        return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_vault_content_tag() != 23104) {
         return InitializationResult.apiChecksumMismatch
@@ -947,6 +1778,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_vault_wrap_with_prf() != 28929) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_braird_core_checksum_constructor_syncengine_open() != 39686) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_constructor_vault_generate() != 65080) {
