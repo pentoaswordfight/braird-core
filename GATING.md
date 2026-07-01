@@ -38,6 +38,7 @@ The named personas resolve from the sibling `gce/` repo (`shared/personas/<name>
 | Path | Primary gate | Reviewer persona(s) |
 |---|---|---|
 | `src/**`, `Cargo.toml`, `Cargo.lock`, `build.rs`, `*.udl` — the crate + every line of crypto | **GCE only** | `crypto-reviewer` (whole crate) + founder sign-off |
+| The **sync engine + local store** (Phase 2, SUR-659) — `src/store.rs`, `src/sync/**`, `src/outbox.rs`, the synced-schema fixture `vendored/schema/**`, `scripts/extract-sync-schema.mjs` | **GCE only** | `sync-reviewer` (engine, PWA↔native coexistence, schema-drift guard) **+** `crypto-reviewer` (the seal-at-flush boundary — note text must never leave unencrypted, from SUR-724) + founder |
 | The **public binding surface** — `#[uniffi::export]` items / `*.udl`, `bindings/**`, exported type & method & error names | **GCE only** | `naming-reviewer` (the *word* devs consume) **+** `crypto-reviewer` (the seam) + founder |
 | `vendored/crypto-parity/**` — the parity vectors vendored from `surfc/main` | **GCE only** | `crypto-reviewer` — must match `surfc/main` (drift-guarded in CI; see §4) |
 | `docs/adr/**` — architecture decision records (e.g. ADR 0002 crypto backend) | **GCE only** | `architecture-decision-reviewer` + founder |
@@ -58,8 +59,6 @@ branding — they stay `surfc-*` despite the Braird rename (SUR-680 allowlist).
 
 ### Not yet in scope
 
-- **`sync-reviewer`** joins at **Phase 2** (SUR-659 — sync engine + local store). No sync
-  work lands in this repo until then.
 - **`naming-reviewer` repo-profile.** The concern-keyed `naming-reviewer` needs an injected
   `gce/shared/personas/repo-profiles/braird-core.md` (developer-facing API-naming mode —
   the audience is iOS/Android integrators, not end users). **It does not exist yet** — a

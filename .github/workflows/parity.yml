@@ -111,3 +111,75 @@ jobs:
         if: steps.guard.outputs.ready == 'true'
         working-directory: bindings/kotlin
         run: ./gradlew test --no-daemon
+
+  # SUR-723: bundled SQLite (rusqlite) is the first C-compile in the crate. The Linux
+  # parity job can't catch a break on the mobile target triples, and the nightly-macos
+  # xcframework job only runs after merge — so smoke-build the two primary device triples
+  # per-PR. A C-compile failure fails the PR, not the next nightly. (The sim / other-arch
+  # triples would surface the same compile error, so one arm64 triple per platform suffices.)
+  ios-crosscompile:
+    name: iOS cross-compile smoke (aarch64-apple-ios)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Guard — skip until the crate exists
+        id: guard
+        run: |
+          if [ -f Cargo.toml ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "No Cargo.toml yet — scaffolding only, skipping the iOS smoke build."
+          fi
+
+      - name: Install Rust toolchain + iOS target
+        if: steps.guard.outputs.ready == 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+
+      - name: Cache cargo
+        if: steps.guard.outputs.ready == 'true'
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo build --target aarch64-apple-ios (bundled SQLite must compile)
+        if: steps.guard.outputs.ready == 'true'
+        run: cargo build --target aarch64-apple-ios
+
+  android-crosscompile:
+    name: Android cross-compile smoke (aarch64-linux-android)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Guard — skip until the crate exists
+        id: guard
+        run: |
+          if [ -f Cargo.toml ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "No Cargo.toml yet — scaffolding only, skipping the Android smoke build."
+          fi
+
+      - name: Install Rust toolchain + Android target
+        if: steps.guard.outputs.ready == 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Cache cargo
+        if: steps.guard.outputs.ready == 'true'
+        uses: Swatinem/rust-cache@v2
+
+      # Point cc + the linker at the runner's preinstalled NDK so bundled SQLite's C
+      # cross-compiles for the Android triple (no device/emulator needed). API 24 = min.
+      - name: cargo build --target aarch64-linux-android (bundled SQLite must compile)
+        if: steps.guard.outputs.ready == 'true'
+        run: |
+          NDK_BIN="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          export CC_aarch64_linux_android="$NDK_BIN/aarch64-linux-android24-clang"
+          export AR_aarch64_linux_android="$NDK_BIN/llvm-ar"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$NDK_BIN/aarch64-linux-android24-clang"
+          cargo build --target aarch64-linux-android

@@ -17,6 +17,12 @@ mod note_encryption;
 mod primitives;
 mod vault;
 
+// The native SQLite local store (SUR-723, Phase 2). Native-only — gated off wasm32,
+// where the PWA uses Dexie and `bundled` SQLite cannot compile. Not a UniFFI binding
+// (no `#[uniffi::export]`); the sync methods that hang off it arrive in SUR-724/725.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod store;
+
 pub use vault::Vault;
 
 uniffi::setup_scaffolding!();

@@ -1,0 +1,86 @@
+{
+  "books": {
+    "author": "text",
+    "cover_resolved_at": "int",
+    "cover_source": "text",
+    "cover_url": "text",
+    "created_at": "int",
+    "deleted": "bool",
+    "id": "text",
+    "isbn": "text",
+    "title": "text",
+    "updated_at": "int"
+  },
+  "notes": {
+    "book_id": "text",
+    "chapter": "text",
+    "content_tag": "text",
+    "created_at": "int",
+    "deleted": "bool",
+    "id": "text",
+    "image_path": "text",
+    "ink_crop_path": "text",
+    "page": "text",
+    "source": "text",
+    "source_id": "text",
+    "source_meta": "json",
+    "tags": "json",
+    "text": "text",
+    "updated_at": "int"
+  },
+  "custom_ideas": {
+    "created_at": "int",
+    "deleted": "bool",
+    "description": "text",
+    "id": "text",
+    "name": "text",
+    "updated_at": "int"
+  },
+  "note_links": {
+    "created_at": "int",
+    "deleted": "bool",
+    "from_note_id": "text",
+    "id": "text",
+    "relation_type": "text",
+    "to_note_id": "text",
+    "updated_at": "int"
+  },
+  "lenses": {
+    "combinator": "text",
+    "created_at": "int",
+    "deleted": "bool",
+    "id": "text",
+    "leaf_ids": "json",
+    "name": "text",
+    "threshold": "int",
+    "updated_at": "int"
+  },
+  "collections": {
+    "created_at": "int",
+    "deleted": "bool",
+    "id": "text",
+    "name": "text",
+    "updated_at": "int"
+  },
+  "collection_memberships": {
+    "collection_id": "text",
+    "created_at": "int",
+    "deleted": "bool",
+    "id": "text",
+    "note_id": "text",
+    "updated_at": "int"
+  },
+  "note_signals": {
+    "created_at": "int",
+    "deleted": "bool",
+    "engagement_recency_at": "int",
+    "exposure_recency_at": "int",
+    "has_annotation": "bool",
+    "importance": "real",
+    "note_id": "text",
+    "return_visits": "int",
+    "source_prior": "real",
+    "stitch_spawns": "int",
+    "updated_at": "int"
+  }
+}

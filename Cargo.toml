@@ -55,6 +55,12 @@ getrandom = "0.2"
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.2", features = ["js"] }
 
+# The native SQLite local store (SUR-723) is native-only: the PWA uses Dexie/IndexedDB,
+# and `bundled` (C) SQLite does not compile to wasm32. Gating it off the wasm build keeps
+# the WASM CSPRNG leg (parity.yml `cargo build --target wasm32-unknown-unknown`) green.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
+
 [dev-dependencies]
 serde_json = "1"
 

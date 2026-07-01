@@ -72,3 +72,24 @@ the vectors would catch any divergence a swap introduced.
   are **17.0**. No real-tables General_Category crate is at 17.0 yet. The current vectors
   are unaffected; the B6 differential fuzz must characterize the residue. See
   `src/normalize.rs`.
+
+## Addendum (SUR-723) — native storage dependency: `rusqlite` (bundled)
+
+Phase 2 (SUR-659) adds the on-device local store (`src/store.rs`). The store dependency
+is **`rusqlite` with the `bundled` feature** — SQLite compiled into the artifact, so there
+is no system-libsqlite dependency on iOS/Android and the build stays reproducible. This is
+a **routine, reversible** dependency pick recorded here rather than in a standalone ADR (no
+`architecture-decision-reviewer` gate of its own).
+
+Two points keep it consistent with this ADR's principles:
+
+1. **WASM stays first-class.** `bundled` SQLite is C and does not compile to
+   `wasm32-unknown-unknown`, so `rusqlite` and the `store` module are **target-gated off
+   wasm32** (`[target.'cfg(not(target_arch = "wasm32"))'.dependencies]`). The PWA keeps using
+   Dexie; the WASM CSPRNG build (the §"Why" #1 invariant) remains green.
+2. **It introduces the first C-compile in the crate.** That risk is offset by the SUR-723
+   per-PR mobile cross-compile smoke jobs (`aarch64-apple-ios`, `aarch64-linux-android` in
+   `parity.yml`), so a bundled-SQLite break fails the PR, not the next nightly.
+
+The synced schema the store mirrors is itself contract-guarded (the `sync-schema.json`
+drift check, SUR-723 §7) — the storage analogue of the crypto parity vectors.
