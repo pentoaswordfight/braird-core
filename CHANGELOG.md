@@ -34,6 +34,11 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   The identical latent hole in surfc's PWA `collapseOutboxItems` is filed as SUR-731.
 
 ### Added
+- **ADR 0001 — async HTTP client (`docs/adr/0001-async-http-client.md`, SUR-724 / SUR-659b):**
+  records the reqwest + tokio `current_thread` + rustls decision behind the sync push layer — the
+  runtime is owned by the `SyncEngine` handle (`block_on` per flush, no background thread), and
+  rustls is chosen for iOS/Android TLS portability. Fills the ADR that 0003 (seal-at-write)
+  already cross-references.
 - **Sync engine — outbox + push/flush + token handoff (`src/sync/**`, SUR-724 / SUR-659b):** the
   `SyncEngine` UniFFI handle enqueues writes, seals note text **at write** (enc:v2 ciphertext +
   a plaintext-derived `content_tag`, so no plaintext note text is ever persisted), and flushes to
