@@ -26,6 +26,14 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 - **ADR 0002:** recorded the `rusqlite` (bundled SQLite) dependency choice as a decision note — reversible/routine, folded into the existing core-impl ADR rather than a standalone one (SUR-723).
 
 ### Fixed
+- **Pull no longer lets a stale outbox edit re-push over a newer server row (SUR-736).** When a pull
+  merges a strictly-newer remote row for a record that still has a queued local edit, that edit is now
+  dropped from the outbox in the SAME transaction as the apply (`Store::apply_row_rebasing_outbox`).
+  Previously it survived and the next unconditional `flush()` re-pushed it over the newer server row (a
+  lost remote edit). `flush()`-before-`pull()` is therefore no longer required to avoid this. Only
+  entries whose payload `updated_at <= incoming` are dropped (a genuinely-later local edit still
+  flushes; a malformed payload is left queued). Note: this does NOT fix SUR-740 — a flush destroying a
+  newer *server* row before a pull can see it is the server's job (tracked separately, PR-3).
 - **Outbox collapse no longer resurrects a soft-deleted record (SUR-724).** `collapse()` tracked
   `deleted` stickiness per-item, so a delete followed by a normal edit — which the enqueue paths
   stamp with `deleted: false` — had its `deleted: true` overwritten by the field-merge and flushed
@@ -38,6 +46,17 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   `docs/adr/0004-async-http-client.md` so the architecture chain resolves to the right document.
 
 ### Added
+- **One-call `sync()` + LWW conflict signal (`src/sync/mod.rs`, `src/sync/pull.rs`, `src/store.rs`,
+  SUR-736 / SUR-738):** a new `SyncEngine.sync()` UniFFI method runs `pull()` THEN `flush()` — a
+  deliberate divergence from the oracle's flush-first (with the outbox rebase, pulling first rebases a
+  stale edit away so the flush pushes nothing stale; flush-first would re-push it). Hard pull failure
+  aborts before flush; a partial pull failure proceeds. `PullSummary` gains `conflicts` + `conflicted:
+  Vec<ConflictedRecord>` (`table` + `record_id` + discarded/winning `updated_at` — ids + timestamps
+  only, never payload contents) so a host can tell the user an offline edit was superseded by a newer
+  remote row. New FFI records `ConflictedRecord` + `SyncSummary`. **Ciphertext-at-rest unchanged** —
+  the rebase touches only already-sealed outbox rows; nothing is decrypted or logged. New offline
+  integration test (`tests/sync_736_integration.rs`, recording sink) proves the re-push window is
+  closed and a genuinely-newer local edit still flushes. **Native-only** (gated off wasm32).
 - **Incremental pull + tombstones + first coexistence (`src/sync/pull.rs`, `src/store.rs`,
   `src/sync/http.rs`, SUR-725 / SUR-659c):** the `SyncEngine.pull()` UniFFI method mirrors surfc's
   `fetchSince` + `mergeCloudRecords` on `books` + `notes` — per table it GETs rows with

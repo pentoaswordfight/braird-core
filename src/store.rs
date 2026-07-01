@@ -502,6 +502,73 @@ impl Store {
         Ok(())
     }
 
+    /// Apply a pulled LWW-winning row AND drop any now-stale pending outbox entries for the same
+    /// record, in ONE transaction (SUR-736). Returns the dropped entries as `(outbox id, payload
+    /// updated_at)` so the caller can surface them as conflicts (SUR-738).
+    ///
+    /// The bug this closes: a pull merges a strictly-newer remote row over a record that still has
+    /// a queued local edit; without dropping that entry the next unconditional `flush` re-pushes the
+    /// stale edit over the newer server row — a lost remote edit. Dropping it here, atomically with
+    /// the apply, closes the window: `apply` without `drop` re-opens the bug, `drop` without `apply`
+    /// loses the edit locally AND never pushes it, so both must commit or roll back together.
+    ///
+    /// Only entries whose payload `updated_at <= incoming_updated` are dropped: a pending edit NEWER
+    /// than the row we just applied is a genuinely-later local write and must still flush. A payload
+    /// that won't parse (or carries no `updated_at`) is LEFT queued — it can't be proven stale, and
+    /// one that won't parse can never flush anyway, so it can't cause the 736 overwrite. The `<=` is
+    /// defensively redundant today (`stage_local_write` stamps row + payload together, so a pending
+    /// stamp is `<=` the local row ts, which is `<` incoming when the caller decided to apply) but it
+    /// self-documents the criterion and protects future enqueue paths.
+    pub fn apply_row_rebasing_outbox(
+        &self,
+        table: &str,
+        row: &Map<String, Value>,
+        incoming_updated: i64,
+    ) -> rusqlite::Result<Vec<(i64, i64)>> {
+        let pk = schema_or_err(table)?.pk[0];
+        // The core write path always sets record_id; if an incoming row somehow lacks its pk we
+        // still apply it, but there's nothing to match in the outbox (scan skipped).
+        let record_id = row.get(pk).and_then(Value::as_str);
+
+        // Same `unchecked_transaction` pattern as `stage_local_write`: `Store` is driven behind the
+        // SyncEngine's `Mutex`, so no concurrent use of this connection; an early `?` drops the
+        // Transaction and rolls back, only `commit()` persists the apply + the drops together.
+        let tx = self.conn.unchecked_transaction()?;
+        self.apply_row(table, row)?;
+
+        let mut dropped: Vec<(i64, i64)> = Vec::new();
+        if let Some(record_id) = record_id {
+            // Collect the record's queued entries first (releasing the statement borrow) so the
+            // DELETEs below can run on the same connection.
+            let entries: Vec<(i64, String)> = {
+                let mut stmt = self.conn.prepare(
+                    "SELECT id, payload FROM outbox WHERE table_name = ?1 AND record_id = ?2",
+                )?;
+                let rows = stmt
+                    .query_map(rusqlite::params![table, record_id], |r| {
+                        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                rows
+            };
+            for (id, payload) in entries {
+                // A stale entry is one we can parse AND whose own stamp is `<=` what we just applied.
+                let stamp = serde_json::from_str::<Value>(&payload)
+                    .ok()
+                    .and_then(|v| v.get("updated_at").and_then(Value::as_i64));
+                if let Some(stamp) = stamp {
+                    if stamp <= incoming_updated {
+                        self.conn
+                            .execute("DELETE FROM outbox WHERE id = ?1", [id])?;
+                        dropped.push((id, stamp));
+                    }
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(dropped)
+    }
+
     /// Atomically stage a local write: merge the partial edit onto any existing row, upsert the
     /// merged row into the synced table, AND enqueue the outbox payload — all in ONE transaction
     /// (SUR-725 review). If any step fails (e.g. an I/O / disk-full / `SQLITE_BUSY` error mid-write)
@@ -752,6 +819,134 @@ mod tests {
         );
         // Per-table isolation: advancing notes must not touch the books cursor.
         assert_eq!(store.get_sync_cursor("books").unwrap(), None);
+    }
+
+    // ── SUR-736 outbox rebase on an LWW win ───────────────────────────────────
+
+    #[test]
+    fn rebase_applies_row_and_drops_stale_outbox_entries() {
+        use serde_json::json;
+        let store = Store::open_in_memory().unwrap();
+        // A queued local edit + its local synced row, both stamped T1.
+        store
+            .apply_row(
+                "notes",
+                json!({"id":"n1","text":"enc:v2:local","updated_at":1000,"deleted":false})
+                    .as_object()
+                    .unwrap(),
+            )
+            .unwrap();
+        let oid = store
+            .enqueue("notes", "n1", r#"{"id":"n1","updated_at":1000}"#, 1000)
+            .unwrap();
+
+        // Pull a strictly-newer remote row (T2 > T1) — the caller already decided to apply.
+        let remote = json!({"id":"n1","text":"enc:v2:remote","updated_at":2000,"deleted":false});
+        let dropped = store
+            .apply_row_rebasing_outbox("notes", remote.as_object().unwrap(), 2000)
+            .unwrap();
+
+        assert_eq!(
+            dropped,
+            vec![(oid, 1000)],
+            "the stale entry is reported dropped"
+        );
+        assert!(
+            store.outbox_items().unwrap().is_empty(),
+            "the stale outbox entry is gone — the next flush can't re-push it (SUR-736)"
+        );
+        assert_eq!(
+            store.get_row("notes", "n1").unwrap().unwrap()["text"],
+            json!("enc:v2:remote"),
+            "the remote LWW winner is applied in the same transaction"
+        );
+    }
+
+    #[test]
+    fn rebase_keeps_an_outbox_entry_newer_than_the_incoming_row() {
+        use serde_json::json;
+        let store = Store::open_in_memory().unwrap();
+        store
+            .apply_row(
+                "notes",
+                json!({"id":"n1","updated_at":1000,"deleted":false})
+                    .as_object()
+                    .unwrap(),
+            )
+            .unwrap();
+        // A genuinely-later local write (T3) must still flush — it is NOT stale vs the T2 we apply.
+        store
+            .enqueue("notes", "n1", r#"{"id":"n1","updated_at":3000}"#, 3000)
+            .unwrap();
+
+        let remote = json!({"id":"n1","updated_at":2000,"deleted":false});
+        let dropped = store
+            .apply_row_rebasing_outbox("notes", remote.as_object().unwrap(), 2000)
+            .unwrap();
+
+        assert!(dropped.is_empty(), "an entry newer than incoming survives");
+        assert_eq!(store.outbox_items().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn rebase_drops_an_entry_stamped_exactly_at_the_incoming_ts() {
+        use serde_json::json;
+        let store = Store::open_in_memory().unwrap();
+        // Synthetic desync: local row below incoming, but a queued payload stamped == incoming.
+        // Proves the guard is `<=`, not `<`.
+        store
+            .apply_row(
+                "notes",
+                json!({"id":"n1","updated_at":1000,"deleted":false})
+                    .as_object()
+                    .unwrap(),
+            )
+            .unwrap();
+        let oid = store
+            .enqueue("notes", "n1", r#"{"id":"n1","updated_at":2000}"#, 2000)
+            .unwrap();
+
+        let remote = json!({"id":"n1","updated_at":2000,"deleted":false});
+        let dropped = store
+            .apply_row_rebasing_outbox("notes", remote.as_object().unwrap(), 2000)
+            .unwrap();
+
+        assert_eq!(
+            dropped,
+            vec![(oid, 2000)],
+            "payload ts == incoming is dropped (<=)"
+        );
+    }
+
+    #[test]
+    fn rebase_leaves_a_malformed_outbox_payload_queued() {
+        use serde_json::json;
+        let store = Store::open_in_memory().unwrap();
+        store
+            .apply_row(
+                "notes",
+                json!({"id":"n1","updated_at":1000,"deleted":false})
+                    .as_object()
+                    .unwrap(),
+            )
+            .unwrap();
+        // A payload that won't parse can't be proven stale — and can never flush anyway.
+        store
+            .enqueue("notes", "n1", "not valid json", 1000)
+            .unwrap();
+
+        let remote = json!({"id":"n1","text":"enc:v2:remote","updated_at":2000,"deleted":false});
+        let dropped = store
+            .apply_row_rebasing_outbox("notes", remote.as_object().unwrap(), 2000)
+            .unwrap();
+
+        assert!(dropped.is_empty(), "malformed payload is not dropped");
+        assert_eq!(store.outbox_items().unwrap().len(), 1, "still queued");
+        assert_eq!(
+            store.get_row("notes", "n1").unwrap().unwrap()["text"],
+            json!("enc:v2:remote"),
+            "the apply still happened (rebase never blocks the LWW winner)"
+        );
     }
 
     #[test]

@@ -1,0 +1,171 @@
+//! SUR-736/738 integration: the outbox rebase closes the "pull-then-flush re-pushes a stale edit"
+//! window, and a genuinely-newer local edit still flushes. Cross-module (store + pull + push) via a
+//! recording sink — OFFLINE + deterministic (no Supabase, no env guard, NOT `#[ignore]`d), so the
+//! make-or-break 736 assertion runs in the fast per-PR suite, unlike the env-guarded real-Supabase
+//! round-trip in `sync_725_integration.rs`. The seam under test is the SAME order `SyncEngine::sync`
+//! runs: `pull` (which rebases) THEN `flush`.
+#![cfg(not(target_arch = "wasm32"))]
+
+use std::cell::RefCell;
+use std::collections::HashMap;
+
+use braird_core::store::Store;
+use braird_core::sync::http::PostgrestSink;
+use braird_core::sync::{pull, push};
+use serde_json::{json, Value};
+
+fn block<F: std::future::Future>(f: F) -> F::Output {
+    tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap()
+        .block_on(f)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum Op {
+    Fetch(String),
+    Upsert(String),
+}
+
+/// A PostgREST stand-in that records every call in order and serves canned remote rows. No network;
+/// `upsert` always succeeds. Lets us assert BOTH the call order (fetch-before-upsert) and that a
+/// rebased-away edit is never re-dispatched.
+struct RecordingSink {
+    remote: HashMap<String, Vec<Value>>,
+    log: RefCell<Vec<Op>>,
+}
+
+impl RecordingSink {
+    fn new(remote: HashMap<String, Vec<Value>>) -> Self {
+        Self {
+            remote,
+            log: RefCell::new(Vec::new()),
+        }
+    }
+    fn upserted(&self, table: &str) -> bool {
+        self.log
+            .borrow()
+            .iter()
+            .any(|o| *o == Op::Upsert(table.to_string()))
+    }
+}
+
+impl PostgrestSink for RecordingSink {
+    async fn upsert(&self, table: &str, _on_conflict: &str, _rows: &Value) -> Result<(), String> {
+        self.log.borrow_mut().push(Op::Upsert(table.to_string()));
+        Ok(())
+    }
+    async fn fetch_since(&self, table: &str, _cursor: i64) -> Result<Vec<Value>, String> {
+        self.log.borrow_mut().push(Op::Fetch(table.to_string()));
+        Ok(self.remote.get(table).cloned().unwrap_or_default())
+    }
+}
+
+fn one(table: &str, rows: Vec<Value>) -> HashMap<String, Vec<Value>> {
+    let mut m = HashMap::new();
+    m.insert(table.to_string(), rows);
+    m
+}
+
+#[test]
+fn pull_then_flush_does_not_re_push_a_rebased_edit() {
+    // The SUR-736 window: a queued local edit (T1) for a record the server has a NEWER row for (T2).
+    let store = Store::open_in_memory().unwrap();
+    // Offline-first local write: synced row + outbox entry, both T1. `text` stays ciphertext at rest.
+    store
+        .stage_local_write(
+            "notes",
+            "n1",
+            json!({ "id": "n1", "text": "enc:v2:local-T1", "updated_at": 1000, "deleted": false })
+                .as_object()
+                .unwrap()
+                .clone(),
+            1000,
+        )
+        .unwrap();
+
+    let sink = RecordingSink::new(one(
+        "notes",
+        vec![
+            json!({ "id": "n1", "text": "enc:v2:remote-T2", "content_tag": "tag", "updated_at": 2000, "deleted": false }),
+        ],
+    ));
+
+    // sync()'s order: pull (which rebases) THEN flush.
+    let pulled = block(pull::pull(&store, &sink, &["notes"], 9000)).unwrap();
+    assert_eq!(pulled.merged, 1);
+    assert_eq!(
+        pulled.conflicts, 1,
+        "the stale local edit is surfaced as a conflict"
+    );
+    assert!(
+        store.outbox_items().unwrap().is_empty(),
+        "the pull rebased the stale entry away"
+    );
+
+    let flushed = block(push::flush(&store, &sink, "user-1")).unwrap();
+    assert!(
+        flushed.ok.is_empty() && flushed.failed.is_empty(),
+        "nothing left to flush"
+    );
+    assert!(
+        !sink.upserted("notes"),
+        "the rebased-away edit must NOT be re-pushed over the newer server row (SUR-736)"
+    );
+    assert_eq!(
+        store.get_row("notes", "n1").unwrap().unwrap()["text"],
+        json!("enc:v2:remote-T2"),
+        "the store converged to the newer server row"
+    );
+}
+
+#[test]
+fn a_genuinely_newer_local_edit_still_flushes_after_pull() {
+    // Guard against over-aggressive dropping: a local edit NEWER than anything the server returns
+    // must survive the pull and flush normally — and the fetch (pull) precedes the upsert (flush).
+    let store = Store::open_in_memory().unwrap();
+    store
+        .stage_local_write(
+            "books",
+            "b1",
+            json!({ "id": "b1", "title": "local-newer", "updated_at": 5000, "deleted": false })
+                .as_object()
+                .unwrap()
+                .clone(),
+            5000,
+        )
+        .unwrap();
+
+    // The server returns an OLDER row for the same record (loses LWW → no apply, no rebase).
+    let sink = RecordingSink::new(one(
+        "books",
+        vec![json!({ "id": "b1", "title": "server-older", "updated_at": 3000, "deleted": false })],
+    ));
+
+    let pulled = block(pull::pull(&store, &sink, &["books"], 9000)).unwrap();
+    assert_eq!(pulled.merged, 0, "the older server row loses LWW");
+    assert_eq!(pulled.conflicts, 0);
+    assert_eq!(
+        store.outbox_items().unwrap().len(),
+        1,
+        "the newer local edit is still queued"
+    );
+
+    let flushed = block(push::flush(&store, &sink, "user-1")).unwrap();
+    assert_eq!(flushed.ok.len(), 1, "the newer local edit flushes");
+    assert!(sink.upserted("books"), "it IS pushed to the server");
+    assert_eq!(
+        store.get_row("books", "b1").unwrap().unwrap()["title"],
+        json!("local-newer"),
+        "the local row kept its newer value"
+    );
+
+    // Pull-then-flush ordering: the fetch precedes the upsert (the order that makes rebase work).
+    let log = sink.log.borrow();
+    let fetch_pos = log.iter().position(|o| matches!(o, Op::Fetch(_)));
+    let upsert_pos = log.iter().position(|o| matches!(o, Op::Upsert(_)));
+    assert!(
+        fetch_pos < upsert_pos,
+        "pull's fetch precedes flush's upsert (the sync() order): {log:?}"
+    );
+}
