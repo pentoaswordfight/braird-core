@@ -26,6 +26,28 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 - **ADR 0002:** recorded the `rusqlite` (bundled SQLite) dependency choice as a decision note — reversible/routine, folded into the existing core-impl ADR rather than a standalone one (SUR-723).
 
 ### Added
+- **Sync engine — outbox + push/flush + token handoff (`src/sync/**`, SUR-724 / SUR-659b):** the
+  `SyncEngine` UniFFI handle enqueues writes, seals note text **at write** (enc:v2 ciphertext +
+  a plaintext-derived `content_tag`, so no plaintext note text is ever persisted), and flushes to
+  Supabase via its OWN authenticated PostgREST calls (`set_access_token` hands it a real GoTrue
+  JWT; `user_id` = the token's `sub`). Flush mirrors surfc's `flushOutbox`: collapse (LWW-per-field,
+  sticky delete, transitive `bookIdRemap` persisted in `meta`) → books first → notes (book_id
+  repointed; a note whose parent book flush failed stays queued → no server FK violation) →
+  failed writes stay in the outbox. `updated_at` is stamped in epoch **ms** at enqueue. The FFI
+  stays synchronous — the engine owns a tokio current-thread runtime and `block_on`s the async
+  reqwest calls (same shape as `Vault`). Proven on `books` + `notes`; the other six synced tables
+  follow in SUR-659c/d behind the same flush. **Native-only** — reqwest/tokio/rusqlite are
+  target-gated off wasm32 (the WASM CSPRNG build stays green).
+- **Cargo workspace + `test-support` member crate (SUR-724):** the crate is now a workspace
+  (`.` + `test-support`); `test-support` exposes `mint_test_user_jwt()` (authenticates a real
+  test user against local Supabase GoTrue → a real token) + the Supabase bootstrap/select helpers,
+  reused across SUR-659b/c/d and the future bindings crate (a `tests/common/mod.rs` only shares
+  within one crate's test binaries). Native-only.
+- **Sync integration CI (`sync-integration.yml`, SUR-724):** a SEPARATE job (keeps `parity.yml`
+  fast) that spins up local Supabase from surfc's migrations, then runs the `#[ignore]`d
+  `tests/sync_659b_integration.rs` — asserting collapse semantics, that only **ciphertext**
+  reaches `notes.text` (never plaintext), that `content_tag` is present + correct, and that the
+  token-handoff upsert succeeds. `cargo test` skips it gracefully when `SUPABASE_URL` is absent.
 - **Native SQLite local store (`src/store.rs`, SUR-723 / Phase 2):** the on-device mirror of
   surfc's synced cloud schema for the iOS/Android clients — the 8 synced stores (`books`,
   `notes` incl. `content_tag`+`chapter`, `custom_ideas`, `note_links`, `lenses`, `collections`,

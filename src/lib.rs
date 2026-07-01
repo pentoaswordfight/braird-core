@@ -23,6 +23,13 @@ mod vault;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod store;
 
+// The outbox + push/flush sync engine (SUR-724, Phase 2 / SUR-659b). Native-only for the
+// same reason as `store`: its deps (rusqlite, reqwest, tokio) do not compile to wasm32,
+// where the PWA keeps its own `supabase.js` flush. `SyncEngine` IS a UniFFI binding — hosts
+// enqueue writes + flush through it, and it makes its own authenticated PostgREST calls.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod sync;
+
 pub use vault::Vault;
 
 uniffi::setup_scaffolding!();
