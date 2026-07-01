@@ -20,6 +20,7 @@
 
 pub mod http;
 pub mod outbox;
+pub mod pull;
 pub mod push;
 
 use std::sync::{Arc, Mutex};
@@ -47,6 +48,16 @@ pub enum SyncError {
 pub struct FlushSummary {
     pub pushed: u32,
     pub still_queued: u32,
+}
+
+/// The result of a pull across the FFI: rows seen, rows merged (last-write-wins winners +
+/// applied tombstones), and incoming deletes skipped as "don't-resurrect" (a delete for a row
+/// this device never had).
+#[derive(Debug, uniffi::Record)]
+pub struct PullSummary {
+    pub pulled: u32,
+    pub merged: u32,
+    pub skipped_tombstones: u32,
 }
 
 /// The on-device sync engine. Owns the SQLite [`Store`], the [`PostgrestClient`], the crypto
@@ -123,7 +134,7 @@ impl SyncEngine {
         row.insert("created_at".into(), json!(created_at));
         row.insert("updated_at".into(), json!(now));
         row.insert("deleted".into(), json!(deleted));
-        self.enqueue_row("books", &id, row)
+        self.stage_write("books", &id, row)
     }
 
     /// Enqueue a note upsert — the seal-at-write path. `text` is the PLAINTEXT; it is sealed here
@@ -164,7 +175,7 @@ impl SyncEngine {
         row.insert("created_at".into(), json!(created_at));
         row.insert("updated_at".into(), json!(now));
         row.insert("deleted".into(), json!(deleted));
-        self.enqueue_row("notes", &id, row)
+        self.stage_write("notes", &id, row)
     }
 
     /// Push every queued write to Supabase (books-first, remap, notes; failed stay queued).
@@ -186,22 +197,94 @@ impl SyncEngine {
             still_queued: result.failed.len() as u32,
         })
     }
+
+    /// Pull incrementally from Supabase for the in-scope tables (`books` + `notes` this slice; the
+    /// other six follow in SUR-726 by extending `TABLES`). Merges last-write-wins by `updated_at`,
+    /// applies tombstones without resurrecting soft-deleted rows, and advances each per-table
+    /// cursor to a lookback watermark (`now()` minus [`PULL_CURSOR_OVERLAP_MS`], SUR-739 — so a
+    /// delayed/offline flush isn't skipped). Synchronous FFI — the async GETs run on the owned
+    /// runtime via `block_on`, exactly like `flush`. Note text stays ciphertext at rest (never
+    /// decrypted on pull); the host decrypts on demand via `Vault::decrypt_note`.
+    ///
+    /// **Call `flush()` BEFORE `pull()`** (as the PWA's `syncFromCloud` does). If a local edit is
+    /// still queued in the outbox and a pull merges a strictly-newer remote row for that record,
+    /// the stale outbox entry survives and the next unconditional `flush()` would re-push it over
+    /// the newer server row — a lost remote edit. Flushing first empties the outbox, closing the
+    /// window. The durable fix (rebase the outbox on an LWW win, or a `sync()` that enforces the
+    /// order) is tracked in SUR-736.
+    pub fn pull(&self) -> Result<PullSummary, SyncError> {
+        const TABLES: &[&str] = &["books", "notes"];
+        let store = lock!(self.store);
+        let client = lock!(self.client);
+        if client.access_token().is_none() {
+            return Err(SyncError::Flush(
+                "no access token set — call set_access_token before pull".into(),
+            ));
+        }
+        // One pre-fetch watermark for the whole pull (mirrors the JS single `nextCheckpoint`);
+        // each table that succeeds advances its cursor to it. Advance to `now() - OVERLAP`, not bare
+        // `now()`: `updated_at` is client-stamped at ENQUEUE, but a row becomes server-visible only
+        // at FLUSH — so a delayed/offline flush lands with a timestamp older than `now()` and a bare
+        // `now()` cursor would skip it forever. The overlap re-fetches that window (idempotent under
+        // LWW). Bounded mitigation only; the durable server-watermark fix is SUR-739.
+        let now = epoch_ms().saturating_sub(PULL_CURSOR_OVERLAP_MS);
+        let result = self
+            .runtime
+            .block_on(pull::pull(&store, &*client, TABLES, now))
+            .map_err(SyncError::Flush)?;
+        // Every requested table failing (e.g. offline / bad token) is a real error — surface it
+        // rather than a misleading "pulled 0". A PARTIAL failure stays Ok (per-table isolation:
+        // the failed table's cursor is untouched and re-pulls next call).
+        if result.failed_tables.len() == TABLES.len() {
+            return Err(SyncError::Flush(format!(
+                "pull failed for all tables: {}",
+                result.failed_tables.join(", ")
+            )));
+        }
+        Ok(PullSummary {
+            pulled: result.pulled as u32,
+            merged: result.merged as u32,
+            skipped_tombstones: result.skipped_tombstones as u32,
+        })
+    }
 }
 
 impl SyncEngine {
-    fn enqueue_row(
+    /// Offline-first (§4): stage a local write to BOTH the synced table and the outbox — the local
+    /// synced row first (so a read, and pull's LWW compare, see it immediately), then the outbox
+    /// (so a later flush pushes it). Both hit SQLite before any cloud call. Mirrors the PWA writing
+    /// Dexie + the outbox together. For notes, `row["text"]` is ALREADY enc:v2 ciphertext
+    /// (seal-at-write), so nothing plaintext is ever persisted here either.
+    ///
+    /// `enqueue_*` payloads are PARTIAL (this FFI doesn't yet carry every column — e.g. a book's
+    /// cover fields, a note's `image_path`/`source_meta`/`chapter`). The local synced row is the
+    /// partial edit **merged** onto any existing row (so it can't null pulled-only columns), while
+    /// the outbox keeps the partial payload (the server upsert patches only the changed columns).
+    /// Both writes happen in ONE transaction ([`Store::stage_local_write`]) — a partial failure
+    /// can't leave a locally-visible edit with no queued outbox row (SUR-725 review).
+    fn stage_write(
         &self,
         table: &str,
         record_id: &str,
         row: Map<String, Value>,
     ) -> Result<(), SyncError> {
-        let payload = Value::Object(row).to_string();
         lock!(self.store)
-            .enqueue(table, record_id, &payload, epoch_ms())
-            .map(|_| ())
+            .stage_local_write(table, record_id, row, epoch_ms())
             .map_err(|e| SyncError::Store(e.to_string()))
     }
 }
+
+/// Lookback the pull cursor keeps behind wall-clock `now()` when it advances (SUR-725 review /
+/// SUR-739). `updated_at` is client-stamped at ENQUEUE, but a row becomes server-visible only at
+/// FLUSH — so a delayed/offline flush lands on the server with a timestamp OLDER than a cursor that
+/// advanced to `now()`, and would be skipped forever. Advancing to `now() - OVERLAP` re-fetches this
+/// window each pull (idempotent under LWW), catching flushes delayed up to the window.
+///
+/// HEURISTIC, not a guarantee: a flush delayed beyond the window (long offline) is still missed
+/// until a full re-pull (reset the cursor to 0). The complete fix — a server-assigned monotonic
+/// watermark the cursor tracks, distinct from the client `updated_at` used for LWW — is SUR-739.
+/// Tunable: larger = fewer misses, more re-fetch per pull (bounded by pagination, SUR-652).
+const PULL_CURSOR_OVERLAP_MS: i64 = 24 * 60 * 60 * 1000; // 24h — covers a full offline day (e.g. a flight)
 
 /// Epoch milliseconds — the PWA `Date.now()` unit the cloud data is stamped in. `SystemTime`
 /// before the epoch is impossible on a sane clock; clamp to 0 rather than panic.
@@ -262,6 +345,100 @@ mod tests {
                 .as_str()
                 .is_some_and(|t| !t.is_empty()),
             "content_tag must be present (computed pre-seal, from plaintext)"
+        );
+    }
+
+    #[test]
+    fn enqueue_note_writes_local_synced_row_and_outbox() {
+        // Offline-first (§4): a local write must hit BOTH the synced `notes` table (so reads + the
+        // pull LWW compare see it) AND the outbox (so it flushes) — before any cloud call. The
+        // local row's text is ciphertext at rest, never plaintext.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = SyncEngine::open(
+            db_path.into(),
+            "https://x.supabase.co".into(),
+            "anon".into(),
+            Vault::generate(),
+        )
+        .unwrap();
+        engine
+            .enqueue_note(
+                "n1".into(),
+                Some("b1".into()),
+                "the secret plaintext".into(),
+                Some("5".into()),
+                vec!["philosophy".into()],
+                0,
+                false,
+            )
+            .unwrap();
+
+        let store = Store::open(db_path).unwrap();
+        let row = store
+            .get_row("notes", "n1")
+            .unwrap()
+            .expect("local synced row written");
+        let text = row["text"].as_str().unwrap();
+        assert!(text.starts_with("enc:v2:"), "local text is ciphertext");
+        assert!(
+            !text.contains("the secret plaintext"),
+            "plaintext must never be at rest"
+        );
+        assert_eq!(row["book_id"], json!("b1"));
+        assert_eq!(
+            store.outbox_items().unwrap().len(),
+            1,
+            "the write is also queued for flush"
+        );
+    }
+
+    #[test]
+    fn enqueue_book_edit_preserves_pulled_only_columns() {
+        // Regression (SUR-725 review): a partial local edit must NOT null the columns this FFI
+        // doesn't carry. A book pulled WITH a cover, then renamed locally, keeps its cover —
+        // stage_write merges the edit onto the existing row rather than full-replacing it.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+
+        // Seed a "pulled" book row with cover fields (own connection, dropped before the engine).
+        {
+            let store = Store::open(db_path).unwrap();
+            store
+                .apply_row(
+                    "books",
+                    json!({
+                        "id": "b1", "title": "Old", "author": "A",
+                        "cover_url": "https://cover", "cover_source": "openlibrary",
+                        "cover_resolved_at": 123, "created_at": 1, "updated_at": 1, "deleted": false
+                    })
+                    .as_object()
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+
+        // The user renames the book — enqueue_book carries only id/title/author/created_at/deleted.
+        let engine = SyncEngine::open(
+            db_path.into(),
+            "https://x.supabase.co".into(),
+            "anon".into(),
+            Vault::generate(),
+        )
+        .unwrap();
+        engine
+            .enqueue_book("b1".into(), "New Title".into(), Some("A".into()), 1, false)
+            .unwrap();
+
+        let store = Store::open(db_path).unwrap();
+        let row = store.get_row("books", "b1").unwrap().unwrap();
+        assert_eq!(row["title"], json!("New Title"), "edit applied");
+        assert_eq!(
+            row["cover_url"],
+            json!("https://cover"),
+            "cover survives a partial edit (merge, not full-replace)"
         );
     }
 }

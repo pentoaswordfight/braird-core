@@ -32,13 +32,38 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   as un-deleted. Stickiness is now accumulated across the group (read from the accumulator before
   the merge), so within a batch a delete wins and can't be resurrected. Two regression tests added.
   The identical latent hole in surfc's PWA `collapseOutboxItems` is filed as SUR-731.
+- **ADR numbering collision fixed (SUR-725).** SUR-724 (PR#7) landed the async-HTTP-client ADR as a
+  local `0001`, colliding with the repo's unqualified "ADR 0001" = the founding Rust+UniFFI decision
+  (surfc#331, referenced in `GATING.md`, ADR 0002/0003, `src/store.rs`). Renumbered to
+  `docs/adr/0004-async-http-client.md` so the architecture chain resolves to the right document.
 
 ### Added
-- **ADR 0001 — async HTTP client (`docs/adr/0001-async-http-client.md`, SUR-724 / SUR-659b):**
+- **Incremental pull + tombstones + first coexistence (`src/sync/pull.rs`, `src/store.rs`,
+  `src/sync/http.rs`, SUR-725 / SUR-659c):** the `SyncEngine.pull()` UniFFI method mirrors surfc's
+  `fetchSince` + `mergeCloudRecords` on `books` + `notes` — per table it GETs rows with
+  `updated_at >= cursor` (inclusive, like the JS `.gte`), merges **last-write-wins by `updated_at`**
+  (strict `>`, so a tie keeps local), applies **tombstones** (an incoming `deleted:1` is written but
+  a soft-deleted row is never *resurrected* — a delete for a row this device never had is skipped),
+  and advances a **per-table** cursor (in `meta`, `sync:cursor:<table>`) to the puller's own
+  pre-fetch `now()`. **Note text stays ciphertext at rest** — pull stores `enc:v2` verbatim and never
+  decrypts (the inverse of push's seal-at-write; the host decrypts on demand via
+  `Vault::decrypt_note`). New store helpers `get_row` / `apply_row` (descriptor-driven, projecting
+  out the server-only `user_id` + any future additive column) + `get_sync_cursor` / `set_sync_cursor`,
+  and the deferred per-table `updated_at` index now lands with its read path. **Offline-first (§4):**
+  local writes (`enqueue_book` / `enqueue_note`) now hit the synced table AND the outbox before any
+  cloud call. Per-table failure isolation: one table's fetch failing leaves its cursor unadvanced
+  (re-pulls next time) while others proceed. **Cursor value decided:** the puller's `now()`, NOT
+  `max(updated_at)` — `updated_at` is client-authored (no server trigger; verified in surfc
+  migrations 0001…), so a batch max would inherit writer clock skew. Proven on `books` + `notes`;
+  the other six tables follow in SUR-726 by extending the pull table list. **Native-only** (gated
+  off wasm32). New env-guarded integration test (`tests/sync_725_integration.rs`) proves server→core
+  coexistence, ciphertext round-trip + `content_tag`, and tombstone apply / no-resurrect against a
+  real local Supabase.
+- **ADR 0004 — async HTTP client (`docs/adr/0004-async-http-client.md`, SUR-724 / SUR-659b):**
   records the reqwest + tokio `current_thread` + rustls decision behind the sync push layer — the
   runtime is owned by the `SyncEngine` handle (`block_on` per flush, no background thread), and
-  rustls is chosen for iOS/Android TLS portability. Fills the ADR that 0003 (seal-at-write)
-  already cross-references.
+  rustls is chosen for iOS/Android TLS portability. Underpins ADR 0003 §Decision 5 (the sync FFI
+  runs sync and `block_on`s this client). (Renumbered from a mistaken local 0001 by SUR-725.)
 - **Sync engine — outbox + push/flush + token handoff (`src/sync/**`, SUR-724 / SUR-659b):** the
   `SyncEngine` UniFFI handle enqueues writes, seals note text **at write** (enc:v2 ciphertext +
   a plaintext-derived `content_tag`, so no plaintext note text is ever persisted), and flushes to
