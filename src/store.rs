@@ -17,6 +17,11 @@
 
 use rusqlite::Connection;
 
+/// One `outbox` row read back by [`Store::outbox_items`]: `(id, table_name, record_id,
+/// payload_json, created_at)`. Aliased so the 5-tuple stays readable at the call site (and
+/// keeps clippy's `type_complexity` lint happy).
+pub type OutboxRow = (i64, String, Option<String>, String, i64);
+
 /// The core's logical column-type vocabulary — the canonical axis the drift guard
 /// compares on (a pg `jsonb` and a `text[]` both round-trip as `Json`; every integer
 /// width is `Int`; `boolean` is `Bool`). One normalization map, shared with the
@@ -288,6 +293,81 @@ impl Store {
         })?;
         rows.collect()
     }
+
+    // ── outbox + meta helpers (SUR-724) ──────────────────────────────────────
+    // The sync engine's read/write surface over the two local-only tables it drives.
+    // Kept on `Store` (which owns the tables) rather than reaching into `conn` from the
+    // sync module; the payload here is already-sealed JSON (ciphertext for note text).
+    //
+    // See the module-level `OutboxRow` alias for the read-back tuple shape.
+
+    /// Enqueue one pending write. `payload_json` is the row's column values as a JSON
+    /// object string; for notes its `text` is ALREADY enc:v2 ciphertext (seal-at-write).
+    pub fn enqueue(
+        &self,
+        table_name: &str,
+        record_id: &str,
+        payload_json: &str,
+        created_at: i64,
+    ) -> rusqlite::Result<i64> {
+        self.conn.execute(
+            "INSERT INTO outbox (table_name, record_id, payload, created_at) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![table_name, record_id, payload_json, created_at],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Every queued write, oldest first (see [`OutboxRow`]) — the sync module parses the
+    /// payload JSON.
+    pub fn outbox_items(&self) -> rusqlite::Result<Vec<OutboxRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, table_name, record_id, payload, created_at FROM outbox ORDER BY created_at, id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?;
+        rows.collect()
+    }
+
+    /// Clear the given outbox ids (a collapsed group that flushed successfully). Failed
+    /// groups are simply NOT passed here, so they stay queued for the next flush.
+    pub fn clear_outbox(&self, ids: &[i64]) -> rusqlite::Result<()> {
+        // Small batch (one flush's worth); a per-id delete is fine and avoids array binding.
+        for id in ids {
+            self.conn
+                .execute("DELETE FROM outbox WHERE id = ?1", [id])?;
+        }
+        Ok(())
+    }
+
+    /// Read a `meta` KV value (e.g. `bookIdRemap`).
+    pub fn meta_get(&self, key: &str) -> rusqlite::Result<Option<String>> {
+        self.conn
+            .query_row("SELECT value FROM meta WHERE key = ?1", [key], |row| {
+                row.get(0)
+            })
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other),
+            })
+    }
+
+    /// Write a `meta` KV value (upsert).
+    pub fn meta_set(&self, key: &str, value: &str) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            rusqlite::params![key, value],
+        )?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -334,5 +414,43 @@ mod tests {
             assert!(names.contains(&"updated_at"), "{} lacks updated_at", t.name);
             assert!(names.contains(&"deleted"), "{} lacks deleted", t.name);
         }
+    }
+
+    // ── SUR-724 outbox + meta helpers (fast-gate coverage, no network) ────────
+
+    #[test]
+    fn outbox_enqueue_read_and_clear_roundtrip() {
+        let store = Store::open_in_memory().unwrap();
+        // Enqueue newest-first; outbox_items must return oldest-first by created_at.
+        let id_new = store
+            .enqueue("notes", "n1", r#"{"id":"n1","text":"enc:v2:b"}"#, 200)
+            .unwrap();
+        let id_old = store
+            .enqueue("notes", "n0", r#"{"id":"n0","text":"enc:v2:a"}"#, 100)
+            .unwrap();
+        let items = store.outbox_items().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].0, id_old, "oldest created_at first");
+        assert_eq!(items[1].0, id_new);
+        // clear_outbox removes only the named ids, leaving the rest queued.
+        store.clear_outbox(&[id_old]).unwrap();
+        let left = store.outbox_items().unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].0, id_new);
+    }
+
+    #[test]
+    fn meta_set_get_roundtrip_and_upsert() {
+        let store = Store::open_in_memory().unwrap();
+        assert_eq!(store.meta_get("bookIdRemap").unwrap(), None);
+        store.meta_set("bookIdRemap", r#"{"a":"b"}"#).unwrap();
+        // Set twice — the ON CONFLICT upsert replaces the value, not inserts a duplicate.
+        store
+            .meta_set("bookIdRemap", r#"{"a":"server-1"}"#)
+            .unwrap();
+        assert_eq!(
+            store.meta_get("bookIdRemap").unwrap().as_deref(),
+            Some(r#"{"a":"server-1"}"#)
+        );
     }
 }
