@@ -149,16 +149,17 @@ fn sql_to_json(sv: SqlValue, ty: ColType) -> Value {
 /// | `books` | — | whole-row LWW | scalar metadata; a null is authoritative (a cover-clear must converge) |
 /// | `notes` | `tags`, `source_meta` | whole-row LWW | a tag edit IS a note edit; array *union* can't express a delete — an OR-set would be a wire change (future ticket only if product demands) |
 /// | `custom_ideas` | — | whole-row LWW | scalar metadata |
-/// | `note_links` | — (row-per-edge) | row-level LWW → set | add = insert a row, remove = tombstone it |
+/// | `note_links` | — (row-per-edge) | row-level LWW → **bag** | random-`uid()` pk: add = insert, remove = tombstone; concurrent adds of the *same* logical edge do NOT dedup (two rows) — unlike memberships' deterministic pk |
 /// | `lenses` | `leaf_ids` | whole-row LWW | a lens is ONE authored query; unioning leaves under one combinator/threshold fabricates a query nobody wrote |
 /// | `collections` | — | whole-row LWW | scalar metadata |
 /// | `collection_memberships` | — (row-per-pair, deterministic `membershipId(collection, note)`) | row-level LWW → OR-set | concurrent adds of the same pair share a pk → converge to ONE row |
 /// | `note_signals` | counters | whole-row LWW → **lossy, accepted** | concurrent increments lose one side; derived data, self-heals on the next signal |
 ///
-/// The composite columns (`tags`, `source_meta`, `leaf_ids`) are stored + compared as opaque JSON
-/// TEXT (`ColType::Json`); **no element-level merge happens or is intended.** Any change to that (e.g.
-/// an OR-set for `tags`) is **wire-visible** and must land in the PWA (`mergeCloudRecords`) and here
-/// in lockstep. Ratification pin tests live in `pull.rs` (`sur737_*`).
+/// The composite columns (`tags`, `source_meta`, `leaf_ids`) are stored as opaque JSON TEXT
+/// (`ColType::Json`); the LWW decision is `updated_at`-only (never on column contents), and **no
+/// element-level merge happens or is intended.** Any change to that (e.g. an OR-set for `tags`) is
+/// **wire-visible** and must land in the PWA (`mergeCloudRecords`) and here in lockstep. Ratification
+/// pin tests live in `pull.rs` (`sur737_*`).
 pub fn synced_schema() -> &'static [TableSchema] {
     &[
         TableSchema {
