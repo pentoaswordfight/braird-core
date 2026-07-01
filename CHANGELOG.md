@@ -6,6 +6,35 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+### Added
+- **Sync fanned out to all eight synced stores + the full coexistence matrix (SUR-726, closes
+  Phase 2 / SUR-659).** Pull and flush now cover every synced table — `custom_ideas`, `note_links`,
+  `lenses`, `collections`, `collection_memberships`, `note_signals` — alongside `books`/`notes`.
+  - **FFI:** six new `enqueue_*` methods on `SyncEngine` (one per new store), plus an exported
+    `membership_id(collection_id, note_id)` free function mirroring surfc's `membershipId` byte-for-byte
+    (`collection:note` join, collection first) so concurrent adds of a note↔collection pair converge to
+    one row. `enqueue_collection_membership` derives that id internally; `enqueue_note_signals` keys on
+    `note_id` (no `id` column) and carries a birth-row-never-enqueued contract (mirror of
+    `ensureNoteSignals`); wire defaults match the oracle (`relation_type` `handwritten_annotation`,
+    `combinator` `AND`, `threshold` `100`, empty `description`). New binding surface → `touches-ffi`.
+  - **Pull scope + flush order from one source.** Both `pull()` and `sync()` now pull every table in
+    `store::synced_table_names()` (derived from `synced_schema()`); `flush()` dispatches that same list
+    in topological (FK-parent-first) order with a generalized, transitive hold-back — a row whose FK
+    points at a parent that failed/held this run stays queued (no server FK violation). This replaces
+    SUR-724's hard-coded books→notes loops.
+  - **Coexistence matrix** (`tests/sync_726_integration.rs`, `#[ignore]`d, real local Supabase):
+    8-store round-trip both directions; tombstone propagation + no-resurrect across all new stores;
+    SUR-736 outbox-rebase convergence on a fan-out table; deterministic-id membership convergence;
+    export/import parity (every column round-trips verbatim; a partial edit doesn't null untouched
+    server columns). Unit coverage: per-table pull/LWW/rebase on the `note_id` pk, enqueue wire shapes,
+    `membership_id` parity vectors, and topo/hold-back flush ordering.
+
+### Fixed
+- **Flush no longer wedges a queued row in a non-`books`/`notes` table (SUR-726).** The pre-fan-out
+  flush dispatched only `books`/`notes` groups, so a queued row in any other synced table was neither
+  sent nor failed — it sat in the outbox forever. The single topo-ordered dispatch pass sends every
+  synced table; regression-tested per new store.
+
 ### Changed
 - **Ratified whole-row-LWW convergence for array/composite + row-per-pair tables (SUR-737).**
   Docs + pin tests only, **no behaviour change**: documented that every synced table resolves

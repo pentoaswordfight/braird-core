@@ -694,4 +694,163 @@ mod tests {
             "device B keeps its own — ms-identical concurrent edit did NOT reconcile (accepted)"
         );
     }
+
+    // ── SUR-726 fan-out: all eight tables + the non-`id` pk (note_signals) ─────
+
+    #[test]
+    fn sur726_all_eight_tables_pull_and_advance_cursors() {
+        // Acceptance: every synced store incremental-pulls with its own cursor. One row per table
+        // through a single `pull()` over the whole `synced_table_names()` scope.
+        let store = Store::open_in_memory().unwrap();
+        let sink = MapSink::new()
+            .with("books", vec![json!({ "id": "b1", "updated_at": 1000, "deleted": false })])
+            .with("notes", vec![note("n1", 1000, false, "enc:v2:x")])
+            .with(
+                "custom_ideas",
+                vec![json!({ "id": "ci1", "name": "I", "updated_at": 1000, "deleted": false })],
+            )
+            .with(
+                "note_links",
+                vec![json!({ "id": "nl1", "from_note_id": "n1", "to_note_id": "n1", "updated_at": 1000, "deleted": false })],
+            )
+            .with(
+                "lenses",
+                vec![json!({ "id": "l1", "name": "L", "leaf_ids": ["a"], "updated_at": 1000, "deleted": false })],
+            )
+            .with(
+                "collections",
+                vec![json!({ "id": "c1", "name": "C", "updated_at": 1000, "deleted": false })],
+            )
+            .with(
+                "collection_memberships",
+                vec![json!({ "id": "c1:n1", "note_id": "n1", "collection_id": "c1", "updated_at": 1000, "deleted": false })],
+            )
+            .with(
+                "note_signals",
+                vec![json!({ "note_id": "n1", "updated_at": 1000, "deleted": false })],
+            );
+
+        let tables = crate::store::synced_table_names();
+        let res = block(pull(&store, &sink, &tables, 5000)).unwrap();
+
+        assert_eq!(res.pulled, 8);
+        assert_eq!(res.merged, 8);
+        for (table, pk) in [
+            ("books", "b1"),
+            ("notes", "n1"),
+            ("custom_ideas", "ci1"),
+            ("note_links", "nl1"),
+            ("lenses", "l1"),
+            ("collections", "c1"),
+            ("collection_memberships", "c1:n1"),
+            ("note_signals", "n1"),
+        ] {
+            assert!(
+                store.get_row(table, pk).unwrap().is_some(),
+                "{table} row merged"
+            );
+            assert_eq!(
+                store.get_sync_cursor(table).unwrap(),
+                Some(5000),
+                "{table} cursor advanced"
+            );
+        }
+    }
+
+    #[test]
+    fn sur726_note_signals_pull_lww_keyed_by_note_id() {
+        // note_signals is the one table whose pk is `note_id`, not `id`. Prove the full pull + LWW
+        // path works keyed on it (the descriptor-driven pk[0] carries through end to end).
+        let store = Store::open_in_memory().unwrap();
+        apply_local(
+            &store,
+            "note_signals",
+            json!({ "note_id": "n1", "return_visits": 1, "updated_at": 1000, "deleted": false }),
+        );
+        let sink = MapSink::new().with(
+            "note_signals",
+            vec![json!({ "note_id": "n1", "return_visits": 5, "updated_at": 2000, "deleted": false })],
+        );
+        let res = block(pull(&store, &sink, &["note_signals"], 9000)).unwrap();
+        assert_eq!(res.merged, 1);
+        assert_eq!(
+            store.get_row("note_signals", "n1").unwrap().unwrap()["return_visits"],
+            json!(5),
+            "newer counters won whole-row LWW, keyed by note_id"
+        );
+    }
+
+    #[test]
+    fn sur726_note_signals_rebase_surfaces_superseded_by_note_id() {
+        // The SUR-736 outbox rebase must fire on the non-`id` pk table too: a pending note_signals
+        // edit that a newer remote row beats is dropped and surfaced, keyed by note_id.
+        let store = Store::open_in_memory().unwrap();
+        apply_local(
+            &store,
+            "note_signals",
+            json!({ "note_id": "n1", "return_visits": 1, "updated_at": 1000, "deleted": false }),
+        );
+        store
+            .enqueue(
+                "note_signals",
+                "n1",
+                &json!({ "note_id": "n1", "return_visits": 1, "updated_at": 1000 }).to_string(),
+                1000,
+            )
+            .unwrap();
+        let sink = MapSink::new().with(
+            "note_signals",
+            vec![json!({ "note_id": "n1", "return_visits": 9, "updated_at": 2000, "deleted": false })],
+        );
+
+        let res = block(pull(&store, &sink, &["note_signals"], 9000)).unwrap();
+
+        assert_eq!(res.merged, 1);
+        assert_eq!(
+            res.superseded,
+            vec![SupersededEdit {
+                table: "note_signals".into(),
+                record_id: "n1".into(),
+                discarded_updated_at: 1000,
+                winning_updated_at: 2000,
+            }]
+        );
+        assert!(
+            store.outbox_items().unwrap().is_empty(),
+            "the stale note_signals edit is rebased away"
+        );
+    }
+
+    #[test]
+    fn sur726_note_link_add_then_tombstone_and_bag_coexistence() {
+        // note_links is row-per-edge (convergence contract): an add is an insert, a remove is a
+        // tombstone (row-level LWW), and two DIFFERENT ids coexist (a "bag" — no dedup, unlike
+        // memberships' deterministic pk).
+        let store = Store::open_in_memory().unwrap();
+        let sink = MapSink::new().with(
+            "note_links",
+            vec![
+                json!({ "id": "nl1", "from_note_id": "a", "to_note_id": "b", "updated_at": 1000, "deleted": false }),
+                json!({ "id": "nl2", "from_note_id": "a", "to_note_id": "b", "updated_at": 1000, "deleted": false }),
+            ],
+        );
+        block(pull(&store, &sink, &["note_links"], 9000)).unwrap();
+        assert!(store.get_row("note_links", "nl1").unwrap().is_some());
+        assert!(
+            store.get_row("note_links", "nl2").unwrap().is_some(),
+            "same logical edge under a different id is a separate row (bag, no dedup)"
+        );
+
+        // A newer remove tombstones nl1 (row-level LWW remove).
+        let sink = MapSink::new().with(
+            "note_links",
+            vec![json!({ "id": "nl1", "from_note_id": "a", "to_note_id": "b", "updated_at": 2000, "deleted": true })],
+        );
+        block(pull(&store, &sink, &["note_links"], 9001)).unwrap();
+        assert_eq!(
+            store.get_row("note_links", "nl1").unwrap().unwrap()["deleted"],
+            json!(true),
+            "a newer remove tombstones the edge"
+        );
+    }
 }

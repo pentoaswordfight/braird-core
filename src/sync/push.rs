@@ -1,15 +1,22 @@
-//! Flush orchestration (SUR-724 / SUR-659b). Mirrors surfc's `flushOutbox`, extended with
-//! the founder-decided seal-at-write + offline-merge-remap model:
+//! Flush orchestration (SUR-724 / SUR-659b; fanned out to all eight synced tables in SUR-726).
+//! Mirrors surfc's `flushOutbox`, extended with the founder-decided seal-at-write + offline-merge
+//! remap model, and hardened with a dependency-ordered dispatch the PWA doesn't need:
 //!
 //!   1. read the queued writes + the persisted `bookIdRemap` (from `meta`);
 //!   2. collapse (LWW per field, sticky delete, note book_id repointed via the remap);
-//!   3. upsert BOOKS first — on success, record temp→server in the persisted remap;
-//!   4. upsert NOTES — book_id already repointed at collapse; a note whose parent BOOK
-//!      flush failed stays queued (never dispatched with a temp id → no server FK violation);
-//!   5. clear only the succeeded outbox ids; failed groups stay queued for the next flush.
+//!   3. dispatch each synced table in TOPOLOGICAL order ([`synced_table_names`]) — every FK parent
+//!      before its children — recording per-table the record ids that failed or were held back;
+//!   4. a row whose FK points at a failed/held parent this run stays queued (no server FK
+//!      violation); on success a book records temp→server in the persisted remap, saved after the
+//!      books pass and before any child table needs it;
+//!   5. clear only the succeeded outbox ids; failed/held groups stay queued for the next flush.
 //!
-//! This slice proves the model on `books` + `notes` only (the two tables with the parent/child
-//! + encryption edges). The other six synced tables land in SUR-659c/d behind the same flush.
+//! One ordered pass replaces SUR-724's hard-coded books-then-notes loops. It also closes a latent
+//! bug that pre-dated the fan-out: the old flush dispatched ONLY `books`/`notes` groups, so a queued
+//! row in any of the other six tables was neither sent nor failed and wedged the outbox forever. The
+//! PWA has no such ordering (it dispatches in collapse order and lets a server FK violation
+//! fail-and-retry); the topo order + hold-back is a documented core hardening, same class as the
+//! books-before-notes guard and the batch-sticky delete.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -17,18 +24,33 @@ use serde_json::{json, Value};
 
 use super::http::PostgrestSink;
 use super::outbox::{collapse, resolve_book_id, Collapsed, OutboxItem};
-use crate::store::Store;
+use crate::store::{synced_table_names, Store};
 
 /// `meta` key holding the offline-merge temp→server book-id map (JSON object). Persisted so a
 /// remap survives a process restart between the book flush and a later note flush.
 const BOOK_ID_REMAP_KEY: &str = "bookIdRemap";
 
-/// The pk each table upserts on (the PostgREST `on_conflict` target). books/notes = `id`.
+/// The pk each table upserts on (the PostgREST `on_conflict` target) — also the pk column the flush
+/// reads a group's record id from. All eight synced tables key on `id` except `note_signals`
+/// (keyed on `note_id`).
 fn on_conflict_for(table: &str) -> &'static str {
     match table {
-        // note_signals is out of this slice, but keep the one non-`id` pk honest for SUR-659c/d.
         "note_signals" => "note_id",
         _ => "id",
+    }
+}
+
+/// The foreign keys each table's rows carry as `(column, parent table)` — mirroring the surfc
+/// server FKs (migrations 0001/0034/0043/0047). The flush holds a child back when its parent
+/// failed/was held this run, so no dispatch hits a server FK violation. Tables with no FK (books,
+/// custom_ideas, lenses, collections) return an empty slice.
+fn fk_deps(table: &str) -> &'static [(&'static str, &'static str)] {
+    match table {
+        "notes" => &[("book_id", "books")],
+        "note_links" => &[("from_note_id", "notes"), ("to_note_id", "notes")],
+        "collection_memberships" => &[("note_id", "notes"), ("collection_id", "collections")],
+        "note_signals" => &[("note_id", "notes")],
+        _ => &[],
     }
 }
 
@@ -74,73 +96,82 @@ pub async fn flush<S: PostgrestSink>(
     let collapsed = collapse(items, &remap);
 
     let mut result = FlushResult::default();
-    // Books whose flush FAILED — their child notes must NOT dispatch with a temp book_id.
-    let mut failed_books: BTreeSet<String> = BTreeSet::new();
+    // Per-table record ids that FAILED or were HELD BACK this run. A child whose FK points at one
+    // must not dispatch (its parent isn't on the server), so holds are transitive across the topo
+    // order: a failed book holds its notes, which in turn holds a note_link to those notes.
+    let mut failed: BTreeMap<&'static str, BTreeSet<String>> = BTreeMap::new();
 
-    // ── Books first ──────────────────────────────────────────────────────────
-    for group in collapsed.iter().filter(|g| g.table == "books") {
-        let book_id = group
-            .payload
-            .get("id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        match upsert_group(sink, group, user_id).await {
-            Ok(()) => {
-                result.ok.extend(&group.ids);
-                // A book that flushed under a temp id and carries its server id maps temp→server.
-                // The PWA gets its server id from the merge (SUR-463); here a book keeps its own
-                // id (offline books are created with their final id), so a remap entry is only
-                // recorded when a `server_id` hint is present — future-proofing the plumbing
-                // without inventing a remap the current write path doesn't produce.
-                if let Some(server_id) = group.payload.get("server_id").and_then(|v| v.as_str()) {
-                    if server_id != book_id {
-                        remap.insert(book_id.clone(), server_id.to_string());
-                    }
-                }
+    // ONE pass in dependency (topological) order so every FK parent flushes before its children.
+    for table in synced_table_names() {
+        for group in collapsed.iter().filter(|g| g.table == table) {
+            let mut group = group.clone();
+
+            // Repoint a note's book_id onto the offline-merge survivor. Collapse already resolved it
+            // against the remap as it stood; re-resolve here to pick up a book merged EARLIER in THIS
+            // flush (its temp→server entry was added during the books pass). No-op for the tables
+            // that carry no book_id column.
+            if let Some(b) = group.payload.get("book_id").and_then(|v| v.as_str()) {
+                let resolved = resolve_book_id(b, &remap);
+                group
+                    .payload
+                    .insert("book_id".into(), Value::String(resolved));
             }
-            Err(_) => {
+
+            // The record's own pk value — `on_conflict_for` is the pk column (`id`, or `note_id` for
+            // note_signals). Recorded in `failed` if this group can't flush, so its children hold.
+            let record_id = group
+                .payload
+                .get(on_conflict_for(table))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            // Hold back if any FK this row carries points at a parent that failed/held this run —
+            // dispatching would hit a server FK violation (the parent row isn't there yet).
+            let blocked = fk_deps(table).iter().any(|&(fk_col, parent)| {
+                group
+                    .payload
+                    .get(fk_col)
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|val| failed.get(parent).is_some_and(|s| s.contains(val)))
+            });
+            if blocked {
                 result.failed.extend(&group.ids);
-                failed_books.insert(book_id);
-            }
-        }
-    }
-
-    // Persist the (possibly-extended) remap before notes, so a crash mid-flush doesn't lose it.
-    persist_remap(store, &remap)?;
-
-    // ── Notes second ─────────────────────────────────────────────────────────
-    for group in collapsed.iter().filter(|g| g.table == "notes") {
-        // book_id was repointed at collapse; re-resolve against the just-extended remap so a
-        // book merged THIS flush is picked up too.
-        let book_id = group
-            .payload
-            .get("book_id")
-            .and_then(|v| v.as_str())
-            .map(|b| resolve_book_id(b, &remap));
-
-        // Guard: a note whose parent book's flush failed this run stays queued — dispatching it
-        // now would hit the server with a temp/absent book_id → FK violation.
-        if let Some(ref b) = book_id {
-            if failed_books.contains(b) {
-                result.failed.extend(&group.ids);
+                failed.entry(table).or_default().insert(record_id);
                 continue;
             }
+
+            match upsert_group(sink, &group, user_id).await {
+                Ok(()) => {
+                    result.ok.extend(&group.ids);
+                    // A book that flushed under a temp id and carries its server id maps temp→server
+                    // (SUR-463; only books produce a server_id hint — offline books otherwise keep
+                    // their own final id, so a remap entry is recorded only when the hint is present).
+                    if table == "books" {
+                        if let Some(server_id) =
+                            group.payload.get("server_id").and_then(|v| v.as_str())
+                        {
+                            if server_id != record_id {
+                                remap.insert(record_id.clone(), server_id.to_string());
+                            }
+                        }
+                    }
+                }
+                Err(_) => {
+                    result.failed.extend(&group.ids);
+                    failed.entry(table).or_default().insert(record_id);
+                }
+            }
         }
 
-        // Repoint the payload's book_id to the resolved value before dispatch.
-        let mut group = group.clone();
-        if let Some(b) = book_id {
-            group.payload.insert("book_id".into(), Value::String(b));
-        }
-
-        match upsert_group(sink, &group, user_id).await {
-            Ok(()) => result.ok.extend(&group.ids),
-            Err(_) => result.failed.extend(&group.ids),
+        // Persist the (possibly-extended) remap right after the books pass — BEFORE any child table —
+        // so a crash mid-flush can't lose a temp→server mapping a queued note still needs.
+        if table == "books" {
+            persist_remap(store, &remap)?;
         }
     }
 
-    // Clear only the succeeded ids; failed groups stay queued.
+    // Clear only the succeeded ids; failed/held groups stay queued for the next flush.
     store
         .clear_outbox(&result.ok)
         .map_err(|e| format!("clear outbox: {e}"))?;
@@ -191,9 +222,11 @@ mod tests {
             .block_on(f)
     }
 
-    /// In-memory sink: records the table of every upsert (in call order); can fail one table.
+    /// In-memory sink: records the table (and the on_conflict target) of every upsert, in call
+    /// order; can fail one table.
     struct VecSink {
         calls: RefCell<Vec<String>>,
+        conflicts: RefCell<Vec<(String, String)>>,
         fail_table: Option<String>,
     }
 
@@ -201,10 +234,13 @@ mod tests {
         async fn upsert(
             &self,
             table: &str,
-            _on_conflict: &str,
+            on_conflict: &str,
             _rows: &Value,
         ) -> Result<(), String> {
             self.calls.borrow_mut().push(table.to_string());
+            self.conflicts
+                .borrow_mut()
+                .push((table.to_string(), on_conflict.to_string()));
             match &self.fail_table {
                 Some(t) if t == table => Err(format!("{table} sink error")),
                 _ => Ok(()),
@@ -220,8 +256,24 @@ mod tests {
     fn sink(fail_table: Option<&str>) -> VecSink {
         VecSink {
             calls: RefCell::new(Vec::new()),
+            conflicts: RefCell::new(Vec::new()),
             fail_table: fail_table.map(String::from),
         }
+    }
+
+    /// Enqueue a minimal valid row for `table` keyed `record_id`. `extra` fields (e.g. FK columns)
+    /// merge over the pk so a test can wire parent/child edges. Used by the SUR-726 fan-out tests.
+    fn enqueue_row(store: &Store, table: &str, pk_col: &str, record_id: &str, extra: Value) {
+        let mut payload = serde_json::Map::new();
+        payload.insert(pk_col.to_string(), json!(record_id));
+        if let Value::Object(fields) = extra {
+            for (k, v) in fields {
+                payload.insert(k, v);
+            }
+        }
+        store
+            .enqueue(table, record_id, &Value::Object(payload).to_string(), 100)
+            .unwrap();
     }
 
     #[test]
@@ -293,5 +345,144 @@ mod tests {
             remap.contains("temp1") && remap.contains("srv-1"),
             "remap persisted to meta: {remap}"
         );
+    }
+
+    // ── SUR-726 fan-out: topo-ordered dispatch across all eight tables ─────────
+
+    #[test]
+    fn flush_dispatches_all_eight_tables_in_topological_order() {
+        // Enqueue one row per synced table in REVERSE topo order; the flush must still dispatch them
+        // parents-first (the schema order). No FK parent fails, so nothing is held.
+        let store = Store::open_in_memory().unwrap();
+        enqueue_row(&store, "note_signals", "note_id", "n1", json!({})); // no separate id column
+        enqueue_row(&store, "collection_memberships", "id", "c1:n1", json!({}));
+        enqueue_row(&store, "collections", "id", "c1", json!({}));
+        enqueue_row(&store, "lenses", "id", "l1", json!({}));
+        enqueue_row(&store, "note_links", "id", "nl1", json!({}));
+        enqueue_row(&store, "custom_ideas", "id", "ci1", json!({}));
+        enqueue_row(&store, "notes", "id", "n1", json!({ "text": "enc:v2:x" }));
+        enqueue_row(&store, "books", "id", "b1", json!({}));
+
+        let s = sink(None);
+        let res = block(flush(&store, &s, "user-1")).unwrap();
+
+        assert_eq!(
+            *s.calls.borrow(),
+            synced_table_names(),
+            "dispatch order is the topological (schema) order regardless of enqueue order"
+        );
+        assert_eq!(res.ok.len(), 8, "every table flushed");
+        assert!(res.failed.is_empty());
+    }
+
+    #[test]
+    fn silent_wedge_regression_all_six_new_tables_dispatch() {
+        // Pre-726 the flush dispatched ONLY books/notes groups — a queued row in any other table was
+        // never sent and never failed, wedging the outbox forever. Each of the six new tables must
+        // now dispatch and clear. (None carry a failing FK parent here, so none are held.)
+        let store = Store::open_in_memory().unwrap();
+        enqueue_row(&store, "custom_ideas", "id", "ci1", json!({}));
+        enqueue_row(&store, "note_links", "id", "nl1", json!({}));
+        enqueue_row(&store, "lenses", "id", "l1", json!({}));
+        enqueue_row(&store, "collections", "id", "c1", json!({}));
+        enqueue_row(&store, "collection_memberships", "id", "c1:n1", json!({}));
+        enqueue_row(&store, "note_signals", "note_id", "n1", json!({}));
+
+        let s = sink(None);
+        let res = block(flush(&store, &s, "user-1")).unwrap();
+
+        let dispatched = s.calls.borrow().clone();
+        for t in [
+            "custom_ideas",
+            "note_links",
+            "lenses",
+            "collections",
+            "collection_memberships",
+            "note_signals",
+        ] {
+            assert!(dispatched.contains(&t.to_string()), "{t} must dispatch");
+        }
+        assert_eq!(res.ok.len(), 6, "all six cleared — none wedged");
+        assert!(store.outbox_items().unwrap().is_empty());
+    }
+
+    #[test]
+    fn note_signals_upserts_on_the_note_id_conflict_target() {
+        // note_signals has no `id` column — its upsert must conflict on `note_id`, every other table
+        // on `id`. (The pk column also drives the flush's record-id read.)
+        let store = Store::open_in_memory().unwrap();
+        enqueue_row(&store, "note_signals", "note_id", "n1", json!({}));
+        enqueue_row(&store, "collections", "id", "c1", json!({}));
+        let s = sink(None);
+        block(flush(&store, &s, "user-1")).unwrap();
+
+        let conflicts = s.conflicts.borrow().clone();
+        assert!(conflicts.contains(&("note_signals".into(), "note_id".into())));
+        assert!(conflicts.contains(&("collections".into(), "id".into())));
+    }
+
+    #[test]
+    fn membership_held_when_parent_collection_flush_fails() {
+        // A membership whose parent collection failed this run must stay queued — dispatching it
+        // would hit a server FK violation.
+        let store = Store::open_in_memory().unwrap();
+        enqueue_row(&store, "collections", "id", "c1", json!({}));
+        enqueue_row(
+            &store,
+            "collection_memberships",
+            "id",
+            "c1:n1",
+            json!({ "note_id": "n1", "collection_id": "c1" }),
+        );
+        let s = sink(Some("collections"));
+        let res = block(flush(&store, &s, "user-1")).unwrap();
+
+        assert_eq!(
+            *s.calls.borrow(),
+            vec!["collections".to_string()],
+            "the membership is never dispatched"
+        );
+        assert_eq!(
+            res.failed.len(),
+            2,
+            "collection + held membership stay queued"
+        );
+        assert!(res.ok.is_empty());
+    }
+
+    #[test]
+    fn hold_back_is_transitive_book_to_note_to_note_link() {
+        // A failed book holds its note (book_id FK); the held note in turn holds a note_link that
+        // references it (from/to_note_id FK) — the transitive chain across the topo order.
+        let store = Store::open_in_memory().unwrap();
+        enqueue_row(&store, "books", "id", "b1", json!({}));
+        enqueue_row(
+            &store,
+            "notes",
+            "id",
+            "n1",
+            json!({ "book_id": "b1", "text": "enc:v2:x" }),
+        );
+        enqueue_row(
+            &store,
+            "note_links",
+            "id",
+            "nl1",
+            json!({ "from_note_id": "n1", "to_note_id": "n1" }),
+        );
+        let s = sink(Some("books"));
+        let res = block(flush(&store, &s, "user-1")).unwrap();
+
+        assert_eq!(
+            *s.calls.borrow(),
+            vec!["books".to_string()],
+            "only the book was dispatched; note and note_link were held transitively"
+        );
+        assert_eq!(
+            res.failed.len(),
+            3,
+            "book + note + note_link all stay queued"
+        );
+        assert!(res.ok.is_empty());
     }
 }
