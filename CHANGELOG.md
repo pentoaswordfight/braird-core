@@ -26,6 +26,11 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 - **ADR 0002:** recorded the `rusqlite` (bundled SQLite) dependency choice as a decision note — reversible/routine, folded into the existing core-impl ADR rather than a standalone one (SUR-723).
 
 ### Added
+- **ADR 0001 — async HTTP client (`docs/adr/0001-async-http-client.md`, SUR-724 / SUR-659b):**
+  records the reqwest + tokio `current_thread` + rustls decision behind the sync push layer — the
+  runtime is owned by the `SyncEngine` handle (`block_on` per flush, no background thread), and
+  rustls is chosen for iOS/Android TLS portability. Fills the ADR that 0003 (seal-at-write)
+  already cross-references.
 - **Native SQLite local store (`src/store.rs`, SUR-723 / Phase 2):** the on-device mirror of
   surfc's synced cloud schema for the iOS/Android clients — the 8 synced stores (`books`,
   `notes` incl. `content_tag`+`chapter`, `custom_ideas`, `note_links`, `lenses`, `collections`,

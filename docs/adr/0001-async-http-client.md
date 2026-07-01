@@ -22,7 +22,7 @@ reqwest was chosen as the HTTP client because it supports both rustls and select
 
 ## Decision
 
-Use **reqwest** (default-features = false, with rustls-tls and json features) as the HTTP client, driven by a **tokio `current_thread` runtime** constructed per flush call inside braird-core. TLS is handled exclusively by **rustls**; the OpenSSL backend is never compiled in.
+Use **reqwest** (default-features = false, with rustls-tls and json features) as the HTTP client, driven by a **tokio `current_thread` runtime** owned by the `SyncEngine` handle — built once in `SyncEngine::open` and reused by every `flush()` via `block_on`. TLS is handled exclusively by **rustls**; the OpenSSL backend is never compiled in.
 
 The host (or test driver) supplies the JWT access token by calling `set_access_token(jwt: String)` before invoking sync operations. braird-core does not perform authentication itself — it consumes a token it is handed.
 
@@ -31,6 +31,6 @@ The host (or test driver) supplies the JWT access token by calling `set_access_t
 ## Consequences
 
 - `flush_outbox()` blocks the calling thread for the duration of the network round-trips. Callers that need non-blocking behaviour must dispatch to a dedicated thread (e.g. `std::thread::spawn` on mobile, a thread-pool worker on desktop). This is intentional: it keeps scheduling decisions in the host, not the library.
-- Only one `current_thread` runtime is active per flush call; there is no persistent background runtime. This means no keep-alive connection pooling across flushes — acceptable given the expected flush cadence.
+- The `SyncEngine` owns one persistent `current_thread` runtime and one reqwest client, so keep-alive connection pooling persists across flushes. A `current_thread` runtime has no worker-thread pool — futures are driven only while `block_on` holds the calling thread, so there is still no background runtime thread.
 - rustls requires Rust 1.63+ and is subject to its own FIPS posture (not certified). If a future target requires a FIPS-validated TLS stack, this decision will need revisiting.
 - The `set_access_token` interface is the single token ingress point. Token refresh is the host's responsibility; braird-core will return a 401-equivalent error if the token is absent or expired, and the item remains in the outbox.
