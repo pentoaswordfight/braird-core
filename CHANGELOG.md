@@ -25,6 +25,14 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 - **GATING.md:** activated `sync-reviewer` (Phase 2) — added the sync-engine/local-store path row (`src/store.rs`, `src/sync/**`, `vendored/schema/**`, `scripts/extract-sync-schema.mjs`) and removed it from "Not yet in scope" (SUR-723).
 - **ADR 0002:** recorded the `rusqlite` (bundled SQLite) dependency choice as a decision note — reversible/routine, folded into the existing core-impl ADR rather than a standalone one (SUR-723).
 
+### Fixed
+- **Outbox collapse no longer resurrects a soft-deleted record (SUR-724).** `collapse()` tracked
+  `deleted` stickiness per-item, so a delete followed by a normal edit — which the enqueue paths
+  stamp with `deleted: false` — had its `deleted: true` overwritten by the field-merge and flushed
+  as un-deleted. Stickiness is now accumulated across the group (read from the accumulator before
+  the merge), so within a batch a delete wins and can't be resurrected. Two regression tests added.
+  The identical latent hole in surfc's PWA `collapseOutboxItems` is filed as SUR-731.
+
 ### Added
 - **Sync engine — outbox + push/flush + token handoff (`src/sync/**`, SUR-724 / SUR-659b):** the
   `SyncEngine` UniFFI handle enqueues writes, seals note text **at write** (enc:v2 ciphertext +

@@ -41,7 +41,8 @@ pub struct Collapsed {
 ///   1. sort by `created_at` (stable, so ties keep insertion order → real LWW);
 ///   2. group by `table:record_id` (record_id falls back to `payload["id"]`);
 ///   3. shallow-merge each item's payload over the accumulator (last field wins);
-///   4. `deleted` truthy is sticky — a delete absorbs all prior edits;
+///   4. `deleted` truthy is sticky — a delete absorbs all prior edits AND is not un-set by a
+///      later edit carrying `deleted: false` (accumulated across the group, not per-item);
 ///   5. for notes, repoint `book_id` transitively through `book_id_remap`.
 pub fn collapse(
     mut items: Vec<OutboxItem>,
@@ -75,12 +76,21 @@ pub fn collapse(
         group.ids.push(item.id);
 
         if let Value::Object(fields) = item.payload {
-            let deleted_now = truthy(fields.get("deleted"));
+            // Sticky delete is accumulated across the WHOLE group, not just this item. The
+            // enqueue paths stamp EVERY payload with `deleted` (false on a normal edit), so a
+            // delete followed by any later edit would otherwise have its `deleted:true`
+            // overwritten by the field-merge below and resurrect a soft-deleted row. Read the
+            // accumulator's prior `deleted` BEFORE the merge clobbers it, OR in this item's.
+            // (Deliberate hardening over JS `collapseOutboxItems`, whose per-item
+            // `if (item.payload?.deleted)` has the same latent hole — masked there only because a
+            // soft-deleted row leaves the surfc UI and can't be re-edited; the core has no such
+            // guarantee. Founder decision: within a batch, delete wins — never resurrect.)
+            let sticky_deleted =
+                truthy(group.payload.get("deleted")) || truthy(fields.get("deleted"));
             for (k, v) in fields {
                 group.payload.insert(k, v);
             }
-            // deleted:1 is sticky — re-assert it even if a later field-merge didn't carry it.
-            if deleted_now {
+            if sticky_deleted {
                 group.payload.insert("deleted".into(), Value::Bool(true));
             }
         }
@@ -197,6 +207,48 @@ mod tests {
                 200,
                 json!({ "id": "n1", "text": "resurrected?" }),
             ),
+        ];
+        let out = collapse(items, &BTreeMap::new());
+        assert_eq!(out[0].payload["deleted"], json!(true));
+    }
+
+    #[test]
+    fn delete_stays_sticky_when_later_edit_carries_deleted_false() {
+        // The real enqueue shape: EVERY payload stamps `deleted` (false on a normal edit). A
+        // delete followed by a normal edit must NOT resurrect — this is the regression the
+        // per-item sticky check missed (it only re-asserted when THIS item was a delete).
+        let items = vec![
+            item(
+                1,
+                "notes",
+                "n1",
+                100,
+                json!({ "id": "n1", "text": "enc:v2:a", "deleted": true }),
+            ),
+            item(
+                2,
+                "notes",
+                "n1",
+                200,
+                json!({ "id": "n1", "text": "enc:v2:b", "page": "7", "deleted": false }),
+            ),
+        ];
+        let out = collapse(items, &BTreeMap::new());
+        assert_eq!(out.len(), 1);
+        // Later fields still win (LWW), but the delete is not un-set.
+        assert_eq!(out[0].payload["text"], json!("enc:v2:b"));
+        assert_eq!(out[0].payload["page"], json!("7"));
+        assert_eq!(out[0].payload["deleted"], json!(true));
+    }
+
+    #[test]
+    fn interleaved_edits_around_a_delete_stay_deleted() {
+        // edit(false) → delete(true) → edit(false): reading the accumulator before each merge
+        // keeps it sticky through the trailing live edit.
+        let items = vec![
+            item(1, "notes", "n1", 100, json!({ "id": "n1", "deleted": false })),
+            item(2, "notes", "n1", 200, json!({ "id": "n1", "deleted": true })),
+            item(3, "notes", "n1", 300, json!({ "id": "n1", "deleted": false })),
         ];
         let out = collapse(items, &BTreeMap::new());
         assert_eq!(out[0].payload["deleted"], json!(true));
