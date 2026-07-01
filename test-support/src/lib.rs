@@ -78,11 +78,20 @@ pub fn mint_test_user_jwt(env: &SupabaseEnv) -> TestUser {
         .expect("admin create user body");
     let user_id = create["id"].as_str().expect("created user id").to_string();
 
-    // Sign in with password → a real access token.
+    // Sign in with password → a real access token. surfc's config.toml enables Turnstile
+    // captcha (`[auth.captcha]`), so the sign-in MUST carry a captcha token — the admin-create
+    // above bypasses captcha, which is why only this call needs it. The sync-integration CI
+    // sets Cloudflare's "always passes" test secret (`1x0000…AA`), against which GoTrue's
+    // siteverify accepts the matching dummy token below. `gotrue_meta_security.captcha_token`
+    // is the field supabase-js's `options.captchaToken` maps to.
     let token: Value = http
         .post(format!("{}/auth/v1/token?grant_type=password", env.url))
         .header("apikey", &env.anon_key)
-        .json(&json!({ "email": email, "password": password }))
+        .json(&json!({
+            "email": email,
+            "password": password,
+            "gotrue_meta_security": { "captcha_token": "XXXX.DUMMY.TOKEN.XXXX" }
+        }))
         .send()
         .expect("password grant")
         .error_for_status()
