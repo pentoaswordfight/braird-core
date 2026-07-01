@@ -131,6 +131,13 @@ async fn pull_table<S: PostgrestSink>(
         // `if (!local || cloud.updated_at > local.updatedAt)`. (Distinct from the INCLUSIVE `>=`
         // fetch filter: fetch inclusive so no same-ms row is missed; merge strict so a tie doesn't
         // clobber local.)
+        //
+        // WHOLE-ROW LWW, including array/composite columns (SUR-737, ratified): the winner's
+        // `tags` / `source_meta` / `leaf_ids` replace the local ones wholesale — there is NO
+        // element-level union (a union can't express a delete). This is table-agnostic, so it holds
+        // for every table the SUR-726 fan-out adds; the convergence contract + rationale live on
+        // `store::synced_schema`, and any change here is wire-visible (must move in lockstep with the
+        // PWA's `mergeCloudRecords`). Ratification pin tests: `sur737_*` below.
         let should_apply = match local_updated {
             None => true,
             Some(local_ts) => incoming_updated > local_ts,
@@ -538,6 +545,123 @@ mod tests {
         assert_eq!(
             store.get_row("notes", "n1").unwrap().unwrap()["text"],
             json!("remote")
+        );
+    }
+
+    // ── SUR-737 array / row convergence ratification ──────────────────────────
+    // pull_table is table-agnostic, so these pin the whole-row-LWW convergence of the composite
+    // and row-per-pair tables AHEAD of the SUR-726 fan-out. If a future change tries element-level
+    // merge (a `tags` union, a `leaf_ids` union), these fail — the convergence contract on
+    // `store::synced_schema` is the decision they enforce.
+
+    #[test]
+    fn sur737_tags_converge_whole_array_not_union() {
+        // A tag set is whole-row LWW: the newer note's `tags` REPLACE the local ones, never union
+        // (a union couldn't express a tag deletion). Both directions.
+        let store = Store::open_in_memory().unwrap();
+
+        // Local newer → an older remote loses; the local array is kept intact.
+        apply_local(
+            &store,
+            "notes",
+            json!({ "id": "n1", "tags": ["a", "b"], "updated_at": 2000, "deleted": false }),
+        );
+        let sink = MapSink::new().with(
+            "notes",
+            vec![json!({ "id": "n1", "tags": ["c"], "updated_at": 1000, "deleted": false })],
+        );
+        block(pull(&store, &sink, &["notes"], 9000)).unwrap();
+        assert_eq!(
+            store.get_row("notes", "n1").unwrap().unwrap()["tags"],
+            json!(["a", "b"]),
+            "older remote loses LWW; the local tag array is untouched"
+        );
+
+        // Remote newer → replaces the whole array; NOT the union ["a","b","c"].
+        let sink = MapSink::new().with(
+            "notes",
+            vec![json!({ "id": "n1", "tags": ["c"], "updated_at": 3000, "deleted": false })],
+        );
+        block(pull(&store, &sink, &["notes"], 9001)).unwrap();
+        assert_eq!(
+            store.get_row("notes", "n1").unwrap().unwrap()["tags"],
+            json!(["c"]),
+            "newer remote replaces the whole tag array (no element union)"
+        );
+    }
+
+    #[test]
+    fn sur737_lens_leaf_ids_converge_whole_array_not_union() {
+        // A lens is ONE authored query — its leaf_ids move whole-row LWW with the combinator +
+        // threshold. Unioning leaves would fabricate a query nobody wrote.
+        let store = Store::open_in_memory().unwrap();
+        apply_local(
+            &store,
+            "lenses",
+            json!({ "id": "l1", "name": "L", "leaf_ids": ["a", "b"], "combinator": "and", "threshold": 1, "updated_at": 1000, "deleted": false }),
+        );
+        let sink = MapSink::new().with(
+            "lenses",
+            vec![json!({ "id": "l1", "name": "L", "leaf_ids": ["c"], "combinator": "or", "threshold": 2, "updated_at": 2000, "deleted": false })],
+        );
+        block(pull(&store, &sink, &["lenses"], 9000)).unwrap();
+        let row = store.get_row("lenses", "l1").unwrap().unwrap();
+        assert_eq!(
+            row["leaf_ids"],
+            json!(["c"]),
+            "newer lens replaces leaf_ids wholesale (no union)"
+        );
+        assert_eq!(
+            row["combinator"],
+            json!("or"),
+            "the rest of the authored query moves with it"
+        );
+    }
+
+    #[test]
+    fn sur737_collection_membership_concurrent_adds_converge_then_tombstone() {
+        // Memberships are row-per-pair with a DETERMINISTIC pk (membershipId(collection, note)), so
+        // two devices adding the same pair share the same id → one row (OR-set add); a remove is a
+        // tombstone on that row. (The shared pk + INSERT OR REPLACE is what collapses concurrent
+        // adds — no duplicate row can exist.)
+        let store = Store::open_in_memory().unwrap();
+        let mid = "col1:note1"; // deterministic membershipId(collection, note)
+
+        apply_local(
+            &store,
+            "collection_memberships",
+            json!({ "id": mid, "collection_id": "col1", "note_id": "note1", "updated_at": 1000, "deleted": false }),
+        );
+        // Remote add of the SAME pair (same id) — merges onto the one row, not a second row.
+        let sink = MapSink::new().with(
+            "collection_memberships",
+            vec![json!({ "id": mid, "collection_id": "col1", "note_id": "note1", "updated_at": 2000, "deleted": false })],
+        );
+        block(pull(&store, &sink, &["collection_memberships"], 9000)).unwrap();
+        let row = store
+            .get_row("collection_memberships", mid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row["updated_at"],
+            json!(2000_i64),
+            "the newer add won the one row"
+        );
+        assert_eq!(row["deleted"], json!(false), "still a live membership");
+
+        // A newer remove tombstones that row (OR-set remove).
+        let sink = MapSink::new().with(
+            "collection_memberships",
+            vec![json!({ "id": mid, "collection_id": "col1", "note_id": "note1", "updated_at": 3000, "deleted": true })],
+        );
+        block(pull(&store, &sink, &["collection_memberships"], 9001)).unwrap();
+        assert_eq!(
+            store
+                .get_row("collection_memberships", mid)
+                .unwrap()
+                .unwrap()["deleted"],
+            json!(true),
+            "a newer remove tombstones the membership"
         );
     }
 }

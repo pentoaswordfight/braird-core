@@ -138,6 +138,27 @@ fn sql_to_json(sv: SqlValue, ty: ColType) -> Value {
 /// The 8 synced stores (parent SUR-659 §1), mirroring the vendored fixture exactly.
 /// Every row carries `updated_at` (epoch bigint) + a `deleted` soft-delete flag.
 /// `tests/schema_parity.rs` fails if this descriptor and the fixture diverge.
+///
+/// **Convergence contract (SUR-737, ratified).** Every table converges **whole-row last-write-wins
+/// by `updated_at`** — a pull applies the newer row's columns wholesale (see `pull_table`), mirroring
+/// the oracle's `mergeCloudRecords`. Pinned here, ahead of the SUR-726 fan-out, so the composite-column
+/// semantics are a decision and not an accident:
+///
+/// | Table | Composite col(s) | Convergence | Why |
+/// |---|---|---|---|
+/// | `books` | — | whole-row LWW | scalar metadata; a null is authoritative (a cover-clear must converge) |
+/// | `notes` | `tags`, `source_meta` | whole-row LWW | a tag edit IS a note edit; array *union* can't express a delete — an OR-set would be a wire change (future ticket only if product demands) |
+/// | `custom_ideas` | — | whole-row LWW | scalar metadata |
+/// | `note_links` | — (row-per-edge) | row-level LWW → set | add = insert a row, remove = tombstone it |
+/// | `lenses` | `leaf_ids` | whole-row LWW | a lens is ONE authored query; unioning leaves under one combinator/threshold fabricates a query nobody wrote |
+/// | `collections` | — | whole-row LWW | scalar metadata |
+/// | `collection_memberships` | — (row-per-pair, deterministic `membershipId(collection, note)`) | row-level LWW → OR-set | concurrent adds of the same pair share a pk → converge to ONE row |
+/// | `note_signals` | counters | whole-row LWW → **lossy, accepted** | concurrent increments lose one side; derived data, self-heals on the next signal |
+///
+/// The composite columns (`tags`, `source_meta`, `leaf_ids`) are stored + compared as opaque JSON
+/// TEXT (`ColType::Json`); **no element-level merge happens or is intended.** Any change to that (e.g.
+/// an OR-set for `tags`) is **wire-visible** and must land in the PWA (`mergeCloudRecords`) and here
+/// in lockstep. Ratification pin tests live in `pull.rs` (`sur737_*`).
 pub fn synced_schema() -> &'static [TableSchema] {
     &[
         TableSchema {
@@ -164,7 +185,7 @@ pub fn synced_schema() -> &'static [TableSchema] {
                 ("book_id", Text),
                 ("text", Text), // ciphertext (enc:v1/enc:v2) for encrypted users
                 ("page", Text),
-                ("tags", Json),
+                ("tags", Json), // SUR-737: whole-row LWW; array union can't express a tag delete
                 ("image_path", Text),
                 ("ink_crop_path", Text),
                 ("source", Text),
@@ -208,7 +229,7 @@ pub fn synced_schema() -> &'static [TableSchema] {
             columns: &[
                 ("id", Text),
                 ("name", Text),
-                ("leaf_ids", Json), // cloud text[]
+                ("leaf_ids", Json), // cloud text[]; SUR-737 whole-row LWW (one authored query — no leaf union)
                 ("combinator", Text),
                 ("threshold", Int), // cloud smallint
                 ("created_at", Int),
@@ -244,6 +265,8 @@ pub fn synced_schema() -> &'static [TableSchema] {
             pk: &["note_id"],
             columns: &[
                 ("note_id", Text),
+                // SUR-737: these counters converge whole-row LWW — concurrent increments on two
+                // devices lose one side. Accepted: signals are derived, and self-heal on the next.
                 ("source_prior", Real),
                 ("return_visits", Int),
                 ("has_annotation", Bool),
