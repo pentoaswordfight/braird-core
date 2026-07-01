@@ -246,9 +246,27 @@ mod tests {
         // edit(false) → delete(true) → edit(false): reading the accumulator before each merge
         // keeps it sticky through the trailing live edit.
         let items = vec![
-            item(1, "notes", "n1", 100, json!({ "id": "n1", "deleted": false })),
-            item(2, "notes", "n1", 200, json!({ "id": "n1", "deleted": true })),
-            item(3, "notes", "n1", 300, json!({ "id": "n1", "deleted": false })),
+            item(
+                1,
+                "notes",
+                "n1",
+                100,
+                json!({ "id": "n1", "deleted": false }),
+            ),
+            item(
+                2,
+                "notes",
+                "n1",
+                200,
+                json!({ "id": "n1", "deleted": true }),
+            ),
+            item(
+                3,
+                "notes",
+                "n1",
+                300,
+                json!({ "id": "n1", "deleted": false }),
+            ),
         ];
         let out = collapse(items, &BTreeMap::new());
         assert_eq!(out[0].payload["deleted"], json!(true));
