@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 use braird_core::store::Store;
 use braird_core::sync::http::PostgrestSink;
-use braird_core::sync::{pull, push};
+use braird_core::sync::{pull, pull_then_flush, push};
 use serde_json::{json, Value};
 
 fn block<F: std::future::Future>(f: F) -> F::Output {
@@ -28,10 +28,12 @@ enum Op {
 }
 
 /// A PostgREST stand-in that records every call in order and serves canned remote rows. No network;
-/// `upsert` always succeeds. Lets us assert BOTH the call order (fetch-before-upsert) and that a
-/// rebased-away edit is never re-dispatched.
+/// `upsert` always succeeds. `failing(table)` makes that table's `fetch_since` error (the partial-
+/// pull-failure case). Lets us assert call order, that a rebased-away edit is never re-dispatched,
+/// and that a failed table's stale edit is never flushed.
 struct RecordingSink {
     remote: HashMap<String, Vec<Value>>,
+    fail_fetch: Option<String>,
     log: RefCell<Vec<Op>>,
 }
 
@@ -39,8 +41,13 @@ impl RecordingSink {
     fn new(remote: HashMap<String, Vec<Value>>) -> Self {
         Self {
             remote,
+            fail_fetch: None,
             log: RefCell::new(Vec::new()),
         }
+    }
+    fn failing(mut self, table: &str) -> Self {
+        self.fail_fetch = Some(table.to_string());
+        self
     }
     fn upserted(&self, table: &str) -> bool {
         self.log
@@ -57,6 +64,9 @@ impl PostgrestSink for RecordingSink {
     }
     async fn fetch_since(&self, table: &str, _cursor: i64) -> Result<Vec<Value>, String> {
         self.log.borrow_mut().push(Op::Fetch(table.to_string()));
+        if self.fail_fetch.as_deref() == Some(table) {
+            return Err(format!("{table} fetch failed"));
+        }
         Ok(self.remote.get(table).cloned().unwrap_or_default())
     }
 }
@@ -95,8 +105,9 @@ fn pull_then_flush_does_not_re_push_a_rebased_edit() {
     let pulled = block(pull::pull(&store, &sink, &["notes"], 9000)).unwrap();
     assert_eq!(pulled.merged, 1);
     assert_eq!(
-        pulled.conflicts, 1,
-        "the stale local edit is surfaced as a conflict"
+        pulled.superseded.len(),
+        1,
+        "the stale local edit is surfaced as superseded"
     );
     assert!(
         store.outbox_items().unwrap().is_empty(),
@@ -144,7 +155,7 @@ fn a_genuinely_newer_local_edit_still_flushes_after_pull() {
 
     let pulled = block(pull::pull(&store, &sink, &["books"], 9000)).unwrap();
     assert_eq!(pulled.merged, 0, "the older server row loses LWW");
-    assert_eq!(pulled.conflicts, 0);
+    assert!(pulled.superseded.is_empty());
     assert_eq!(
         store.outbox_items().unwrap().len(),
         1,
@@ -168,4 +179,77 @@ fn a_genuinely_newer_local_edit_still_flushes_after_pull() {
         fetch_pos < upsert_pos,
         "pull's fetch precedes flush's upsert (the sync() order): {log:?}"
     );
+}
+
+#[test]
+fn partial_pull_failure_aborts_the_flush() {
+    // SUR-736 (founder finding): `books` pulls fine but `notes` fetch fails, so the notes outbox
+    // never rebased. `sync()` (via pull_then_flush) MUST NOT flush here — flushing would re-push the
+    // stale notes edit over the (unseen) newer server row, reopening the lost-edit case sync closes.
+    let store = Store::open_in_memory().unwrap();
+    // A stale queued notes edit that a *successful* notes pull would have rebased away.
+    store
+        .stage_local_write(
+            "notes",
+            "n1",
+            json!({ "id": "n1", "text": "enc:v2:local-T1", "updated_at": 1000, "deleted": false })
+                .as_object()
+                .unwrap()
+                .clone(),
+            1000,
+        )
+        .unwrap();
+    let sink = RecordingSink::new(one("books", vec![])).failing("notes");
+
+    let outcome = block(pull_then_flush(
+        &store,
+        &sink,
+        "user-1",
+        &["books", "notes"],
+        9000,
+    ));
+
+    assert!(outcome.is_err(), "a failed table must abort the flush");
+    assert!(
+        !sink.upserted("notes"),
+        "the un-rebased stale notes edit must NOT be flushed (SUR-736)"
+    );
+    assert!(
+        !sink.upserted("books"),
+        "no table is flushed when the pull wasn't fully clean"
+    );
+    assert_eq!(
+        store.outbox_items().unwrap().len(),
+        1,
+        "the stale edit stays queued for a later clean sync"
+    );
+}
+
+#[test]
+fn pull_then_flush_pulls_then_flushes_on_a_clean_pull() {
+    // Happy path: a clean pull → the queued local edit flushes, fetch precedes upsert.
+    let store = Store::open_in_memory().unwrap();
+    store
+        .stage_local_write(
+            "books",
+            "b1",
+            json!({ "id": "b1", "title": "local", "updated_at": 5000, "deleted": false })
+                .as_object()
+                .unwrap()
+                .clone(),
+            5000,
+        )
+        .unwrap();
+    let sink = RecordingSink::new(one("books", vec![]));
+
+    let (pulled, flushed) =
+        block(pull_then_flush(&store, &sink, "user-1", &["books"], 9000)).expect("clean sync");
+
+    assert!(pulled.failed_tables.is_empty());
+    assert_eq!(flushed.ok.len(), 1, "the local edit flushed");
+    assert!(sink.upserted("books"));
+    let log = sink.log.borrow();
+    let fetch_pos = log.iter().position(|o| matches!(o, Op::Fetch(_)));
+    let upsert_pos = log.iter().position(|o| matches!(o, Op::Upsert(_)));
+    assert!(fetch_pos < upsert_pos, "pull before flush: {log:?}");
 }

@@ -46,17 +46,25 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   `docs/adr/0004-async-http-client.md` so the architecture chain resolves to the right document.
 
 ### Added
-- **One-call `sync()` + LWW conflict signal (`src/sync/mod.rs`, `src/sync/pull.rs`, `src/store.rs`,
-  SUR-736 / SUR-738):** a new `SyncEngine.sync()` UniFFI method runs `pull()` THEN `flush()` — a
-  deliberate divergence from the oracle's flush-first (with the outbox rebase, pulling first rebases a
-  stale edit away so the flush pushes nothing stale; flush-first would re-push it). Hard pull failure
-  aborts before flush; a partial pull failure proceeds. `PullSummary` gains `conflicts` + `conflicted:
-  Vec<ConflictedRecord>` (`table` + `record_id` + discarded/winning `updated_at` — ids + timestamps
-  only, never payload contents) so a host can tell the user an offline edit was superseded by a newer
-  remote row. New FFI records `ConflictedRecord` + `SyncSummary`. **Ciphertext-at-rest unchanged** —
-  the rebase touches only already-sealed outbox rows; nothing is decrypted or logged. New offline
-  integration test (`tests/sync_736_integration.rs`, recording sink) proves the re-push window is
-  closed and a genuinely-newer local edit still flushes. **Native-only** (gated off wasm32).
+- **One-call `sync()` + superseded-edit signal (`src/sync/mod.rs`, `src/sync/pull.rs`, `src/store.rs`,
+  SUR-736 / SUR-738):** a new `SyncEngine.sync()` UniFFI method pulls THEN flushes — a deliberate
+  divergence from the oracle's flush-first (with the outbox rebase, pulling first rebases a stale edit
+  away so the flush pushes nothing stale; flush-first would re-push it). **The flush is aborted unless
+  the pull was fully clean** — if any table's pull fails (partial OR total), `sync()` errors and does
+  NOT flush, so a table that never rebased can't re-push a stale edit over a newer server row (the
+  partial-failure hole). `PullSummary` gains `superseded: Vec<SupersededEdit>` (`table` + `record_id` +
+  discarded/winning `updated_at` — ids + timestamps only, never payload contents) so a host can tell
+  the user an offline edit lost last-write-wins to a newer remote row. New FFI records `SupersededEdit`
+  + `SyncSummary`. **Ciphertext-at-rest unchanged** — the rebase touches only already-sealed outbox
+  rows; nothing is decrypted or logged. New offline integration test (`tests/sync_736_integration.rs`,
+  recording sink) proves the re-push window is closed, a genuinely-newer local edit still flushes, and
+  a partial pull failure aborts the flush. **Native-only** (gated off wasm32).
+- **Regenerated Swift + Kotlin bindings (`bindings/swift/**`, `bindings/kotlin/**`, SUR-736):** the
+  committed UniFFI bindings now reflect the full FFI surface. They had only ever carried `Vault` — the
+  `SyncEngine` handle (SUR-724) + `pull()`/`PullSummary` (SUR-725) had never been regenerated into the
+  committed API, so native clients couldn't call sync at all. Regenerated from the compiled library via
+  `cargo run --bin uniffi-bindgen` (swiftformat/ktlint unavailable on the dev box → raw uniffi output;
+  the macOS/Kotlin CI legs are the compile + round-trip validation, opted in via `touches-ffi`).
 - **Incremental pull + tombstones + first coexistence (`src/sync/pull.rs`, `src/store.rs`,
   `src/sync/http.rs`, SUR-725 / SUR-659c):** the `SyncEngine.pull()` UniFFI method mirrors surfc's
   `fetchSince` + `mergeCloudRecords` on `books` + `notes` — per table it GETs rows with

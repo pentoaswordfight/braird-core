@@ -21,7 +21,7 @@
 //! a record that still has a queued local edit, that stale outbox entry is dropped in the SAME
 //! transaction as the apply (via [`Store::apply_row_rebasing_outbox`]) — otherwise the next flush
 //! would re-push the losing edit over the newer server row (a lost remote edit). Each record with a
-//! dropped entry is reported as a [`ConflictedRecord`] (the local edit was silently overwritten;
+//! dropped entry is reported as a [`SupersededEdit`] (the local edit lost LWW and was dropped;
 //! full server-side conflict detection is out of scope — SUR-738 ratifies the client-side signal).
 //!
 //! Source of truth: surfc `src/supabase.js` (`fetchSince`) + `src/db.js` (`mergeCloudRecords`).
@@ -29,7 +29,7 @@
 use serde_json::Value;
 
 use super::http::PostgrestSink;
-use super::ConflictedRecord;
+use super::SupersededEdit;
 use crate::store::{table_schema, Store};
 
 /// Counts across a whole pull (one or more tables). `failed_tables` are the tables whose fetch or
@@ -40,10 +40,8 @@ pub struct PullResult {
     pub pulled: usize,
     pub merged: usize,
     pub skipped_tombstones: usize,
-    /// Records whose queued local edit was dropped because a strictly-newer remote row won LWW
-    /// (SUR-736/738). `conflicts == conflicted.len()`.
-    pub conflicts: usize,
-    pub conflicted: Vec<ConflictedRecord>,
+    /// Local edits dropped because a strictly-newer remote row won LWW (SUR-736/738).
+    pub superseded: Vec<SupersededEdit>,
     pub failed_tables: Vec<String>,
 }
 
@@ -52,8 +50,7 @@ struct TableStats {
     pulled: usize,
     merged: usize,
     skipped_tombstones: usize,
-    conflicts: usize,
-    conflicted: Vec<ConflictedRecord>,
+    superseded: Vec<SupersededEdit>,
 }
 
 /// Pull `tables` incrementally. `now_ms` is the watermark each succeeding table's cursor advances
@@ -74,8 +71,7 @@ pub async fn pull<S: PostgrestSink>(
                 result.pulled += stats.pulled;
                 result.merged += stats.merged;
                 result.skipped_tombstones += stats.skipped_tombstones;
-                result.conflicts += stats.conflicts;
-                result.conflicted.extend(stats.conflicted);
+                result.superseded.extend(stats.superseded);
             }
             Err(e) => {
                 // ponytail: log the dropped table — a silent failure would read as "nothing to
@@ -146,11 +142,10 @@ async fn pull_table<S: PostgrestSink>(
                 .apply_row_rebasing_outbox(table, obj, incoming_updated)
                 .map_err(|e| format!("apply {table}/{id}: {e}"))?;
             stats.merged += 1;
-            // A dropped entry = a local edit silently overwritten by the remote winner (SUR-738).
-            // Key the conflict by the newest discarded stamp.
+            // A dropped entry = a local edit superseded by the remote winner (SUR-738). Key it by
+            // the newest discarded stamp.
             if let Some(discarded) = dropped.iter().map(|(_, ts)| *ts).max() {
-                stats.conflicts += 1;
-                stats.conflicted.push(ConflictedRecord {
+                stats.superseded.push(SupersededEdit {
                     table: table.to_string(),
                     record_id: id.to_string(),
                     discarded_updated_at: discarded,
@@ -173,7 +168,7 @@ async fn pull_table<S: PostgrestSink>(
 mod tests {
     use super::*;
     use crate::store::Store;
-    use crate::sync::ConflictedRecord;
+    use crate::sync::SupersededEdit;
     use serde_json::json;
     use std::collections::HashMap;
 
@@ -393,10 +388,9 @@ mod tests {
         let res = block(pull(&store, &sink, &["notes"], 9000)).unwrap();
 
         assert_eq!(res.merged, 1);
-        assert_eq!(res.conflicts, 1);
         assert_eq!(
-            res.conflicted,
-            vec![ConflictedRecord {
+            res.superseded,
+            vec![SupersededEdit {
                 table: "notes".into(),
                 record_id: "n1".into(),
                 discarded_updated_at: 1000,
@@ -424,7 +418,7 @@ mod tests {
         let res = block(pull(&store, &sink, &["notes"], 9000)).unwrap();
 
         assert_eq!(res.merged, 0);
-        assert_eq!(res.conflicts, 0);
+        assert!(res.superseded.is_empty());
         assert_eq!(
             store.outbox_items().unwrap().len(),
             1,
@@ -447,7 +441,7 @@ mod tests {
         let res = block(pull(&store, &sink, &["notes"], 9000)).unwrap();
 
         assert_eq!(res.merged, 0);
-        assert_eq!(res.conflicts, 0);
+        assert!(res.superseded.is_empty());
         assert_eq!(store.outbox_items().unwrap().len(), 1);
     }
 
@@ -462,7 +456,7 @@ mod tests {
         let res = block(pull(&store, &sink, &["notes"], 9000)).unwrap();
 
         assert_eq!(res.merged, 1);
-        assert_eq!(res.conflicts, 1);
+        assert_eq!(res.superseded.len(), 1);
         assert_eq!(
             store.get_row("notes", "n1").unwrap().unwrap()["deleted"],
             json!(true)
@@ -487,7 +481,7 @@ mod tests {
         let res = block(pull(&store, &sink, &["notes"], 9000)).unwrap();
 
         assert_eq!(res.merged, 1);
-        assert_eq!(res.conflicts, 1);
+        assert_eq!(res.superseded.len(), 1);
         let row = store.get_row("notes", "n1").unwrap().unwrap();
         assert_eq!(
             row["deleted"],
@@ -513,7 +507,7 @@ mod tests {
         let res = block(pull(&store, &sink, &["notes"], 9000)).unwrap();
 
         assert_eq!(res.merged, 0, "incoming T2 < local T3 → no apply");
-        assert_eq!(res.conflicts, 0);
+        assert!(res.superseded.is_empty());
         assert_eq!(
             store.outbox_items().unwrap().len(),
             2,
@@ -532,9 +526,9 @@ mod tests {
         let res = block(pull(&store, &sink, &["notes"], 9000)).unwrap();
 
         assert_eq!(res.merged, 1);
-        assert_eq!(
-            res.conflicts, 0,
-            "an unparseable entry can't be proven stale → not surfaced as a conflict"
+        assert!(
+            res.superseded.is_empty(),
+            "an unparseable entry can't be proven stale → not surfaced"
         );
         assert_eq!(
             store.outbox_items().unwrap().len(),
