@@ -1,9 +1,9 @@
 # ADR 0003 — Sync engine: seal-at-write + books-first flush
 
-- **Status:** Accepted (founder-decided at the SUR-724 / SUR-659b Phase-2 gates)
+- **Status:** Accepted (founder-decided at the SUR-724 / SUR-659b Phase-2 gates). **Pressure-tested** at the SUR-724 Gate-1 (2026-07-01) — 7 failure modes + 4 alternatives on the record (the GCE-line pressure-test station), reviewed before this ADR was accepted.
 - **Date:** 2026-07-01
-- **Context tickets:** SUR-724 (659b impl), parent SUR-659, implements ADR 0001 (Rust+UniFFI)
-- **Supersedes / superseded by:** none. Extends ADR 0002 (the `rusqlite`/native-only addendum).
+- **Context tickets:** SUR-724 (659b impl), parent SUR-659, implements ADR 0001 (Rust+UniFFI, surfc#331)
+- **Supersedes / superseded by:** none. Extends ADR 0002 (RustCrypto crypto backend; §Addendum SUR-723 — rusqlite/native-only).
 
 ## Context
 
@@ -12,6 +12,21 @@ Phase 2 adds the on-device write path: an **outbox** the host enqueues writes in
 (`collapseOutboxItems` + `flushOutbox`), and that JS is the source of truth — the native core
 must mirror its semantics so PWA↔native coexistence round-trips. Two edges force real decisions:
 **where note text gets sealed**, and **how offline book-merges are resolved at flush**.
+
+## Options considered
+
+Per decision, the rejected alternative and why. The two highest-lock-in choices — **#1** (the
+crypto boundary) and **#5** (the FFI ABI) — are the ones worth stress-testing; #2–#4 mirror the JS
+source of truth, so "diverge from `supabase.js`" is the standing alternative, rejected by the
+PWA↔native coexistence requirement.
+
+| Decision | Chosen | Rejected alternative | Why rejected |
+|---|---|---|---|
+| **1. Seal boundary** | Seal at **write** (ciphertext in the outbox) | Seal at **flush** (plaintext in the outbox, encrypt on the way out) | Plaintext-at-rest in the local queue, even transiently, weakens E2EE; a crash / dump / debugger between enqueue and flush would expose it. Field-merge on `text` is not needed — text is one field, so the latest sealed blob wins. |
+| **2. `updated_at`** | Client sends epoch **ms** | Omit it, let a server trigger stamp it | No trigger exists on the synced tables (verified in the migrations); the default is `0`, so an omitted value loses every LWW race. |
+| **3. `bookIdRemap`** | Persist in `meta` | Hold in memory per flush (as the JS param does) | A crash between the book flush and a later note flush strands child notes on a dead temp id — an unrecoverable orphan without a pull. |
+| **4. Flush order** | Books-first, **explicit** failed-parent guard | Rely on group-iteration order | Iteration order is incidental; an explicit `failed_books` set makes the FK-safety invariant legible and test-pinnable. |
+| **5. FFI shape** | **Sync** FFI, `block_on` a current-thread tokio runtime inside | **Async** UniFFI export | Async FFI is a breaking UniFFI ABI change requiring coordinated iOS + Android host updates; the Vault surface is already sync, and one-flush-at-a-time needs no worker pool. |
 
 ## Decisions
 
@@ -76,3 +91,14 @@ array. `user_id` is the JWT `sub`, injected per row at flush, never stored (mirr
   flush, no new orchestration.
 - rustls (no OpenSSL/C) keeps the same reproducible-build / narrow-supply-chain principle ADR 0002
   chose for the crypto backend.
+
+### Reversibility
+
+- **Decision 1 (seal-at-write) is effectively irreversible** without a migration that re-seals or
+  re-derives existing outbox entries, and it permanently constrains debugging — no plaintext note
+  text exists in any log / dump / queue path, by construction. That is the point, but it is a
+  one-way door.
+- **Decision 5 (sync FFI)** is reversible only as a **breaking UniFFI ABI change**: switching to
+  async export forces coordinated iOS + Android host updates. Low likelihood (sync suffices), but
+  flagged as the other high-lock-in choice.
+- Decisions 2–4 are internal and cheaply reversible (a code change, no ABI / schema break).

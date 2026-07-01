@@ -206,3 +206,55 @@ fn epoch_ms() -> i64 {
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value;
+
+    #[test]
+    fn enqueue_note_stores_ciphertext_not_plaintext() {
+        // Seal-at-write fast-gate guard (SUR-724 Gate-2): a plaintext-storage regression must
+        // fail `cargo test`, not slip past to the #[ignore]d Docker integration test. This is
+        // the structural E2EE invariant — plaintext note text must never reach the outbox.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = SyncEngine::open(
+            db_path.into(),
+            "https://x.supabase.co".into(),
+            "anon".into(),
+            Vault::generate(),
+        )
+        .unwrap();
+        engine
+            .enqueue_note(
+                "n1".into(),
+                None,
+                "the secret plaintext".into(),
+                None,
+                vec![],
+                0,
+                false,
+            )
+            .unwrap();
+
+        // Read the outbox back through a fresh Store on the same file.
+        let rows = Store::open(db_path).unwrap().outbox_items().unwrap();
+        assert_eq!(rows.len(), 1);
+        let payload: Value = serde_json::from_str(&rows[0].3).unwrap();
+        let text = payload["text"].as_str().unwrap();
+        assert!(
+            text.starts_with("enc:v2:"),
+            "note text must be enc:v2 ciphertext, got {text}"
+        );
+        assert!(
+            !text.contains("the secret plaintext"),
+            "plaintext must never reach the outbox"
+        );
+        assert!(
+            payload["content_tag"].as_str().is_some_and(|t| !t.is_empty()),
+            "content_tag must be present (computed pre-seal, from plaintext)"
+        );
+    }
+}
