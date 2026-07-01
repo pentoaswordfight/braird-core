@@ -664,4 +664,34 @@ mod tests {
             "a newer remove tombstones the membership"
         );
     }
+
+    #[test]
+    fn sur737_exact_ms_tie_keeps_local_so_replicas_can_diverge() {
+        // Accepted residual (plan §8): the compare is strict `>`, so an exact-ms tie keeps local.
+        // Two devices that wrote DIFFERENT values at the SAME updated_at do NOT converge — each keeps
+        // its own after pulling the other. Pinned so a future tie-break becomes a deliberate,
+        // wire-visible decision (PWA+core lockstep), not an accident. The convergence contract on
+        // `store::synced_schema` carries this caveat.
+        let dev_a = Store::open_in_memory().unwrap();
+        let dev_b = Store::open_in_memory().unwrap();
+        apply_local(&dev_a, "notes", note("n1", 5000, false, "value-A"));
+        apply_local(&dev_b, "notes", note("n1", 5000, false, "value-B"));
+
+        // A pulls B's row (same ts) → keeps A; B pulls A's row (same ts) → keeps B.
+        let a_sees_b = MapSink::new().with("notes", vec![note("n1", 5000, false, "value-B")]);
+        let b_sees_a = MapSink::new().with("notes", vec![note("n1", 5000, false, "value-A")]);
+        block(pull(&dev_a, &a_sees_b, &["notes"], 9000)).unwrap();
+        block(pull(&dev_b, &b_sees_a, &["notes"], 9000)).unwrap();
+
+        assert_eq!(
+            dev_a.get_row("notes", "n1").unwrap().unwrap()["text"],
+            json!("value-A"),
+            "device A keeps its own value on the tie"
+        );
+        assert_eq!(
+            dev_b.get_row("notes", "n1").unwrap().unwrap()["text"],
+            json!("value-B"),
+            "device B keeps its own — ms-identical concurrent edit did NOT reconcile (accepted)"
+        );
+    }
 }

@@ -139,10 +139,10 @@ fn sql_to_json(sv: SqlValue, ty: ColType) -> Value {
 /// Every row carries `updated_at` (epoch bigint) + a `deleted` soft-delete flag.
 /// `tests/schema_parity.rs` fails if this descriptor and the fixture diverge.
 ///
-/// **Convergence contract (SUR-737, ratified).** Every table converges **whole-row last-write-wins
-/// by `updated_at`** — a pull applies the newer row's columns wholesale (see `pull_table`), mirroring
-/// the oracle's `mergeCloudRecords`. Pinned here, ahead of the SUR-726 fan-out, so the composite-column
-/// semantics are a decision and not an accident:
+/// **Convergence contract (SUR-737, ratified).** Every table resolves concurrent writes **whole-row
+/// last-write-wins by `updated_at`** — a pull applies a STRICTLY-newer row's columns wholesale (see
+/// `pull_table`), mirroring the oracle's `mergeCloudRecords`. Pinned here, ahead of the SUR-726
+/// fan-out, so the composite-column semantics are a decision and not an accident:
 ///
 /// | Table | Composite col(s) | Convergence | Why |
 /// |---|---|---|---|
@@ -158,8 +158,18 @@ fn sql_to_json(sv: SqlValue, ty: ColType) -> Value {
 /// The composite columns (`tags`, `source_meta`, `leaf_ids`) are stored as opaque JSON TEXT
 /// (`ColType::Json`); the LWW decision is `updated_at`-only (never on column contents), and **no
 /// element-level merge happens or is intended.** Any change to that (e.g. an OR-set for `tags`) is
-/// **wire-visible** and must land in the PWA (`mergeCloudRecords`) and here in lockstep. Ratification
-/// pin tests live in `pull.rs` (`sur737_*`).
+/// **wire-visible** and must land in the PWA (`mergeCloudRecords`) and here in lockstep.
+///
+/// **Exact-ms tie caveat — NOT full convergence (accepted residual).** The compare is STRICT `>`, so
+/// a tie keeps the local row (mirror of the oracle; pinned by `pull::tests::lww_tie_keeps_local`).
+/// Two devices writing DIFFERENT values to the same row in the SAME millisecond therefore do NOT
+/// reconcile — each replica keeps its own value until the next edit bumps `updated_at`
+/// (`pull::tests::sur737_exact_ms_tie_keeps_local_so_replicas_can_diverge`). This is an accepted,
+/// NTP-bounded, pathological residual (plan §8); the SUR-726 fan-out must not assume ms-identical
+/// concurrent edits converge. A deterministic tie-break (e.g. by `id`) would be wire-visible and must
+/// land PWA+core in lockstep — explicitly out of scope here.
+///
+/// Ratification pin tests live in `pull.rs` (`sur737_*`).
 pub fn synced_schema() -> &'static [TableSchema] {
     &[
         TableSchema {

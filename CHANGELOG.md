@@ -8,15 +8,18 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ### Changed
 - **Ratified whole-row-LWW convergence for array/composite + row-per-pair tables (SUR-737).**
-  Docs + pin tests only, **no behaviour change**: documented that every synced table converges
-  whole-row last-write-wins by `updated_at` — including the composite columns `notes.tags` /
-  `notes.source_meta` / `lenses.leaf_ids` (opaque JSON, replaced wholesale, **never element-unioned**
-  — a union can't express a delete) and the row-per-pair `note_links` / `collection_memberships`
-  (deterministic pk → concurrent adds converge to one row; remove = tombstone). Convergence table
-  on `store::synced_schema`, a rationale comment at the `pull_table` merge site, and `sur737_*` pin
-  tests in `pull.rs` (tags + `leaf_ids` whole-array LWW both directions; membership add/remove
-  convergence) that pre-lock the semantics ahead of the SUR-726 fan-out. Any move to element-level
-  merge is wire-visible and must land in the PWA (`mergeCloudRecords`) and here in lockstep.
+  Docs + pin tests only, **no behaviour change**: documented that every synced table resolves
+  concurrent writes whole-row last-write-wins by `updated_at` (strict `>`, so an exact-ms tie keeps
+  local — an accepted residual, plan §8: ms-identical concurrent edits with different values do NOT
+  converge) — including the composite columns `notes.tags` / `notes.source_meta` / `lenses.leaf_ids`
+  (opaque JSON, replaced wholesale, **never element-unioned** — a union can't express a delete), the
+  row-per-pair `collection_memberships` (deterministic pk → concurrent adds converge to one row;
+  remove = tombstone), and `note_links` (random-uid pk → a **bag**: concurrent adds of the same edge
+  do NOT dedup). Convergence table on `store::synced_schema`, a rationale comment at the `pull_table`
+  merge site, and `sur737_*` pin tests in `pull.rs` (tags + `leaf_ids` whole-array LWW both directions;
+  membership add/remove convergence; exact-ms tie divergence) that pre-lock the semantics ahead of the
+  SUR-726 fan-out. Any move to element-level merge or a deterministic tie-break is wire-visible and
+  must land in the PWA (`mergeCloudRecords`) and here in lockstep.
 - **GATING.md §3.1 row order (SUR-724).** Reordered so the specific rows (sync engine,
   bindings, crypto-parity) precede the general `src/**` catch-all, and added `src/http.rs`
   to the sync row. The line's classifier (`gce/src/classify-paths.ts`) is **first-match**, so
