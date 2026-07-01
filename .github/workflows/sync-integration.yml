@@ -1,0 +1,89 @@
+name: Sync integration (real Supabase)
+
+# SUR-724 / SUR-659b. The sync engine makes its OWN authenticated PostgREST calls with a REAL
+# GoTrue-issued token, so its flush can only be proven against a live Supabase stack. This job
+# spins one up from surfc's migrations, mints a real test user, and runs the `#[ignore]`d
+# integration test (`tests/sync_659b_integration.rs`) via `cargo test -- --ignored`.
+#
+# Kept SEPARATE from the fast `parity.yml` job so the per-PR crypto/wasm gate stays fast (this
+# one pulls Docker + the supabase CLI + a full `db reset`). Requires SURFC_READ_PAT (the same
+# cross-repo read PAT schema-drift.yml uses) to fetch surfc's migrations.
+
+on:
+  push:
+    branches: [main]
+    paths: ['Cargo.toml', 'Cargo.lock', 'src/**', 'tests/**', 'test-support/**', '.github/workflows/sync-integration.yml']
+  pull_request:
+    branches: [main]
+    paths: ['Cargo.toml', 'Cargo.lock', 'src/**', 'tests/**', 'test-support/**', '.github/workflows/sync-integration.yml']
+  workflow_dispatch:
+
+jobs:
+  integration:
+    name: outbox flush against local Supabase
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Guard — skip until the crate exists
+        id: guard
+        run: |
+          if [ -f Cargo.toml ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "No Cargo.toml yet — scaffolding only, skipping the sync integration job."
+          fi
+
+      - name: Install Rust toolchain
+        if: steps.guard.outputs.ready == 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        if: steps.guard.outputs.ready == 'true'
+        uses: Swatinem/rust-cache@v2
+
+      # The stack replays SURFC's migrations (the tables the engine upserts into live there),
+      # so we need surfc's supabase/ dir + its pinned CLI. Shallow clone of main, same as
+      # schema-drift.yml.
+      - name: Set up Node (surfc CLI is an npm devDependency)
+        if: steps.guard.outputs.ready == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Fetch surfc/main (migrations + pinned supabase CLI)
+        if: steps.guard.outputs.ready == 'true'
+        run: |
+          git clone --depth 1 \
+            "https://x-access-token:${{ secrets.SURFC_READ_PAT }}@github.com/pentoaswordfight/surfc.git" \
+            /tmp/surfc
+          # Install the pinned supabase CLI (surfc's package.json devDependency) — same
+          # rate-limit-safe approach as surfc's db-test.yml (no setup-cli GitHub API calls).
+          (cd /tmp/surfc && npm ci)
+
+      - name: Start Supabase local stack + replay migrations from scratch
+        if: steps.guard.outputs.ready == 'true'
+        env:
+          # Dummy secrets so the CLI can finalise config.toml's env-substitutions (mirrors
+          # surfc db-test.yml — GoTrue must not see an empty-string secret).
+          RESEND_API_KEY: dummy_for_local_dev
+          SUPABASE_AUTH_CAPTCHA_SECRET: 1x0000000000000000000000000000000AA
+        working-directory: /tmp/surfc
+        run: |
+          npx supabase start
+          npx supabase db reset --no-seed
+
+      - name: Export Supabase URL + keys for the integration test
+        if: steps.guard.outputs.ready == 'true'
+        working-directory: /tmp/surfc
+        run: |
+          eval "$(npx supabase status -o env)"
+          echo "SUPABASE_URL=$API_URL" >> "$GITHUB_ENV"
+          echo "SUPABASE_ANON_KEY=$ANON_KEY" >> "$GITHUB_ENV"
+          echo "SUPABASE_SERVICE_ROLE_KEY=$SERVICE_ROLE_KEY" >> "$GITHUB_ENV"
+
+      - name: Run the sync integration test (the #[ignore]d real-Supabase flush)
+        if: steps.guard.outputs.ready == 'true'
+        run: cargo test --test sync_659b_integration -- --ignored --nocapture

@@ -6,6 +6,15 @@
 #
 # Frozen protocol constants are verbatim (SUR-680 allowlist): the `surfc-*` HKDF info
 # strings and the 600 000 PBKDF2 count are wire-format, not branding.
+
+# Workspace (SUR-724): the crate + a `test-support` member crate. Integration-test files
+# compile as separate crates, so a `tests/common/mod.rs` only shares within ONE crate's
+# test binaries; the local-Supabase harness (mint_test_user_jwt + bootstrap + seed) must
+# be reusable across SUR-659b/c/d and the future bindings crate, so it lives in a real
+# member crate consumed as a dev-dependency.
+[workspace]
+members = [".", "test-support"]
+
 [package]
 name = "braird-core"
 version = "0.0.0"
@@ -55,14 +64,25 @@ getrandom = "0.2"
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.2", features = ["js"] }
 
-# The native SQLite local store (SUR-723) is native-only: the PWA uses Dexie/IndexedDB,
-# and `bundled` (C) SQLite does not compile to wasm32. Gating it off the wasm build keeps
-# the WASM CSPRNG leg (parity.yml `cargo build --target wasm32-unknown-unknown`) green.
+# The native SQLite local store (SUR-723) + the sync engine (SUR-724) are native-only:
+# the PWA uses Dexie/IndexedDB, and `bundled` (C) SQLite / reqwest / tokio do not compile
+# to wasm32. Gating them off the wasm build keeps the WASM CSPRNG leg (parity.yml
+# `cargo build --target wasm32-unknown-unknown`) green — see the `#[cfg]` on `pub mod sync`.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 rusqlite = { version = "0.32", features = ["bundled"] }
+# SUR-724 sync engine: reqwest (rustls, no C/OpenSSL — same reproducible-build principle as
+# bundled SQLite) drives the PostgREST upserts; tokio provides the current-thread runtime the
+# SyncEngine `block_on`s inside its synchronous UniFFI methods (the FFI stays sync, like Vault).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+tokio = { version = "1", default-features = false, features = ["rt", "net", "time"] }
+# serde_json carries serde transitively; add an explicit `serde = { features = ["derive"] }`
+# only when the first `#[derive(Serialize/Deserialize)]` lands (none yet — SUR-724 Gate-2 nit).
+serde_json = "1"
 
 [dev-dependencies]
 serde_json = "1"
+tempfile = "3"
+test-support = { path = "test-support" }
 
 [profile.release]
 opt-level = "z"

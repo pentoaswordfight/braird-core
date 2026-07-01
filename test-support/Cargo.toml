@@ -1,0 +1,18 @@
+# test-support — shared integration-test harness for braird-core's sync engine (SUR-724).
+#
+# A real workspace member (not a `tests/common/mod.rs`), because integration-test files each
+# compile as their OWN crate: a `common/` module only shares within ONE crate's test binaries.
+# The local-Supabase harness (mint_test_user_jwt + bootstrap + seed) must be reused across
+# SUR-659b/c/d and the future bindings crate, so it lives here and is consumed as a dev-dependency.
+#
+# Native-only helpers (reqwest); this crate is never built for wasm32.
+[package]
+name = "test-support"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "UNLICENSED"
+
+[dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "blocking"] }
+serde_json = "1"
