@@ -791,7 +791,7 @@ internal interface UniffiLib : Library {
     ): Unit
     fun uniffi_braird_core_fn_constructor_syncengine_open(`dbPath`: RustBuffer.ByValue,`supabaseUrl`: RustBuffer.ByValue,`anonKey`: RustBuffer.ByValue,`vault`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Pointer
-    fun uniffi_braird_core_fn_method_syncengine_enqueue_book(`ptr`: Pointer,`id`: RustBuffer.ByValue,`title`: RustBuffer.ByValue,`author`: RustBuffer.ByValue,`createdAt`: Long,`deleted`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+    fun uniffi_braird_core_fn_method_syncengine_enqueue_book(`ptr`: Pointer,`id`: RustBuffer.ByValue,`title`: RustBuffer.ByValue,`author`: RustBuffer.ByValue,`isbn`: RustBuffer.ByValue,`coverUrl`: RustBuffer.ByValue,`coverSource`: RustBuffer.ByValue,`coverResolvedAt`: RustBuffer.ByValue,`createdAt`: Long,`deleted`: Byte,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     fun uniffi_braird_core_fn_method_syncengine_enqueue_collection(`ptr`: Pointer,`id`: RustBuffer.ByValue,`name`: RustBuffer.ByValue,`createdAt`: Long,`deleted`: Byte,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
@@ -801,7 +801,7 @@ internal interface UniffiLib : Library {
     ): Unit
     fun uniffi_braird_core_fn_method_syncengine_enqueue_lens(`ptr`: Pointer,`id`: RustBuffer.ByValue,`name`: RustBuffer.ByValue,`leafIds`: RustBuffer.ByValue,`combinator`: RustBuffer.ByValue,`threshold`: RustBuffer.ByValue,`createdAt`: Long,`deleted`: Byte,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
-    fun uniffi_braird_core_fn_method_syncengine_enqueue_note(`ptr`: Pointer,`id`: RustBuffer.ByValue,`bookId`: RustBuffer.ByValue,`plaintext`: RustBuffer.ByValue,`page`: RustBuffer.ByValue,`tags`: RustBuffer.ByValue,`createdAt`: Long,`deleted`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+    fun uniffi_braird_core_fn_method_syncengine_enqueue_note(`ptr`: Pointer,`id`: RustBuffer.ByValue,`bookId`: RustBuffer.ByValue,`plaintext`: RustBuffer.ByValue,`page`: RustBuffer.ByValue,`tags`: RustBuffer.ByValue,`source`: RustBuffer.ByValue,`sourceId`: RustBuffer.ByValue,`sourceMetaJson`: RustBuffer.ByValue,`chapter`: RustBuffer.ByValue,`imagePath`: RustBuffer.ByValue,`inkCropPath`: RustBuffer.ByValue,`createdAt`: Long,`deleted`: Byte,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     fun uniffi_braird_core_fn_method_syncengine_enqueue_note_link(`ptr`: Pointer,`id`: RustBuffer.ByValue,`fromNoteId`: RustBuffer.ByValue,`toNoteId`: RustBuffer.ByValue,`relationType`: RustBuffer.ByValue,`createdAt`: Long,`deleted`: Byte,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
@@ -1025,7 +1025,7 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_braird_core_checksum_func_membership_id() != 9610.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_book() != 22816.toShort()) {
+    if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_book() != 63811.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_collection() != 43786.toShort()) {
@@ -1040,7 +1040,7 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_lens() != 60504.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_note() != 25351.toShort()) {
+    if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_note() != 38590.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_note_link() != 53465.toShort()) {
@@ -1485,9 +1485,17 @@ public interface SyncEngineInterface {
     /**
      * Enqueue a book upsert. `updated_at` is stamped in epoch ms at enqueue (never omitted —
      * the migration default is 0). Plaintext metadata only, no encryption branch (like the PWA
-     * `upsertBook`).
+     * `upsertBook`). Column NAMES mirror `upsertBook` in surfc `src/supabase.js` exactly.
+     *
+     * PARTIAL-PATCH SEMANTICS (SUR-741). Every optional is `None` → the column is OMITTED from the
+     * payload, so the server upsert (`merge-duplicates`) and the local `stage_write` merge patch
+     * only the columns actually supplied — a `None` never clobbers a pulled-only column (e.g. a
+     * title-only rename keeps the server's cover). Consequence (founder decision, deferred to a
+     * 660/661 follow-up): native cannot yet *clear* a field to NULL — `None` means "leave it",
+     * `Some(v)` means "set it to v" (incl. `Some("")`). Tri-state (absent | null | value) over
+     * UniFFI is awkward and out of scope here.
      */
-    fun `enqueueBook`(`id`: kotlin.String, `title`: kotlin.String, `author`: kotlin.String?, `createdAt`: kotlin.Long, `deleted`: kotlin.Boolean)
+    fun `enqueueBook`(`id`: kotlin.String, `title`: kotlin.String, `author`: kotlin.String?, `isbn`: kotlin.String?, `coverUrl`: kotlin.String?, `coverSource`: kotlin.String?, `coverResolvedAt`: kotlin.Long?, `createdAt`: kotlin.Long, `deleted`: kotlin.Boolean)
     
     /**
      * Enqueue a collection upsert (SUR-726). Plaintext metadata only.
@@ -1517,9 +1525,22 @@ public interface SyncEngineInterface {
     fun `enqueueLens`(`id`: kotlin.String, `name`: kotlin.String, `leafIds`: List<kotlin.String>, `combinator`: kotlin.String?, `threshold`: kotlin.Long?, `createdAt`: kotlin.Long, `deleted`: kotlin.Boolean)
     
     /**
-     * Enqueue a note upsert — the seal-at-write path. `text` is the PLAINTEXT; it is sealed here
-     * (enc:v2, AAD = note id) and `content_tag` is computed here FROM the plaintext (both while
-     * the plaintext is in hand). The stored outbox payload holds only the ciphertext + the tag.
+     * Enqueue a note upsert — the seal-at-write path. `plaintext` is the note text; it is sealed
+     * here (enc:v2, AAD = note id) and `content_tag` is computed here FROM the plaintext (both
+     * while the plaintext is in hand). The stored outbox payload holds only the ciphertext + the
+     * tag. Column NAMES mirror `upsertNote` in surfc `src/supabase.js` exactly.
+     *
+     * WIDENED (SUR-741). Carries the full authoring surface: `source`/`source_id`/`source_meta`/
+     * `chapter`/`image_path`/`ink_crop_path`. `source_meta_json` takes a serialized JSON **object**
+     * string for the `source_meta` jsonb column — the `…Json` suffix is the stated convention for any
+     * param that crosses the FFI as a serialized-JSON string (UniFFI has no jsonb type; the type
+     * alone can't say "this String is JSON, not a scalar"). It is parse-validated up front — invalid
+     * JSON or a non-object → `SyncError::Store` and **nothing is staged** (no seal, no write). None of
+     * the new fields touch the Vault — only `plaintext` is ever sealed.
+     *
+     * PARTIAL-PATCH SEMANTICS (SUR-741): every optional is `None` → column OMITTED (patch, never
+     * clobbers a pulled-only column; see [`SyncEngine::enqueue_book`]). `source` is the one
+     * exception — `None` → `"manual"` (the PWA's `|| 'manual'` / the prior hardcode), always sent.
      *
      * STALE-TAG EDGE (deliberate, mirrors surfc — do not "fix"): the content_tag bakes in the
      * note's `book_id`, but the flush repoints `book_id` via `bookIdRemap` after an offline
@@ -1529,7 +1550,7 @@ public interface SyncEngineInterface {
      * stale-tag-after-offline-merge self-heals on the note's next edit (which re-enqueues with a
      * freshly-computed tag). The tag is never NULL because it is computed pre-seal, from plaintext.
      */
-    fun `enqueueNote`(`id`: kotlin.String, `bookId`: kotlin.String?, `plaintext`: kotlin.String, `page`: kotlin.String?, `tags`: List<kotlin.String>, `createdAt`: kotlin.Long, `deleted`: kotlin.Boolean)
+    fun `enqueueNote`(`id`: kotlin.String, `bookId`: kotlin.String?, `plaintext`: kotlin.String, `page`: kotlin.String?, `tags`: List<kotlin.String>, `source`: kotlin.String?, `sourceId`: kotlin.String?, `sourceMetaJson`: kotlin.String?, `chapter`: kotlin.String?, `imagePath`: kotlin.String?, `inkCropPath`: kotlin.String?, `createdAt`: kotlin.Long, `deleted`: kotlin.Boolean)
     
     /**
      * Enqueue a note-link upsert (SUR-726) — a parent→child annotation edge. Plaintext only;
@@ -1697,14 +1718,22 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
     /**
      * Enqueue a book upsert. `updated_at` is stamped in epoch ms at enqueue (never omitted —
      * the migration default is 0). Plaintext metadata only, no encryption branch (like the PWA
-     * `upsertBook`).
+     * `upsertBook`). Column NAMES mirror `upsertBook` in surfc `src/supabase.js` exactly.
+     *
+     * PARTIAL-PATCH SEMANTICS (SUR-741). Every optional is `None` → the column is OMITTED from the
+     * payload, so the server upsert (`merge-duplicates`) and the local `stage_write` merge patch
+     * only the columns actually supplied — a `None` never clobbers a pulled-only column (e.g. a
+     * title-only rename keeps the server's cover). Consequence (founder decision, deferred to a
+     * 660/661 follow-up): native cannot yet *clear* a field to NULL — `None` means "leave it",
+     * `Some(v)` means "set it to v" (incl. `Some("")`). Tri-state (absent | null | value) over
+     * UniFFI is awkward and out of scope here.
      */
-    @Throws(SyncException::class)override fun `enqueueBook`(`id`: kotlin.String, `title`: kotlin.String, `author`: kotlin.String?, `createdAt`: kotlin.Long, `deleted`: kotlin.Boolean)
+    @Throws(SyncException::class)override fun `enqueueBook`(`id`: kotlin.String, `title`: kotlin.String, `author`: kotlin.String?, `isbn`: kotlin.String?, `coverUrl`: kotlin.String?, `coverSource`: kotlin.String?, `coverResolvedAt`: kotlin.Long?, `createdAt`: kotlin.Long, `deleted`: kotlin.Boolean)
         = 
     callWithPointer {
     uniffiRustCallWithError(SyncException) { _status ->
     UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_enqueue_book(
-        it, FfiConverterString.lower(`id`),FfiConverterString.lower(`title`),FfiConverterOptionalString.lower(`author`),FfiConverterLong.lower(`createdAt`),FfiConverterBoolean.lower(`deleted`),_status)
+        it, FfiConverterString.lower(`id`),FfiConverterString.lower(`title`),FfiConverterOptionalString.lower(`author`),FfiConverterOptionalString.lower(`isbn`),FfiConverterOptionalString.lower(`coverUrl`),FfiConverterOptionalString.lower(`coverSource`),FfiConverterOptionalLong.lower(`coverResolvedAt`),FfiConverterLong.lower(`createdAt`),FfiConverterBoolean.lower(`deleted`),_status)
 }
     }
     
@@ -1779,9 +1808,22 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
 
     
     /**
-     * Enqueue a note upsert — the seal-at-write path. `text` is the PLAINTEXT; it is sealed here
-     * (enc:v2, AAD = note id) and `content_tag` is computed here FROM the plaintext (both while
-     * the plaintext is in hand). The stored outbox payload holds only the ciphertext + the tag.
+     * Enqueue a note upsert — the seal-at-write path. `plaintext` is the note text; it is sealed
+     * here (enc:v2, AAD = note id) and `content_tag` is computed here FROM the plaintext (both
+     * while the plaintext is in hand). The stored outbox payload holds only the ciphertext + the
+     * tag. Column NAMES mirror `upsertNote` in surfc `src/supabase.js` exactly.
+     *
+     * WIDENED (SUR-741). Carries the full authoring surface: `source`/`source_id`/`source_meta`/
+     * `chapter`/`image_path`/`ink_crop_path`. `source_meta_json` takes a serialized JSON **object**
+     * string for the `source_meta` jsonb column — the `…Json` suffix is the stated convention for any
+     * param that crosses the FFI as a serialized-JSON string (UniFFI has no jsonb type; the type
+     * alone can't say "this String is JSON, not a scalar"). It is parse-validated up front — invalid
+     * JSON or a non-object → `SyncError::Store` and **nothing is staged** (no seal, no write). None of
+     * the new fields touch the Vault — only `plaintext` is ever sealed.
+     *
+     * PARTIAL-PATCH SEMANTICS (SUR-741): every optional is `None` → column OMITTED (patch, never
+     * clobbers a pulled-only column; see [`SyncEngine::enqueue_book`]). `source` is the one
+     * exception — `None` → `"manual"` (the PWA's `|| 'manual'` / the prior hardcode), always sent.
      *
      * STALE-TAG EDGE (deliberate, mirrors surfc — do not "fix"): the content_tag bakes in the
      * note's `book_id`, but the flush repoints `book_id` via `bookIdRemap` after an offline
@@ -1791,12 +1833,12 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
      * stale-tag-after-offline-merge self-heals on the note's next edit (which re-enqueues with a
      * freshly-computed tag). The tag is never NULL because it is computed pre-seal, from plaintext.
      */
-    @Throws(SyncException::class)override fun `enqueueNote`(`id`: kotlin.String, `bookId`: kotlin.String?, `plaintext`: kotlin.String, `page`: kotlin.String?, `tags`: List<kotlin.String>, `createdAt`: kotlin.Long, `deleted`: kotlin.Boolean)
+    @Throws(SyncException::class)override fun `enqueueNote`(`id`: kotlin.String, `bookId`: kotlin.String?, `plaintext`: kotlin.String, `page`: kotlin.String?, `tags`: List<kotlin.String>, `source`: kotlin.String?, `sourceId`: kotlin.String?, `sourceMetaJson`: kotlin.String?, `chapter`: kotlin.String?, `imagePath`: kotlin.String?, `inkCropPath`: kotlin.String?, `createdAt`: kotlin.Long, `deleted`: kotlin.Boolean)
         = 
     callWithPointer {
     uniffiRustCallWithError(SyncException) { _status ->
     UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_enqueue_note(
-        it, FfiConverterString.lower(`id`),FfiConverterOptionalString.lower(`bookId`),FfiConverterString.lower(`plaintext`),FfiConverterOptionalString.lower(`page`),FfiConverterSequenceString.lower(`tags`),FfiConverterLong.lower(`createdAt`),FfiConverterBoolean.lower(`deleted`),_status)
+        it, FfiConverterString.lower(`id`),FfiConverterOptionalString.lower(`bookId`),FfiConverterString.lower(`plaintext`),FfiConverterOptionalString.lower(`page`),FfiConverterSequenceString.lower(`tags`),FfiConverterOptionalString.lower(`source`),FfiConverterOptionalString.lower(`sourceId`),FfiConverterOptionalString.lower(`sourceMetaJson`),FfiConverterOptionalString.lower(`chapter`),FfiConverterOptionalString.lower(`imagePath`),FfiConverterOptionalString.lower(`inkCropPath`),FfiConverterLong.lower(`createdAt`),FfiConverterBoolean.lower(`deleted`),_status)
 }
     }
     

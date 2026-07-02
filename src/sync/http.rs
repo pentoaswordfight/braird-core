@@ -124,11 +124,12 @@ impl PostgrestClient {
     /// moment it appears (the SUR-739 primary win) and needs no writer-clock-skew lookback. The caller
     /// ([`super::pull`]) loops, advancing per page until a short page.
     ///
-    /// **Caveat (SUR-739 follow-up):** exact skip-safety needs `change_seq` COMMIT-ordered, but 0051's
-    /// bare per-table `nextval` is allocated at statement time — a concurrent flush that commits a
-    /// lower value after the cursor passed a higher one is skipped until a full re-pull. The durable
-    /// fix is server-side (a per-user lock-serialized counter; trigger-only, no change here). See
-    /// [`super::pull`] and SUR-743 (the SUR-739 follow-up migration).
+    /// **Commit-ordered (SUR-743):** `change_seq` is assigned in COMMIT order per user — surfc
+    /// migration 0052 replaced 0051's per-table `nextval` (allocated at statement time) with a
+    /// per-user lock-serialized counter — so the exclusive keyset is skip-safe by construction: a
+    /// concurrent flush can no longer commit a lower value after the cursor passed a higher one. The
+    /// fix was server-side + trigger-only; the client already consumed a commit-ordered watermark
+    /// correctly, so no change here.
     ///
     /// Returns the raw PostgREST row objects (snake_case, `change_seq` included); RLS scopes them to
     /// the token's user, and the owner sees their own tombstones so `deleted:1` rows come back too.

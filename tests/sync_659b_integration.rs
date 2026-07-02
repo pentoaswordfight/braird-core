@@ -94,6 +94,10 @@ fn flush_seals_text_and_upserts_via_token_handoff() {
             book_id.clone(),
             "Apology".into(),
             Some("Plato".into()),
+            None,
+            None,
+            None,
+            None,
             1_700_000_000_000,
             false,
         )
@@ -105,6 +109,12 @@ fn flush_seals_text_and_upserts_via_token_handoff() {
             plaintext.to_string(),
             Some("38a".into()),
             vec!["philosophy".into()],
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
             1_700_000_000_000,
             false,
         )
