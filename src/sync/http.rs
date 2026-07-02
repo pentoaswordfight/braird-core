@@ -116,17 +116,27 @@ impl PostgrestClient {
         Ok(())
     }
 
-    /// Fetch every row of `table` with `updated_at >= cursor`, ordered ascending — the incremental
-    /// pull read (SUR-725 / SUR-659c). Mirrors surfc `fetchSince` (`.from(table).select('*')
-    /// .gte('updated_at', since)`): **inclusive** on the boundary, so a row stamped exactly at the
-    /// cursor re-pulls (idempotent under the caller's last-write-wins merge — the deliberate mirror
-    /// of the oracle's `.gte`, not the ticket prose's `>`). Returns the raw PostgREST row objects
-    /// (snake_case); RLS scopes them to the token's user, and (per the soft-delete invariant) the
-    /// owner sees their own tombstones so `deleted:1` rows come back too.
-    pub async fn get_since(
+    /// Fetch ONE page of `table` rows with `change_seq > after_seq`, ordered by `change_seq`
+    /// ascending, capped at `limit` — the incremental-pull read (SUR-739 / SUR-652). `change_seq` is
+    /// the server-assigned visibility watermark (surfc migration 0051 / trigger `t02_change_seq`),
+    /// distinct from the client-authored `updated_at` used for last-write-wins; it is stamped when the
+    /// server makes a row visible, so the exclusive `gt` keyset delivers a delayed/offline flush the
+    /// moment it appears (the SUR-739 primary win) and needs no writer-clock-skew lookback. The caller
+    /// ([`super::pull`]) loops, advancing per page until a short page.
+    ///
+    /// **Caveat (SUR-739 follow-up):** exact skip-safety needs `change_seq` COMMIT-ordered, but 0051's
+    /// bare per-table `nextval` is allocated at statement time — a concurrent flush that commits a
+    /// lower value after the cursor passed a higher one is skipped until a full re-pull. The durable
+    /// fix is server-side (a per-user lock-serialized counter; trigger-only, no change here). See
+    /// [`super::pull`] and SUR-743 (the SUR-739 follow-up migration).
+    ///
+    /// Returns the raw PostgREST row objects (snake_case, `change_seq` included); RLS scopes them to
+    /// the token's user, and the owner sees their own tombstones so `deleted:1` rows come back too.
+    pub async fn get_page(
         &self,
         table: &str,
-        cursor: i64,
+        after_seq: i64,
+        limit: i64,
     ) -> Result<Vec<Value>, Box<dyn std::error::Error + Send + Sync>> {
         let token = self
             .access_token
@@ -134,8 +144,8 @@ impl PostgrestClient {
             .ok_or("no access token set — call set_access_token before pull")?;
 
         let url = format!(
-            "{}/rest/v1/{}?updated_at=gte.{}&order=updated_at.asc",
-            self.base_url, table, cursor
+            "{}/rest/v1/{}?change_seq=gt.{}&order=change_seq.asc&limit={}",
+            self.base_url, table, after_seq, limit
         );
 
         let mut headers = HeaderMap::new();
@@ -155,14 +165,6 @@ impl PostgrestClient {
                 body,
             }));
         }
-        // ponytail: single request, no pagination — mirrors the JS `fetchSince` oracle. PostgREST
-        // caps every response at `max_rows` (DEFAULT 1000), so an account whose per-table delta
-        // exceeds the cap pulls only the first page, and `pull_table` then advances the cursor past
-        // the rest — permanently skipping them. This is a REAL defect shared with the PWA (already
-        // hit there at ~1.6k notes), tracked by SUR-652: the durable fix pages with `Range` /
-        // `Content-Range` under a stable `updated_at,id` order until a short page, THEN advances the
-        // cursor. Out of scope for this slice (the notes+books coexistence proof runs well under the
-        // cap); fix it in SUR-652 across the PWA + this core together.
         Ok(resp.json::<Vec<Value>>().await?)
     }
 }
@@ -178,8 +180,14 @@ impl PostgrestClient {
 pub trait PostgrestSink {
     async fn upsert(&self, table: &str, on_conflict: &str, rows: &Value) -> Result<(), String>;
 
-    /// Fetch `table` rows with `updated_at >= cursor` (incremental pull, SUR-725).
-    async fn fetch_since(&self, table: &str, cursor: i64) -> Result<Vec<Value>, String>;
+    /// Fetch one page of `table` rows with `change_seq > after_seq`, ordered by `change_seq` asc,
+    /// capped at `limit` (keyset incremental pull, SUR-739 / SUR-652).
+    async fn fetch_page(
+        &self,
+        table: &str,
+        after_seq: i64,
+        limit: i64,
+    ) -> Result<Vec<Value>, String>;
 }
 
 impl PostgrestSink for PostgrestClient {
@@ -189,8 +197,13 @@ impl PostgrestSink for PostgrestClient {
             .map_err(|e| e.to_string())
     }
 
-    async fn fetch_since(&self, table: &str, cursor: i64) -> Result<Vec<Value>, String> {
-        self.get_since(table, cursor)
+    async fn fetch_page(
+        &self,
+        table: &str,
+        after_seq: i64,
+        limit: i64,
+    ) -> Result<Vec<Value>, String> {
+        self.get_page(table, after_seq, limit)
             .await
             .map_err(|e| e.to_string())
     }

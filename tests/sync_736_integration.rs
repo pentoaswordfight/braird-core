@@ -28,7 +28,7 @@ enum Op {
 }
 
 /// A PostgREST stand-in that records every call in order and serves canned remote rows. No network;
-/// `upsert` always succeeds. `failing(table)` makes that table's `fetch_since` error (the partial-
+/// `upsert` always succeeds. `failing(table)` makes that table's `fetch_page` error (the partial-
 /// pull-failure case). Lets us assert call order, that a rebased-away edit is never re-dispatched,
 /// and that a failed table's stale edit is never flushed.
 struct RecordingSink {
@@ -62,7 +62,12 @@ impl PostgrestSink for RecordingSink {
         self.log.borrow_mut().push(Op::Upsert(table.to_string()));
         Ok(())
     }
-    async fn fetch_since(&self, table: &str, _cursor: i64) -> Result<Vec<Value>, String> {
+    async fn fetch_page(
+        &self,
+        table: &str,
+        _after_seq: i64,
+        _limit: i64,
+    ) -> Result<Vec<Value>, String> {
         self.log.borrow_mut().push(Op::Fetch(table.to_string()));
         if self.fail_fetch.as_deref() == Some(table) {
             return Err(format!("{table} fetch failed"));
@@ -102,7 +107,7 @@ fn pull_then_flush_does_not_re_push_a_rebased_edit() {
     ));
 
     // sync()'s order: pull (which rebases) THEN flush.
-    let pulled = block(pull::pull(&store, &sink, &["notes"], 9000)).unwrap();
+    let pulled = block(pull::pull(&store, &sink, &["notes"])).unwrap();
     assert_eq!(pulled.merged, 1);
     assert_eq!(
         pulled.superseded.len(),
@@ -153,7 +158,7 @@ fn a_genuinely_newer_local_edit_still_flushes_after_pull() {
         vec![json!({ "id": "b1", "title": "server-older", "updated_at": 3000, "deleted": false })],
     ));
 
-    let pulled = block(pull::pull(&store, &sink, &["books"], 9000)).unwrap();
+    let pulled = block(pull::pull(&store, &sink, &["books"])).unwrap();
     assert_eq!(pulled.merged, 0, "the older server row loses LWW");
     assert!(pulled.superseded.is_empty());
     assert_eq!(
@@ -206,7 +211,6 @@ fn partial_pull_failure_aborts_the_flush() {
         &sink,
         "user-1",
         &["books", "notes"],
-        9000,
     ));
 
     assert!(outcome.is_err(), "a failed table must abort the flush");
@@ -243,7 +247,7 @@ fn pull_then_flush_pulls_then_flushes_on_a_clean_pull() {
     let sink = RecordingSink::new(one("books", vec![]));
 
     let (pulled, flushed) =
-        block(pull_then_flush(&store, &sink, "user-1", &["books"], 9000)).expect("clean sync");
+        block(pull_then_flush(&store, &sink, "user-1", &["books"])).expect("clean sync");
 
     assert!(pulled.failed_tables.is_empty());
     assert_eq!(flushed.ok.len(), 1, "the local edit flushed");

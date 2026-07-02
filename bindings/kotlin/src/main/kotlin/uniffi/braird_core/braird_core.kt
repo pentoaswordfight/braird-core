@@ -1052,7 +1052,7 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_braird_core_checksum_method_syncengine_flush() != 39156.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_braird_core_checksum_method_syncengine_pull() != 18621.toShort()) {
+    if (lib.uniffi_braird_core_checksum_method_syncengine_pull() != 8960.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_set_access_token() != 47386.toShort()) {
@@ -1560,13 +1560,15 @@ public interface SyncEngineInterface {
     
     /**
      * Pull incrementally from Supabase for **all eight synced tables** (SUR-726 —
-     * [`synced_table_names`] is the one source of the pull scope). Merges last-write-wins by `updated_at`,
-     * applies tombstones without resurrecting soft-deleted rows, **rebases the outbox** (drops a
-     * queued local edit a newer remote row beat — SUR-736 — and reports it in `superseded`,
-     * SUR-738), and advances each per-table cursor to a lookback watermark (`now()` minus
-     * [`PULL_CURSOR_OVERLAP_MS`], SUR-739 — so a delayed/offline flush isn't skipped). Synchronous
-     * FFI — the async GETs run on the owned runtime via `block_on`, exactly like `flush`. Note text
-     * stays ciphertext at rest (never decrypted on pull); the host decrypts via `Vault::decrypt_note`.
+     * [`synced_table_names`] is the one source of the pull scope). Merges last-write-wins by
+     * `updated_at`, applies tombstones without resurrecting soft-deleted rows, **rebases the outbox**
+     * (drops a queued local edit a newer remote row beat — SUR-736 — and reports it in `superseded`,
+     * SUR-738), and advances each per-table cursor to the max server `change_seq` it merged
+     * (SUR-739 visibility watermark), paging by `change_seq` until a short page (SUR-652). The
+     * watermark replaces the old client-clock lookback: a delayed/offline flush is now delivered the
+     * moment the server makes it visible, not skipped. Synchronous FFI — the async GETs run on the
+     * owned runtime via `block_on`, exactly like `flush`. Note text stays ciphertext at rest (never
+     * decrypted on pull); the host decrypts via `Vault::decrypt_note`.
      *
      * Call order is now safe either way for SUR-736: the rebase drops a stale queued edit as it
      * merges the newer remote row, so a following `flush()` can't re-push it. Prefer
@@ -1861,13 +1863,15 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
     
     /**
      * Pull incrementally from Supabase for **all eight synced tables** (SUR-726 —
-     * [`synced_table_names`] is the one source of the pull scope). Merges last-write-wins by `updated_at`,
-     * applies tombstones without resurrecting soft-deleted rows, **rebases the outbox** (drops a
-     * queued local edit a newer remote row beat — SUR-736 — and reports it in `superseded`,
-     * SUR-738), and advances each per-table cursor to a lookback watermark (`now()` minus
-     * [`PULL_CURSOR_OVERLAP_MS`], SUR-739 — so a delayed/offline flush isn't skipped). Synchronous
-     * FFI — the async GETs run on the owned runtime via `block_on`, exactly like `flush`. Note text
-     * stays ciphertext at rest (never decrypted on pull); the host decrypts via `Vault::decrypt_note`.
+     * [`synced_table_names`] is the one source of the pull scope). Merges last-write-wins by
+     * `updated_at`, applies tombstones without resurrecting soft-deleted rows, **rebases the outbox**
+     * (drops a queued local edit a newer remote row beat — SUR-736 — and reports it in `superseded`,
+     * SUR-738), and advances each per-table cursor to the max server `change_seq` it merged
+     * (SUR-739 visibility watermark), paging by `change_seq` until a short page (SUR-652). The
+     * watermark replaces the old client-clock lookback: a delayed/offline flush is now delivered the
+     * moment the server makes it visible, not skipped. Synchronous FFI — the async GETs run on the
+     * owned runtime via `block_on`, exactly like `flush`. Note text stays ciphertext at rest (never
+     * decrypted on pull); the host decrypts via `Vault::decrypt_note`.
      *
      * Call order is now safe either way for SUR-736: the rebase drops a stale queued edit as it
      * merges the newer remote row, so a following `flush()` can't re-push it. Prefer

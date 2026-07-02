@@ -129,11 +129,11 @@ fn pull_roundtrips_notes_and_books_from_the_server() {
     );
     assert!(
         store_b
-            .get_sync_cursor("notes")
+            .get_seq_cursor("notes")
             .expect("cursor")
             .unwrap_or(0)
             > 0,
-        "notes cursor advanced after a successful pull"
+        "notes change_seq cursor advanced after a successful pull"
     );
 
     let _ = std::fs::remove_file(&db_a);

@@ -496,6 +496,13 @@ impl Store {
         Ok(())
     }
 
+    /// Delete a `meta` KV value (no-op if absent) — used to retire the legacy pull-cursor key.
+    pub fn meta_delete(&self, key: &str) -> rusqlite::Result<()> {
+        self.conn
+            .execute("DELETE FROM meta WHERE key = ?1", [key])?;
+        Ok(())
+    }
+
     // ── synced-table read/write + pull cursors (SUR-725) ──────────────────────
     // The inverse of the outbox path: `apply_row` merges a remote row INTO a synced table
     // (pull), and `get_row` reads one back (the pull LWW compare + host/test introspection).
@@ -653,23 +660,36 @@ impl Store {
         tx.commit()
     }
 
-    /// The per-table incremental-pull cursor (epoch-ms watermark), or `None` on the first pull.
-    /// Local-only (in `meta`, keyed `sync:cursor:<table>`) — an intentional divergence from the
-    /// PWA's single global `meta.lastSyncAt` (founder, SUR-659): each table advances independently
-    /// so one table's fetch failure never skips another's changes.
-    pub fn get_sync_cursor(&self, table: &str) -> rusqlite::Result<Option<i64>> {
+    /// The per-table incremental-pull cursor: the highest server-assigned `change_seq` merged so
+    /// far (SUR-739 visibility watermark), or `None` before the first pull. Local-only (in `meta`,
+    /// keyed `sync:seq:<table>`) — per-table so one table's fetch failure never skips another's
+    /// changes (founder, SUR-659), and keyed on `change_seq` (server-monotonic) rather than the
+    /// retired epoch-ms `sync:cursor:<table>` watermark: keyset pagination by exclusive `gt` is then
+    /// exact (no clock-skew lookback, no boundary re-pull — see `sync::pull`). Absent → 0 → a
+    /// one-time full re-pull (which also recovers every row the old client-timestamp cursor skipped).
+    pub fn get_seq_cursor(&self, table: &str) -> rusqlite::Result<Option<i64>> {
         Ok(self
-            .meta_get(&sync_cursor_key(table))?
+            .meta_get(&sync_seq_key(table))?
             .and_then(|s| s.parse::<i64>().ok()))
     }
 
-    /// Advance a per-table pull cursor (called only after that table's merge succeeds).
-    pub fn set_sync_cursor(&self, table: &str, cursor: i64) -> rusqlite::Result<()> {
-        self.meta_set(&sync_cursor_key(table), &cursor.to_string())
+    /// Advance a per-table seq cursor (called after each merged page — a consistent prefix, so a
+    /// mid-pull crash resumes here). Also clears the retired epoch-ms `sync:cursor:<table>` key on
+    /// the first advance: it's dead once unread, and a ~1.7e12 ms value reinterpreted as a
+    /// `change_seq` would skip everything.
+    pub fn set_seq_cursor(&self, table: &str, seq: i64) -> rusqlite::Result<()> {
+        self.meta_set(&sync_seq_key(table), &seq.to_string())?;
+        self.meta_delete(&sync_cursor_key(table))
     }
 }
 
-/// The `meta` key holding a table's incremental-pull cursor.
+/// The `meta` key holding a table's incremental-pull cursor (server `change_seq` watermark).
+fn sync_seq_key(table: &str) -> String {
+    format!("sync:seq:{table}")
+}
+
+/// The retired epoch-ms pull-cursor key (pre-SUR-739) — kept only so [`Store::set_seq_cursor`] can
+/// delete it on the first change_seq pull.
 fn sync_cursor_key(table: &str) -> String {
     format!("sync:cursor:{table}")
 }
@@ -863,16 +883,31 @@ mod tests {
     }
 
     #[test]
-    fn sync_cursor_defaults_none_then_roundtrips_per_table() {
+    fn seq_cursor_defaults_none_then_roundtrips_per_table() {
         let store = Store::open_in_memory().unwrap();
-        assert_eq!(store.get_sync_cursor("notes").unwrap(), None);
-        store.set_sync_cursor("notes", 1_700_000_000_000).unwrap();
-        assert_eq!(
-            store.get_sync_cursor("notes").unwrap(),
-            Some(1_700_000_000_000)
-        );
+        assert_eq!(store.get_seq_cursor("notes").unwrap(), None);
+        store.set_seq_cursor("notes", 42).unwrap();
+        assert_eq!(store.get_seq_cursor("notes").unwrap(), Some(42));
         // Per-table isolation: advancing notes must not touch the books cursor.
-        assert_eq!(store.get_sync_cursor("books").unwrap(), None);
+        assert_eq!(store.get_seq_cursor("books").unwrap(), None);
+    }
+
+    #[test]
+    fn set_seq_cursor_retires_the_legacy_ms_cursor_key() {
+        // A store carrying a pre-SUR-739 epoch-ms cursor: the first change_seq advance must delete
+        // it (a ~1.7e12 ms value reinterpreted as a change_seq would skip everything), and reads go
+        // to the new key only.
+        let store = Store::open_in_memory().unwrap();
+        store
+            .meta_set(&sync_cursor_key("notes"), "1700000000000")
+            .unwrap();
+        store.set_seq_cursor("notes", 7).unwrap();
+        assert_eq!(store.get_seq_cursor("notes").unwrap(), Some(7));
+        assert_eq!(
+            store.meta_get(&sync_cursor_key("notes")).unwrap(),
+            None,
+            "the legacy epoch-ms cursor key is deleted on the first change_seq advance"
+        );
     }
 
     // ── SUR-736 outbox rebase on an LWW win ───────────────────────────────────

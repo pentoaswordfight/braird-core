@@ -381,13 +381,15 @@ impl SyncEngine {
     }
 
     /// Pull incrementally from Supabase for **all eight synced tables** (SUR-726 —
-    /// [`synced_table_names`] is the one source of the pull scope). Merges last-write-wins by `updated_at`,
-    /// applies tombstones without resurrecting soft-deleted rows, **rebases the outbox** (drops a
-    /// queued local edit a newer remote row beat — SUR-736 — and reports it in `superseded`,
-    /// SUR-738), and advances each per-table cursor to a lookback watermark (`now()` minus
-    /// [`PULL_CURSOR_OVERLAP_MS`], SUR-739 — so a delayed/offline flush isn't skipped). Synchronous
-    /// FFI — the async GETs run on the owned runtime via `block_on`, exactly like `flush`. Note text
-    /// stays ciphertext at rest (never decrypted on pull); the host decrypts via `Vault::decrypt_note`.
+    /// [`synced_table_names`] is the one source of the pull scope). Merges last-write-wins by
+    /// `updated_at`, applies tombstones without resurrecting soft-deleted rows, **rebases the outbox**
+    /// (drops a queued local edit a newer remote row beat — SUR-736 — and reports it in `superseded`,
+    /// SUR-738), and advances each per-table cursor to the max server `change_seq` it merged
+    /// (SUR-739 visibility watermark), paging by `change_seq` until a short page (SUR-652). The
+    /// watermark replaces the old client-clock lookback: a delayed/offline flush is now delivered the
+    /// moment the server makes it visible, not skipped. Synchronous FFI — the async GETs run on the
+    /// owned runtime via `block_on`, exactly like `flush`. Note text stays ciphertext at rest (never
+    /// decrypted on pull); the host decrypts via `Vault::decrypt_note`.
     ///
     /// Call order is now safe either way for SUR-736: the rebase drops a stale queued edit as it
     /// merges the newer remote row, so a following `flush()` can't re-push it. Prefer
@@ -402,16 +404,9 @@ impl SyncEngine {
                 "no access token set — call set_access_token before pull".into(),
             ));
         }
-        // One pre-fetch watermark for the whole pull (mirrors the JS single `nextCheckpoint`);
-        // each table that succeeds advances its cursor to it. Advance to `now() - OVERLAP`, not bare
-        // `now()`: `updated_at` is client-stamped at ENQUEUE, but a row becomes server-visible only
-        // at FLUSH — so a delayed/offline flush lands with a timestamp older than `now()` and a bare
-        // `now()` cursor would skip it forever. The overlap re-fetches that window (idempotent under
-        // LWW). Bounded mitigation only; the durable server-watermark fix is SUR-739.
-        let now = epoch_ms().saturating_sub(PULL_CURSOR_OVERLAP_MS);
         let result = self
             .runtime
-            .block_on(pull::pull(&store, &*client, &tables, now))
+            .block_on(pull::pull(&store, &*client, &tables))
             .map_err(SyncError::Flush)?;
         // Every requested table failing (e.g. offline / bad token) is a real error — surface it
         // rather than a misleading "pulled 0". A PARTIAL failure stays Ok (per-table isolation:
@@ -455,10 +450,9 @@ impl SyncEngine {
         })?;
         let user_id = user_id_from_jwt(token)
             .map_err(|e| SyncError::Flush(format!("bad access token: {e}")))?;
-        let now = epoch_ms().saturating_sub(PULL_CURSOR_OVERLAP_MS);
         let (pull, flush) = self
             .runtime
-            .block_on(pull_then_flush(&store, &*client, &user_id, &tables, now))
+            .block_on(pull_then_flush(&store, &*client, &user_id, &tables))
             .map_err(SyncError::Flush)?;
         Ok(SyncSummary {
             pull: PullSummary {
@@ -511,9 +505,8 @@ pub async fn pull_then_flush<S: http::PostgrestSink>(
     sink: &S,
     user_id: &str,
     tables: &[&str],
-    now_ms: i64,
 ) -> Result<(pull::PullResult, push::FlushResult), String> {
-    let pulled = pull::pull(store, sink, tables, now_ms).await?;
+    let pulled = pull::pull(store, sink, tables).await?;
     if !pulled.failed_tables.is_empty() {
         return Err(format!(
             "pull failed for {} — aborting flush so a stale edit can't re-push over a newer server \
@@ -524,18 +517,6 @@ pub async fn pull_then_flush<S: http::PostgrestSink>(
     let flushed = push::flush(store, sink, user_id).await?;
     Ok((pulled, flushed))
 }
-
-/// Lookback the pull cursor keeps behind wall-clock `now()` when it advances (SUR-725 review /
-/// SUR-739). `updated_at` is client-stamped at ENQUEUE, but a row becomes server-visible only at
-/// FLUSH — so a delayed/offline flush lands on the server with a timestamp OLDER than a cursor that
-/// advanced to `now()`, and would be skipped forever. Advancing to `now() - OVERLAP` re-fetches this
-/// window each pull (idempotent under LWW), catching flushes delayed up to the window.
-///
-/// HEURISTIC, not a guarantee: a flush delayed beyond the window (long offline) is still missed
-/// until a full re-pull (reset the cursor to 0). The complete fix — a server-assigned monotonic
-/// watermark the cursor tracks, distinct from the client `updated_at` used for LWW — is SUR-739.
-/// Tunable: larger = fewer misses, more re-fetch per pull (bounded by pagination, SUR-652).
-const PULL_CURSOR_OVERLAP_MS: i64 = 24 * 60 * 60 * 1000; // 24h — covers a full offline day (e.g. a flight)
 
 /// Derive a `collection_memberships` primary key from its `(collection_id, note_id)` pair — the
 /// FFI-exported mirror of surfc's `membershipId(collectionId, noteId)`, so a host can look up or
