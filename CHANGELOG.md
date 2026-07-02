@@ -33,6 +33,12 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   - **FFI:** new binding surface → regenerated Swift + Kotlin via `scripts/gen-bindings.sh`; Swift +
     Kotlin round-trip tests exercise list/get/counts/search (incl. the no-`enc:`-sentinel guard).
     New surface → `naming-reviewer` + `crypto-reviewer` gate.
+- **`docs/learnings/` — Phase-2 (SUR-659) closeout lessons.** Seed the learnings register (with the
+  `_template.md` GATING.md references) and record the two non-obvious keepers from the fast-follows:
+  a unique/monotonic sequence is **not** a commit-ordered watermark (`nextval` allocates
+  non-transactionally → keyset skip; SUR-743), and UniFFI folds **docstrings** into per-method
+  checksums so a doc-only edit drifts the committed bindings while the runtime guard can't see a
+  missing symbol (SUR-742). Docs-only; no code, schema, or binding change.
 - **FFI bindings-drift guard (SUR-742).** New `scripts/gen-bindings.sh` — the single canonical
   UniFFI bindgen invocation: builds the library and regenerates the committed Swift + Kotlin
   bindings in library mode with **`--no-format`**, so output is deterministic across hosts (no
