@@ -182,10 +182,12 @@ impl SyncEngine {
     /// tag. Column NAMES mirror `upsertNote` in surfc `src/supabase.js` exactly.
     ///
     /// WIDENED (SUR-741). Carries the full authoring surface: `source`/`source_id`/`source_meta`/
-    /// `chapter`/`image_path`/`ink_crop_path`. `source_meta_json` is a JSON **object** string
-    /// (mirroring the `source_meta` jsonb column); it is parse-validated up front — invalid JSON or a
-    /// non-object → `SyncError::Store` and **nothing is staged** (no seal, no write). None of the new
-    /// fields touch the Vault — only `plaintext` is ever sealed.
+    /// `chapter`/`image_path`/`ink_crop_path`. `source_meta_json` takes a serialized JSON **object**
+    /// string for the `source_meta` jsonb column — the `…Json` suffix is the stated convention for any
+    /// param that crosses the FFI as a serialized-JSON string (UniFFI has no jsonb type; the type
+    /// alone can't say "this String is JSON, not a scalar"). It is parse-validated up front — invalid
+    /// JSON or a non-object → `SyncError::Store` and **nothing is staged** (no seal, no write). None of
+    /// the new fields touch the Vault — only `plaintext` is ever sealed.
     ///
     /// PARTIAL-PATCH SEMANTICS (SUR-741): every optional is `None` → column OMITTED (patch, never
     /// clobbers a pulled-only column; see [`SyncEngine::enqueue_book`]). `source` is the one
@@ -219,9 +221,11 @@ impl SyncEngine {
         let source_meta = match source_meta_json {
             None => None,
             Some(s) => {
-                let v: Value = serde_json::from_str(&s).map_err(|e| {
-                    SyncError::Store(format!("source_meta_json is not valid JSON: {e}"))
-                })?;
+                // Do NOT interpolate the serde error — it can echo a fragment of the caller's
+                // input into a string that crosses the FFI and may be host-logged (crypto-reviewer:
+                // keep host-supplied content out of error messages).
+                let v: Value = serde_json::from_str(&s)
+                    .map_err(|_| SyncError::Store("source_meta_json is not valid JSON".into()))?;
                 if !v.is_object() {
                     return Err(SyncError::Store(
                         "source_meta_json must be a JSON object".into(),

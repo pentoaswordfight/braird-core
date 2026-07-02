@@ -748,14 +748,24 @@ fn native_authors_cover_and_source_metadata_to_the_server() {
     let sn = test_support::select(&env, &user.access_token, "notes", &format!("id=eq.{note}"));
     assert_eq!(sn[0]["source"], json!("readwise"));
     assert_eq!(sn[0]["source_id"], json!("rw-42"));
-    assert_eq!(sn[0]["source_meta"], json!({ "highlight_id": "h1" }), "jsonb object authored");
+    assert_eq!(
+        sn[0]["source_meta"],
+        json!({ "highlight_id": "h1" }),
+        "jsonb object authored"
+    );
     assert_eq!(sn[0]["chapter"], json!("On Anger"));
     assert_eq!(sn[0]["image_path"], json!("img/n.jpg"));
     assert_eq!(sn[0]["ink_crop_path"], json!("ink/n.jpg"));
     // Seal-at-write still holds on the wire: text is enc:v2 ciphertext, never plaintext.
     let text = sn[0]["text"].as_str().unwrap();
-    assert!(text.starts_with("enc:v2:"), "authored note text is ciphertext on the server");
-    assert!(!text.contains("a highlighted line"), "plaintext never left the device");
+    assert!(
+        text.starts_with("enc:v2:"),
+        "authored note text is ciphertext on the server"
+    );
+    assert!(
+        !text.contains("a highlighted line"),
+        "plaintext never left the device"
+    );
 
     let _ = std::fs::remove_file(&db);
 }

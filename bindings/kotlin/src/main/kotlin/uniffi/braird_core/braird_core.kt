@@ -1040,7 +1040,7 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_lens() != 60504.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_note() != 7341.toShort()) {
+    if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_note() != 38590.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_note_link() != 53465.toShort()) {
@@ -1531,10 +1531,12 @@ public interface SyncEngineInterface {
      * tag. Column NAMES mirror `upsertNote` in surfc `src/supabase.js` exactly.
      *
      * WIDENED (SUR-741). Carries the full authoring surface: `source`/`source_id`/`source_meta`/
-     * `chapter`/`image_path`/`ink_crop_path`. `source_meta_json` is a JSON **object** string
-     * (mirroring the `source_meta` jsonb column); it is parse-validated up front — invalid JSON or a
-     * non-object → `SyncError::Store` and **nothing is staged** (no seal, no write). None of the new
-     * fields touch the Vault — only `plaintext` is ever sealed.
+     * `chapter`/`image_path`/`ink_crop_path`. `source_meta_json` takes a serialized JSON **object**
+     * string for the `source_meta` jsonb column — the `…Json` suffix is the stated convention for any
+     * param that crosses the FFI as a serialized-JSON string (UniFFI has no jsonb type; the type
+     * alone can't say "this String is JSON, not a scalar"). It is parse-validated up front — invalid
+     * JSON or a non-object → `SyncError::Store` and **nothing is staged** (no seal, no write). None of
+     * the new fields touch the Vault — only `plaintext` is ever sealed.
      *
      * PARTIAL-PATCH SEMANTICS (SUR-741): every optional is `None` → column OMITTED (patch, never
      * clobbers a pulled-only column; see [`SyncEngine::enqueue_book`]). `source` is the one
@@ -1812,10 +1814,12 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
      * tag. Column NAMES mirror `upsertNote` in surfc `src/supabase.js` exactly.
      *
      * WIDENED (SUR-741). Carries the full authoring surface: `source`/`source_id`/`source_meta`/
-     * `chapter`/`image_path`/`ink_crop_path`. `source_meta_json` is a JSON **object** string
-     * (mirroring the `source_meta` jsonb column); it is parse-validated up front — invalid JSON or a
-     * non-object → `SyncError::Store` and **nothing is staged** (no seal, no write). None of the new
-     * fields touch the Vault — only `plaintext` is ever sealed.
+     * `chapter`/`image_path`/`ink_crop_path`. `source_meta_json` takes a serialized JSON **object**
+     * string for the `source_meta` jsonb column — the `…Json` suffix is the stated convention for any
+     * param that crosses the FFI as a serialized-JSON string (UniFFI has no jsonb type; the type
+     * alone can't say "this String is JSON, not a scalar"). It is parse-validated up front — invalid
+     * JSON or a non-object → `SyncError::Store` and **nothing is staged** (no seal, no write). None of
+     * the new fields touch the Vault — only `plaintext` is ever sealed.
      *
      * PARTIAL-PATCH SEMANTICS (SUR-741): every optional is `None` → column OMITTED (patch, never
      * clobbers a pulled-only column; see [`SyncEngine::enqueue_book`]). `source` is the one
