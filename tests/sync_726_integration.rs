@@ -82,6 +82,10 @@ fn enqueue_full_graph(dev: &SyncEngine, user_id: &str) -> Ids {
         book.clone(),
         "Apology".into(),
         Some("Plato".into()),
+        None,
+        None,
+        None,
+        None,
         TS,
         false,
     )
@@ -92,6 +96,12 @@ fn enqueue_full_graph(dev: &SyncEngine, user_id: &str) -> Ids {
         "first".into(),
         None,
         vec![],
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
         TS,
         false,
     )
@@ -102,6 +112,12 @@ fn enqueue_full_graph(dev: &SyncEngine, user_id: &str) -> Ids {
         "second".into(),
         None,
         vec![],
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
         TS,
         false,
     )
@@ -498,7 +514,21 @@ fn concurrent_membership_add_converges_to_one_row() {
     // A creates the parents (note + collection) so the membership FK is satisfiable, then flushes.
     let (device_a, db_a) = open_device(&env, &user, vault.clone(), "mem-a");
     device_a
-        .enqueue_note(note.clone(), None, "n".into(), None, vec![], TS, false)
+        .enqueue_note(
+            note.clone(),
+            None,
+            "n".into(),
+            None,
+            vec![],
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            TS,
+            false,
+        )
         .unwrap();
     device_a
         .enqueue_collection(collection.clone(), "C".into(), TS, false)
@@ -631,7 +661,17 @@ fn export_import_parity_every_column_roundtrips_and_partial_edit_preserves_colum
     // A PARTIAL local edit (rename the book — the FFI carries only id/title/author) + flush must NOT
     // null the untouched server columns (the upsert `merge-duplicates` patches only the sent fields).
     device
-        .enqueue_book(book.clone(), "Renamed".into(), Some("A".into()), TS, false)
+        .enqueue_book(
+            book.clone(),
+            "Renamed".into(),
+            Some("A".into()),
+            None,
+            None,
+            None,
+            None,
+            TS,
+            false,
+        )
         .expect("partial rename");
     device.flush().expect("flush partial edit");
     let server = test_support::select(&env, &user.access_token, "books", &format!("id=eq.{book}"));
@@ -645,6 +685,77 @@ fn export_import_parity_every_column_roundtrips_and_partial_edit_preserves_colum
         json!("https://cover"),
         "the untouched cover survived a partial edit (no null-out)"
     );
+
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+#[ignore = "needs a running local Supabase stack (CI `sync-integration` job, or a local `supabase start`)"]
+fn native_authors_cover_and_source_metadata_to_the_server() {
+    // SUR-741: the widened FFI can AUTHOR (not just preserve) the full column set. A native-created
+    // book-with-cover + note-with-source-metadata flushes and lands on the server with those columns
+    // populated — the capability the PWA had and native lacked before this ticket.
+    let Some(env) = test_support::env() else {
+        eprintln!("SUPABASE_URL unset — skipping the native-authoring integration test");
+        return;
+    };
+    let user = test_support::mint_test_user_jwt(&env);
+    let vault = Vault::generate();
+    let uid = &user.user_id;
+    let book = format!("auth-book-{uid}");
+    let note = format!("auth-note-{uid}");
+
+    let (device, db) = open_device(&env, &user, vault.clone(), "authoring");
+    device
+        .enqueue_book(
+            book.clone(),
+            "Meditations".into(),
+            Some("Aurelius".into()),
+            Some("978-0140449334".into()),
+            Some("https://cover".into()),
+            Some("openlibrary".into()),
+            Some(TS),
+            TS,
+            false,
+        )
+        .expect("author book with cover");
+    device
+        .enqueue_note(
+            note.clone(),
+            Some(book.clone()),
+            "a highlighted line".into(),
+            Some("12".into()),
+            vec!["stoicism".into()],
+            Some("readwise".into()),
+            Some("rw-42".into()),
+            Some(r#"{"highlight_id":"h1"}"#.into()),
+            Some("On Anger".into()),
+            Some("img/n.jpg".into()),
+            Some("ink/n.jpg".into()),
+            TS,
+            false,
+        )
+        .expect("author note with source metadata");
+    device.flush().expect("flush authored rows");
+
+    // The server carries the authored columns — native AUTHORED them, not just round-trip-preserved.
+    let sb = test_support::select(&env, &user.access_token, "books", &format!("id=eq.{book}"));
+    assert_eq!(sb[0]["isbn"], json!("978-0140449334"));
+    assert_eq!(sb[0]["cover_url"], json!("https://cover"));
+    assert_eq!(sb[0]["cover_source"], json!("openlibrary"));
+    assert_eq!(sb[0]["cover_resolved_at"], json!(TS));
+
+    let sn = test_support::select(&env, &user.access_token, "notes", &format!("id=eq.{note}"));
+    assert_eq!(sn[0]["source"], json!("readwise"));
+    assert_eq!(sn[0]["source_id"], json!("rw-42"));
+    assert_eq!(sn[0]["source_meta"], json!({ "highlight_id": "h1" }), "jsonb object authored");
+    assert_eq!(sn[0]["chapter"], json!("On Anger"));
+    assert_eq!(sn[0]["image_path"], json!("img/n.jpg"));
+    assert_eq!(sn[0]["ink_crop_path"], json!("ink/n.jpg"));
+    // Seal-at-write still holds on the wire: text is enc:v2 ciphertext, never plaintext.
+    let text = sn[0]["text"].as_str().unwrap();
+    assert!(text.starts_with("enc:v2:"), "authored note text is ciphertext on the server");
+    assert!(!text.contains("a highlighted line"), "plaintext never left the device");
 
     let _ = std::fs::remove_file(&db);
 }

@@ -541,9 +541,17 @@ public protocol SyncEngineProtocol : AnyObject {
     /**
      * Enqueue a book upsert. `updated_at` is stamped in epoch ms at enqueue (never omitted —
      * the migration default is 0). Plaintext metadata only, no encryption branch (like the PWA
-     * `upsertBook`).
+     * `upsertBook`). Column NAMES mirror `upsertBook` in surfc `src/supabase.js` exactly.
+     *
+     * PARTIAL-PATCH SEMANTICS (SUR-741). Every optional is `None` → the column is OMITTED from the
+     * payload, so the server upsert (`merge-duplicates`) and the local `stage_write` merge patch
+     * only the columns actually supplied — a `None` never clobbers a pulled-only column (e.g. a
+     * title-only rename keeps the server's cover). Consequence (founder decision, deferred to a
+     * 660/661 follow-up): native cannot yet *clear* a field to NULL — `None` means "leave it",
+     * `Some(v)` means "set it to v" (incl. `Some("")`). Tri-state (absent | null | value) over
+     * UniFFI is awkward and out of scope here.
      */
-    func enqueueBook(id: String, title: String, author: String?, createdAt: Int64, deleted: Bool) throws 
+    func enqueueBook(id: String, title: String, author: String?, isbn: String?, coverUrl: String?, coverSource: String?, coverResolvedAt: Int64?, createdAt: Int64, deleted: Bool) throws 
     
     /**
      * Enqueue a collection upsert (SUR-726). Plaintext metadata only.
@@ -573,9 +581,20 @@ public protocol SyncEngineProtocol : AnyObject {
     func enqueueLens(id: String, name: String, leafIds: [String], combinator: String?, threshold: Int64?, createdAt: Int64, deleted: Bool) throws 
     
     /**
-     * Enqueue a note upsert — the seal-at-write path. `text` is the PLAINTEXT; it is sealed here
-     * (enc:v2, AAD = note id) and `content_tag` is computed here FROM the plaintext (both while
-     * the plaintext is in hand). The stored outbox payload holds only the ciphertext + the tag.
+     * Enqueue a note upsert — the seal-at-write path. `plaintext` is the note text; it is sealed
+     * here (enc:v2, AAD = note id) and `content_tag` is computed here FROM the plaintext (both
+     * while the plaintext is in hand). The stored outbox payload holds only the ciphertext + the
+     * tag. Column NAMES mirror `upsertNote` in surfc `src/supabase.js` exactly.
+     *
+     * WIDENED (SUR-741). Carries the full authoring surface: `source`/`source_id`/`source_meta`/
+     * `chapter`/`image_path`/`ink_crop_path`. `source_meta_json` is a JSON **object** string
+     * (mirroring the `source_meta` jsonb column); it is parse-validated up front — invalid JSON or a
+     * non-object → `SyncError::Store` and **nothing is staged** (no seal, no write). None of the new
+     * fields touch the Vault — only `plaintext` is ever sealed.
+     *
+     * PARTIAL-PATCH SEMANTICS (SUR-741): every optional is `None` → column OMITTED (patch, never
+     * clobbers a pulled-only column; see [`SyncEngine::enqueue_book`]). `source` is the one
+     * exception — `None` → `"manual"` (the PWA's `|| 'manual'` / the prior hardcode), always sent.
      *
      * STALE-TAG EDGE (deliberate, mirrors surfc — do not "fix"): the content_tag bakes in the
      * note's `book_id`, but the flush repoints `book_id` via `bookIdRemap` after an offline
@@ -585,7 +604,7 @@ public protocol SyncEngineProtocol : AnyObject {
      * stale-tag-after-offline-merge self-heals on the note's next edit (which re-enqueues with a
      * freshly-computed tag). The tag is never NULL because it is computed pre-seal, from plaintext.
      */
-    func enqueueNote(id: String, bookId: String?, plaintext: String, page: String?, tags: [String], createdAt: Int64, deleted: Bool) throws 
+    func enqueueNote(id: String, bookId: String?, plaintext: String, page: String?, tags: [String], source: String?, sourceId: String?, sourceMetaJson: String?, chapter: String?, imagePath: String?, inkCropPath: String?, createdAt: Int64, deleted: Bool) throws 
     
     /**
      * Enqueue a note-link upsert (SUR-726) — a parent→child annotation edge. Plaintext only;
@@ -737,13 +756,25 @@ public static func `open`(dbPath: String, supabaseUrl: String, anonKey: String, 
     /**
      * Enqueue a book upsert. `updated_at` is stamped in epoch ms at enqueue (never omitted —
      * the migration default is 0). Plaintext metadata only, no encryption branch (like the PWA
-     * `upsertBook`).
+     * `upsertBook`). Column NAMES mirror `upsertBook` in surfc `src/supabase.js` exactly.
+     *
+     * PARTIAL-PATCH SEMANTICS (SUR-741). Every optional is `None` → the column is OMITTED from the
+     * payload, so the server upsert (`merge-duplicates`) and the local `stage_write` merge patch
+     * only the columns actually supplied — a `None` never clobbers a pulled-only column (e.g. a
+     * title-only rename keeps the server's cover). Consequence (founder decision, deferred to a
+     * 660/661 follow-up): native cannot yet *clear* a field to NULL — `None` means "leave it",
+     * `Some(v)` means "set it to v" (incl. `Some("")`). Tri-state (absent | null | value) over
+     * UniFFI is awkward and out of scope here.
      */
-open func enqueueBook(id: String, title: String, author: String?, createdAt: Int64, deleted: Bool)throws  {try rustCallWithError(FfiConverterTypeSyncError.lift) {
+open func enqueueBook(id: String, title: String, author: String?, isbn: String?, coverUrl: String?, coverSource: String?, coverResolvedAt: Int64?, createdAt: Int64, deleted: Bool)throws  {try rustCallWithError(FfiConverterTypeSyncError.lift) {
     uniffi_braird_core_fn_method_syncengine_enqueue_book(self.uniffiClonePointer(),
         FfiConverterString.lower(id),
         FfiConverterString.lower(title),
         FfiConverterOptionString.lower(author),
+        FfiConverterOptionString.lower(isbn),
+        FfiConverterOptionString.lower(coverUrl),
+        FfiConverterOptionString.lower(coverSource),
+        FfiConverterOptionInt64.lower(coverResolvedAt),
         FfiConverterInt64.lower(createdAt),
         FfiConverterBool.lower(deleted),$0
     )
@@ -814,9 +845,20 @@ open func enqueueLens(id: String, name: String, leafIds: [String], combinator: S
 }
     
     /**
-     * Enqueue a note upsert — the seal-at-write path. `text` is the PLAINTEXT; it is sealed here
-     * (enc:v2, AAD = note id) and `content_tag` is computed here FROM the plaintext (both while
-     * the plaintext is in hand). The stored outbox payload holds only the ciphertext + the tag.
+     * Enqueue a note upsert — the seal-at-write path. `plaintext` is the note text; it is sealed
+     * here (enc:v2, AAD = note id) and `content_tag` is computed here FROM the plaintext (both
+     * while the plaintext is in hand). The stored outbox payload holds only the ciphertext + the
+     * tag. Column NAMES mirror `upsertNote` in surfc `src/supabase.js` exactly.
+     *
+     * WIDENED (SUR-741). Carries the full authoring surface: `source`/`source_id`/`source_meta`/
+     * `chapter`/`image_path`/`ink_crop_path`. `source_meta_json` is a JSON **object** string
+     * (mirroring the `source_meta` jsonb column); it is parse-validated up front — invalid JSON or a
+     * non-object → `SyncError::Store` and **nothing is staged** (no seal, no write). None of the new
+     * fields touch the Vault — only `plaintext` is ever sealed.
+     *
+     * PARTIAL-PATCH SEMANTICS (SUR-741): every optional is `None` → column OMITTED (patch, never
+     * clobbers a pulled-only column; see [`SyncEngine::enqueue_book`]). `source` is the one
+     * exception — `None` → `"manual"` (the PWA's `|| 'manual'` / the prior hardcode), always sent.
      *
      * STALE-TAG EDGE (deliberate, mirrors surfc — do not "fix"): the content_tag bakes in the
      * note's `book_id`, but the flush repoints `book_id` via `bookIdRemap` after an offline
@@ -826,13 +868,19 @@ open func enqueueLens(id: String, name: String, leafIds: [String], combinator: S
      * stale-tag-after-offline-merge self-heals on the note's next edit (which re-enqueues with a
      * freshly-computed tag). The tag is never NULL because it is computed pre-seal, from plaintext.
      */
-open func enqueueNote(id: String, bookId: String?, plaintext: String, page: String?, tags: [String], createdAt: Int64, deleted: Bool)throws  {try rustCallWithError(FfiConverterTypeSyncError.lift) {
+open func enqueueNote(id: String, bookId: String?, plaintext: String, page: String?, tags: [String], source: String?, sourceId: String?, sourceMetaJson: String?, chapter: String?, imagePath: String?, inkCropPath: String?, createdAt: Int64, deleted: Bool)throws  {try rustCallWithError(FfiConverterTypeSyncError.lift) {
     uniffi_braird_core_fn_method_syncengine_enqueue_note(self.uniffiClonePointer(),
         FfiConverterString.lower(id),
         FfiConverterOptionString.lower(bookId),
         FfiConverterString.lower(plaintext),
         FfiConverterOptionString.lower(page),
         FfiConverterSequenceString.lower(tags),
+        FfiConverterOptionString.lower(source),
+        FfiConverterOptionString.lower(sourceId),
+        FfiConverterOptionString.lower(sourceMetaJson),
+        FfiConverterOptionString.lower(chapter),
+        FfiConverterOptionString.lower(imagePath),
+        FfiConverterOptionString.lower(inkCropPath),
         FfiConverterInt64.lower(createdAt),
         FfiConverterBool.lower(deleted),$0
     )
@@ -1955,7 +2003,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_braird_core_checksum_func_membership_id() != 9610) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_braird_core_checksum_method_syncengine_enqueue_book() != 22816) {
+    if (uniffi_braird_core_checksum_method_syncengine_enqueue_book() != 63811) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_enqueue_collection() != 43786) {
@@ -1970,7 +2018,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_braird_core_checksum_method_syncengine_enqueue_lens() != 60504) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_braird_core_checksum_method_syncengine_enqueue_note() != 25351) {
+    if (uniffi_braird_core_checksum_method_syncengine_enqueue_note() != 7341) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_enqueue_note_link() != 53465) {

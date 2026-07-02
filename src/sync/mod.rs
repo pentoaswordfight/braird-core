@@ -139,12 +139,25 @@ impl SyncEngine {
 
     /// Enqueue a book upsert. `updated_at` is stamped in epoch ms at enqueue (never omitted —
     /// the migration default is 0). Plaintext metadata only, no encryption branch (like the PWA
-    /// `upsertBook`).
+    /// `upsertBook`). Column NAMES mirror `upsertBook` in surfc `src/supabase.js` exactly.
+    ///
+    /// PARTIAL-PATCH SEMANTICS (SUR-741). Every optional is `None` → the column is OMITTED from the
+    /// payload, so the server upsert (`merge-duplicates`) and the local `stage_write` merge patch
+    /// only the columns actually supplied — a `None` never clobbers a pulled-only column (e.g. a
+    /// title-only rename keeps the server's cover). Consequence (founder decision, deferred to a
+    /// 660/661 follow-up): native cannot yet *clear* a field to NULL — `None` means "leave it",
+    /// `Some(v)` means "set it to v" (incl. `Some("")`). Tri-state (absent | null | value) over
+    /// UniFFI is awkward and out of scope here.
+    #[allow(clippy::too_many_arguments)]
     pub fn enqueue_book(
         &self,
         id: String,
         title: String,
         author: Option<String>,
+        isbn: Option<String>,
+        cover_url: Option<String>,
+        cover_source: Option<String>,
+        cover_resolved_at: Option<i64>,
         created_at: i64,
         deleted: bool,
     ) -> Result<(), SyncError> {
@@ -152,16 +165,31 @@ impl SyncEngine {
         let mut row = Map::new();
         row.insert("id".into(), json!(id));
         row.insert("title".into(), json!(title));
-        row.insert("author".into(), json!(author.unwrap_or_default()));
+        insert_opt(&mut row, "author", author);
+        insert_opt(&mut row, "isbn", isbn);
+        insert_opt(&mut row, "cover_url", cover_url);
+        insert_opt(&mut row, "cover_source", cover_source);
+        insert_opt(&mut row, "cover_resolved_at", cover_resolved_at);
         row.insert("created_at".into(), json!(created_at));
         row.insert("updated_at".into(), json!(now));
         row.insert("deleted".into(), json!(deleted));
         self.stage_write("books", &id, row)
     }
 
-    /// Enqueue a note upsert — the seal-at-write path. `text` is the PLAINTEXT; it is sealed here
-    /// (enc:v2, AAD = note id) and `content_tag` is computed here FROM the plaintext (both while
-    /// the plaintext is in hand). The stored outbox payload holds only the ciphertext + the tag.
+    /// Enqueue a note upsert — the seal-at-write path. `plaintext` is the note text; it is sealed
+    /// here (enc:v2, AAD = note id) and `content_tag` is computed here FROM the plaintext (both
+    /// while the plaintext is in hand). The stored outbox payload holds only the ciphertext + the
+    /// tag. Column NAMES mirror `upsertNote` in surfc `src/supabase.js` exactly.
+    ///
+    /// WIDENED (SUR-741). Carries the full authoring surface: `source`/`source_id`/`source_meta`/
+    /// `chapter`/`image_path`/`ink_crop_path`. `source_meta_json` is a JSON **object** string
+    /// (mirroring the `source_meta` jsonb column); it is parse-validated up front — invalid JSON or a
+    /// non-object → `SyncError::Store` and **nothing is staged** (no seal, no write). None of the new
+    /// fields touch the Vault — only `plaintext` is ever sealed.
+    ///
+    /// PARTIAL-PATCH SEMANTICS (SUR-741): every optional is `None` → column OMITTED (patch, never
+    /// clobbers a pulled-only column; see [`SyncEngine::enqueue_book`]). `source` is the one
+    /// exception — `None` → `"manual"` (the PWA's `|| 'manual'` / the prior hardcode), always sent.
     ///
     /// STALE-TAG EDGE (deliberate, mirrors surfc — do not "fix"): the content_tag bakes in the
     /// note's `book_id`, but the flush repoints `book_id` via `bookIdRemap` after an offline
@@ -178,9 +206,31 @@ impl SyncEngine {
         plaintext: String,
         page: Option<String>,
         tags: Vec<String>,
+        source: Option<String>,
+        source_id: Option<String>,
+        source_meta_json: Option<String>,
+        chapter: Option<String>,
+        image_path: Option<String>,
+        ink_crop_path: Option<String>,
         created_at: i64,
         deleted: bool,
     ) -> Result<(), SyncError> {
+        // Validate source_meta_json BEFORE any seal/stage — a bad payload stages nothing.
+        let source_meta = match source_meta_json {
+            None => None,
+            Some(s) => {
+                let v: Value = serde_json::from_str(&s).map_err(|e| {
+                    SyncError::Store(format!("source_meta_json is not valid JSON: {e}"))
+                })?;
+                if !v.is_object() {
+                    return Err(SyncError::Store(
+                        "source_meta_json must be a JSON object".into(),
+                    ));
+                }
+                Some(v)
+            }
+        };
+
         let now = epoch_ms();
         // Seal-at-write: enc:v2 ciphertext (AAD = note id) + the tag from PLAINTEXT.
         let ciphertext = self.vault.encrypt_note(Some(id.clone()), plaintext.clone());
@@ -188,11 +238,22 @@ impl SyncEngine {
 
         let mut row = Map::new();
         row.insert("id".into(), json!(id));
-        row.insert("book_id".into(), json!(book_id));
+        insert_opt(&mut row, "book_id", book_id);
         row.insert("text".into(), json!(ciphertext)); // ciphertext, never plaintext
-        row.insert("page".into(), json!(page.unwrap_or_default()));
+        insert_opt(&mut row, "page", page);
         row.insert("tags".into(), json!(tags));
-        row.insert("source".into(), json!("manual"));
+        // source is the one always-sent optional: None → "manual" (PWA's `|| 'manual'`).
+        row.insert(
+            "source".into(),
+            json!(source.unwrap_or_else(|| "manual".into())),
+        );
+        insert_opt(&mut row, "source_id", source_id);
+        if let Some(v) = source_meta {
+            row.insert("source_meta".into(), v);
+        }
+        insert_opt(&mut row, "chapter", chapter);
+        insert_opt(&mut row, "image_path", image_path);
+        insert_opt(&mut row, "ink_crop_path", ink_crop_path);
         row.insert("content_tag".into(), json!(content_tag));
         row.insert("created_at".into(), json!(created_at));
         row.insert("updated_at".into(), json!(now));
@@ -527,6 +588,16 @@ pub fn membership_id(collection_id: String, note_id: String) -> String {
     crate::store::membership_id(&collection_id, &note_id)
 }
 
+/// Insert `key` into an outbox payload only when `Some` — the SUR-741 partial-patch rule: an
+/// absent optional is OMITTED (so the server `merge-duplicates` upsert + the local merge patch
+/// only supplied columns), never emitted as an explicit `null` that would clobber a pulled-only
+/// column. `Some(v)` sets the column to `v` (incl. `Some("")`).
+fn insert_opt<T: Into<Value>>(row: &mut Map<String, Value>, key: &str, val: Option<T>) {
+    if let Some(v) = val {
+        row.insert(key.to_string(), v.into());
+    }
+}
+
 /// Epoch milliseconds — the PWA `Date.now()` unit the cloud data is stamped in. `SystemTime`
 /// before the epoch is impossible on a sane clock; clamp to 0 rather than panic.
 fn epoch_ms() -> i64 {
@@ -563,6 +634,12 @@ mod tests {
                 "the secret plaintext".into(),
                 None,
                 vec![],
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
                 0,
                 false,
             )
@@ -611,6 +688,12 @@ mod tests {
                 "the secret plaintext".into(),
                 Some("5".into()),
                 vec!["philosophy".into()],
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
                 0,
                 false,
             )
@@ -670,7 +753,17 @@ mod tests {
         )
         .unwrap();
         engine
-            .enqueue_book("b1".into(), "New Title".into(), Some("A".into()), 1, false)
+            .enqueue_book(
+                "b1".into(),
+                "New Title".into(),
+                Some("A".into()),
+                None,
+                None,
+                None,
+                None,
+                1,
+                false,
+            )
             .unwrap();
 
         let store = Store::open(db_path).unwrap();
@@ -680,6 +773,287 @@ mod tests {
             row["cover_url"],
             json!("https://cover"),
             "cover survives a partial edit (merge, not full-replace)"
+        );
+    }
+
+    // ── SUR-741: widened enqueue_book / enqueue_note authoring surface ──────────
+
+    fn outbox_payload(db_path: &str, idx: usize) -> Value {
+        let rows = Store::open(db_path).unwrap().outbox_items().unwrap();
+        serde_json::from_str(&rows[idx].3).unwrap()
+    }
+
+    #[test]
+    fn enqueue_book_authors_cover_fields_when_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        engine_at(db_path)
+            .enqueue_book(
+                "b1".into(),
+                "Meditations".into(),
+                Some("Aurelius".into()),
+                Some("978-0140449334".into()),
+                Some("https://cover".into()),
+                Some("openlibrary".into()),
+                Some(1_700_000_000_000),
+                1,
+                false,
+            )
+            .unwrap();
+        let row = Store::open(db_path)
+            .unwrap()
+            .get_row("books", "b1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row["isbn"], json!("978-0140449334"));
+        assert_eq!(row["cover_url"], json!("https://cover"));
+        assert_eq!(row["cover_source"], json!("openlibrary"));
+        assert_eq!(row["cover_resolved_at"], json!(1_700_000_000_000_i64));
+        // the outbox payload carries the cover too — native can now AUTHOR it, not just preserve it.
+        assert_eq!(
+            outbox_payload(db_path, 0)["cover_url"],
+            json!("https://cover")
+        );
+    }
+
+    #[test]
+    fn enqueue_book_omits_absent_optionals() {
+        // None → key OMITTED (patch), never an explicit null that would clobber a server column.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        engine_at(db_path)
+            .enqueue_book(
+                "b1".into(),
+                "T".into(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                1,
+                false,
+            )
+            .unwrap();
+        let p = outbox_payload(db_path, 0);
+        let obj = p.as_object().unwrap();
+        for k in [
+            "author",
+            "isbn",
+            "cover_url",
+            "cover_source",
+            "cover_resolved_at",
+        ] {
+            assert!(!obj.contains_key(k), "{k} must be omitted when None");
+        }
+        assert_eq!(p["title"], json!("T"));
+    }
+
+    #[test]
+    fn enqueue_note_authors_widened_fields_and_parses_source_meta() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        engine_at(db_path)
+            .enqueue_note(
+                "n1".into(),
+                Some("b1".into()),
+                "highlighted line".into(),
+                Some("12".into()),
+                vec!["stoicism".into()],
+                Some("readwise".into()),
+                Some("rw-42".into()),
+                Some(r#"{"highlight_id":"h1","location":42}"#.into()),
+                Some("On Anger".into()),
+                Some("images/n1.jpg".into()),
+                Some("images/n1-ink.jpg".into()),
+                7,
+                false,
+            )
+            .unwrap();
+        let p = outbox_payload(db_path, 0);
+        assert_eq!(p["source"], json!("readwise"));
+        assert_eq!(p["source_id"], json!("rw-42"));
+        assert_eq!(p["chapter"], json!("On Anger"));
+        assert_eq!(p["image_path"], json!("images/n1.jpg"));
+        assert_eq!(p["ink_crop_path"], json!("images/n1-ink.jpg"));
+        // source_meta_json is parsed into a JSON OBJECT stored under the `source_meta` column
+        // (mirrors the PWA's jsonb column name, not the FFI param name).
+        assert!(p["source_meta"].is_object());
+        assert_eq!(p["source_meta"]["highlight_id"], json!("h1"));
+        assert_eq!(p["source_meta"]["location"], json!(42));
+        // Seal-at-write invariants STILL hold on the widened path: text sealed, tag present.
+        let text = p["text"].as_str().unwrap();
+        assert!(text.starts_with("enc:v2:"), "text is enc:v2 ciphertext");
+        assert!(
+            !text.contains("highlighted line"),
+            "plaintext never reaches the outbox"
+        );
+        assert!(p["content_tag"].as_str().is_some_and(|t| !t.is_empty()));
+    }
+
+    #[test]
+    fn enqueue_note_source_none_defaults_to_manual_and_omits_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        engine_at(db_path)
+            .enqueue_note(
+                "n1".into(),
+                None,
+                "x".into(),
+                None,
+                vec![],
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                0,
+                false,
+            )
+            .unwrap();
+        let p = outbox_payload(db_path, 0);
+        // source is the one always-sent optional (the PWA's `|| 'manual'` / the prior hardcode).
+        assert_eq!(p["source"], json!("manual"));
+        let obj = p.as_object().unwrap();
+        for k in [
+            "book_id",
+            "page",
+            "source_id",
+            "source_meta",
+            "chapter",
+            "image_path",
+            "ink_crop_path",
+        ] {
+            assert!(!obj.contains_key(k), "{k} must be omitted when None");
+        }
+    }
+
+    #[test]
+    fn enqueue_note_invalid_source_meta_json_is_rejected_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        // (a) not JSON at all, and (b) valid JSON but NOT an object — both rejected.
+        assert!(
+            engine
+                .enqueue_note(
+                    "n1".into(),
+                    None,
+                    "x".into(),
+                    None,
+                    vec![],
+                    None,
+                    None,
+                    Some("not json".into()),
+                    None,
+                    None,
+                    None,
+                    0,
+                    false,
+                )
+                .is_err(),
+            "invalid JSON rejected"
+        );
+        assert!(
+            engine
+                .enqueue_note(
+                    "n2".into(),
+                    None,
+                    "x".into(),
+                    None,
+                    vec![],
+                    None,
+                    None,
+                    Some("[1,2,3]".into()),
+                    None,
+                    None,
+                    None,
+                    0,
+                    false,
+                )
+                .is_err(),
+            "non-object JSON rejected"
+        );
+        // Atomic: the reject happens BEFORE any seal/stage — nothing queued, no local rows.
+        let store = Store::open(db_path).unwrap();
+        assert_eq!(store.outbox_items().unwrap().len(), 0, "nothing queued");
+        assert!(
+            store.get_row("notes", "n1").unwrap().is_none(),
+            "no local row for n1"
+        );
+        assert!(
+            store.get_row("notes", "n2").unwrap().is_none(),
+            "no local row for n2"
+        );
+    }
+
+    #[test]
+    fn enqueue_note_edit_preserves_omitted_columns_but_resets_always_sent_source() {
+        // The note analogue of enqueue_book_edit_preserves_pulled_only_columns: a text-only edit
+        // OMITS image_path/source_id/chapter (None→omit) so they survive the merge; `source` is the
+        // deliberate always-sent exception, so a source-less edit resets it to "manual".
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        {
+            let store = Store::open(db_path).unwrap();
+            store
+                .apply_row(
+                    "notes",
+                    json!({
+                        "id": "n1", "book_id": "b1", "text": "enc:v2:seed", "page": "1",
+                        "tags": [], "image_path": "images/keep.jpg", "ink_crop_path": null,
+                        "source": "readwise", "source_id": "rw-1", "source_meta": {"k": "v"},
+                        "chapter": "C", "content_tag": "tag", "created_at": 1, "updated_at": 1,
+                        "deleted": false
+                    })
+                    .as_object()
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        engine_at(db_path)
+            .enqueue_note(
+                "n1".into(),
+                Some("b1".into()),
+                "edited text".into(),
+                None,
+                vec![],
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                2,
+                false,
+            )
+            .unwrap();
+        let row = Store::open(db_path)
+            .unwrap()
+            .get_row("notes", "n1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row["image_path"],
+            json!("images/keep.jpg"),
+            "image_path (None→omit) survives"
+        );
+        assert_eq!(
+            row["source_id"],
+            json!("rw-1"),
+            "source_id (None→omit) survives"
+        );
+        assert_eq!(row["chapter"], json!("C"), "chapter (None→omit) survives");
+        assert_eq!(
+            row["source"],
+            json!("manual"),
+            "source is always sent (None→manual) — a source-less edit resets it (host must pass it)"
         );
     }
 
@@ -701,7 +1075,17 @@ mod tests {
         )
         .unwrap();
         engine
-            .enqueue_book("b1".into(), "T".into(), None, 0, false)
+            .enqueue_book(
+                "b1".into(),
+                "T".into(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                0,
+                false,
+            )
             .unwrap();
 
         assert!(

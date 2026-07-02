@@ -7,6 +7,8 @@ import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Test
 import uniffi.braird_core.CryptoException
+import uniffi.braird_core.SyncEngine
+import uniffi.braird_core.SyncException
 import uniffi.braird_core.Vault
 import uniffi.braird_core.WrappedBlob
 
@@ -83,5 +85,45 @@ class RoundTripTest {
 
         val sealed = vault.sealBytes(byteArrayOf(1, 2, 3, 4), "note-1")
         assertEquals(listOf<Byte>(1, 2, 3, 4), vault.openBytes(sealed, "note-1").toList())
+    }
+
+    /** SUR-741: the widened enqueue surface crosses the FFI, and source_meta_json validation
+     * (which runs in Rust) surfaces as a thrown SyncException on the Kotlin side. */
+    @Test
+    fun enqueueNoteWidenedFieldsOverFfi() {
+        val db = File.createTempFile("braird-rt", ".sqlite").apply { deleteOnExit() }
+        val engine = SyncEngine.open(db.absolutePath, "https://x.supabase.co", "anon", Vault.generate())
+        engine.enqueueNote(
+            id = "n1",
+            bookId = "b1",
+            plaintext = "secret",
+            page = "5",
+            tags = listOf("philosophy"),
+            source = "readwise",
+            sourceId = "rw-1",
+            sourceMetaJson = "{\"highlight_id\":\"h1\"}",
+            chapter = "1",
+            imagePath = "img/1.jpg",
+            inkCropPath = null,
+            createdAt = 0L,
+            deleted = false,
+        )
+        assertThrows(SyncException::class.java) {
+            engine.enqueueNote(
+                id = "n2",
+                bookId = null,
+                plaintext = "x",
+                page = null,
+                tags = emptyList(),
+                source = null,
+                sourceId = null,
+                sourceMetaJson = "not json",
+                chapter = null,
+                imagePath = null,
+                inkCropPath = null,
+                createdAt = 0L,
+                deleted = false,
+            )
+        }
     }
 }

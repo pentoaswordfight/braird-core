@@ -17,17 +17,13 @@
 //!     delayed/offline flush's `change_seq` is allocated at flush time (high), so it's delivered on
 //!     the next pull instead of skipped by a client-clock cursor. Absent cursor → 0 → full re-pull.
 //!
-//!     **Residual — `change_seq` is allocation-ordered, not commit-ordered (SUR-743).** The
-//!     exclusive keyset is only skip-safe if `change_seq` is assigned in COMMIT order, but 0051's bare
-//!     per-table `nextval` is allocated at *statement* time. Under concurrent flushes a lower value
-//!     can commit AFTER the cursor passed a higher one (T1 allocates 100 and stays open; T2 allocates
-//!     101 and commits; a pull advances to 101; T1 then commits 100 → `> 101` skips it until a full
-//!     re-pull). Uniqueness does NOT make a sequence a commit-ordered watermark — this is a real
-//!     concurrent-flush convergence gap, shared with the merged PWA leg. The durable fix is
-//!     **server-side and trigger-only** (a per-user lock-serialized counter, so allocation order ==
-//!     commit order per user) and needs **no change here** — the client consumes a commit-ordered
-//!     watermark correctly by construction. Until it lands, a row skipped this way recovers on the
-//!     next full re-pull (cursor reset to 0).
+//!     **Commit-ordered as of SUR-743.** `change_seq` is assigned in COMMIT order per user: surfc
+//!     migration 0052 replaced 0051's per-table `nextval` (allocated at *statement* time) with a
+//!     per-user lock-serialized counter, so a lower value can no longer commit AFTER the cursor
+//!     passed a higher one (the old T1-allocates-100-stays-open / T2-allocates-101-commits skip).
+//!     The exclusive keyset is therefore skip-safe by construction. The fix was **server-side and
+//!     trigger-only** — the client already consumed a commit-ordered watermark correctly, so no
+//!     change was needed here.
 //!   - **Fetch is paginated** (SUR-652): one page of `PULL_PAGE_LIMIT` rows at a time, ordered by
 //!     `change_seq` asc, advancing the cursor per page (a consistent prefix — a mid-pull failure
 //!     resumes from the last merged page, never re-pulling merged rows or skipping unpulled ones),

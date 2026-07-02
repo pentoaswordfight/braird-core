@@ -88,4 +88,23 @@ final class RoundTripTests: XCTestCase {
         let sealed = vault.sealBytes(bytes: Data([1, 2, 3, 4]), aad: "note-1")
         XCTAssertEqual(try vault.openBytes(sealed: sealed, aad: "note-1"), Data([1, 2, 3, 4]))
     }
+
+    /// SUR-741: the widened enqueue surface crosses the FFI, and source_meta_json validation
+    /// (which runs in Rust) surfaces as a thrown error on the Swift side.
+    func testEnqueueNoteWidenedFieldsOverFfi() throws {
+        let db = FileManager.default.temporaryDirectory
+            .appendingPathComponent("braird-rt-\(UUID().uuidString).sqlite")
+        let engine = try SyncEngine.open(
+            dbPath: db.path, supabaseUrl: "https://x.supabase.co", anonKey: "anon",
+            vault: Vault.generate())
+        try engine.enqueueNote(
+            id: "n1", bookId: "b1", plaintext: "secret", page: "5", tags: ["philosophy"],
+            source: "readwise", sourceId: "rw-1", sourceMetaJson: "{\"highlight_id\":\"h1\"}",
+            chapter: "1", imagePath: "img/1.jpg", inkCropPath: nil, createdAt: 0, deleted: false)
+        XCTAssertThrowsError(
+            try engine.enqueueNote(
+                id: "n2", bookId: nil, plaintext: "x", page: nil, tags: [],
+                source: nil, sourceId: nil, sourceMetaJson: "not json", chapter: nil,
+                imagePath: nil, inkCropPath: nil, createdAt: 0, deleted: false))
+    }
 }

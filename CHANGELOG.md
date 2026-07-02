@@ -43,6 +43,29 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
     server columns). Unit coverage: per-table pull/LWW/rebase on the `note_id` pk, enqueue wire shapes,
     `membership_id` parity vectors, and topo/hold-back flush ordering.
 
+### Changed
+- **Widened `enqueue_book` / `enqueue_note` to the full authoring surface (SUR-741).** `enqueue_book`
+  now carries `isbn` / `cover_url` / `cover_source` / `cover_resolved_at`; `enqueue_note` now carries
+  `source` / `source_id` / `source_meta_json` / `chapter` / `image_path` / `ink_crop_path` — columns
+  already in `synced_schema()` but previously unauthorable from native (only round-trip-preserved).
+  **Breaking signature change, widened in place** (no shipped native hosts; an additive `_v2` path
+  would double the surface for no consumer). Partial-patch semantics: an absent optional is **omitted**
+  from the payload — never an explicit null that would clobber a pulled-only column (the
+  `enqueue_book_edit_preserves_pulled_only_columns` contract) — so native still can't *clear* a field
+  to NULL (tri-state deferred to a 660/661 follow-up, noted in the method docs). `source` is the one
+  always-sent optional (`None` → `"manual"`, the PWA's `|| 'manual'` / prior hardcode).
+  `source_meta_json` is a JSON **object** string, parse-validated at enqueue — invalid JSON / non-object
+  → `SyncError::Store`, nothing staged. Column names mirror surfc `upsertBook` / `upsertNote` exactly,
+  so no payload key falls outside `synced_schema()`. Seal-at-write unchanged: only `plaintext` is
+  sealed (enc:v2, AAD = note id) + `content_tag` from plaintext; the new fields never touch the
+  `Vault`. Bindings regenerated via `scripts/gen-bindings.sh` (the SUR-742 `bindings-drift` guard
+  verifies); Kotlin + Swift round-trip tests exercise a widened method incl. the invalid-JSON
+  rejection. New binding surface → `touches-ffi`. Gate: `sync-reviewer` + `crypto-reviewer` +
+  `naming-reviewer`.
+- **Removed the stale SUR-743 allocation-order caveats** from `src/sync/http.rs` (`get_page` doc) and
+  `src/sync/pull.rs` (module doc) — they described a hole surfc 0052 (SUR-743) closed; both now note
+  the watermark is commit-ordered.
+
 ### Fixed
 - **Pull now tracks the server `change_seq` watermark + paginates (SUR-739 + SUR-652 core leg).** The
   incremental-pull cursor is keyed on the server-assigned monotonic `change_seq` (surfc migration 0051
@@ -64,13 +87,12 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
     rows the old cursor historically skipped) and deleted on the first pull. Tests: keyset paging
     across boundaries, cursor-not-advanced on mid-page failure, legacy-key migration, full-page-missing
     -change_seq guard; the env-guarded coexistence matrix re-proves both directions against live 0051.
-  - **Known residual (SUR-739 follow-up).** `change_seq` (0051's bare per-table `nextval`) is
-    *allocation*-ordered, not *commit*-ordered: under concurrent flushes a lower value that commits
-    after the cursor passed a higher one is skipped until a full re-pull. Uniqueness ≠ commit-order.
-    The durable fix is server-side and trigger-only (a per-user lock-serialized counter, so allocation
-    order == commit order per user) — **no client change** (the client already consumes a commit-ordered
-    watermark correctly). The merged PWA leg shares the exposure; tracked as SUR-743 (a narrow
-    SUR-739 follow-up migration).
+  - **Commit-ordered as of SUR-743 (was a known residual).** `change_seq` is now assigned in COMMIT
+    order per user — surfc migration 0052 replaced 0051's per-table `nextval` with a per-user
+    lock-serialized counter — so the exclusive keyset is skip-safe by construction: the concurrent-flush
+    skip (a lower value committing after the cursor passed a higher one) is closed. Server-side +
+    trigger-only; **no client change** (the client already consumed a commit-ordered watermark
+    correctly). The stale allocation-order caveats in `http.rs` / `pull.rs` were removed with SUR-741.
 - **Flush no longer wedges a queued row in a non-`books`/`notes` table (SUR-726).** The pre-fan-out
   flush dispatched only `books`/`notes` groups, so a queued row in any other synced table was neither
   sent nor failed — it sat in the outbox forever. The single topo-ordered dispatch pass sends every
