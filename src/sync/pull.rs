@@ -9,19 +9,25 @@
 //!     VERBATIM — never decrypted here (the inverse of push's seal-at-write). The host decrypts on
 //!     demand via `Vault::decrypt_note`. Writing plaintext to SQLite would defeat E2EE.
 //!   - **The cursor is the server `change_seq` watermark**, not a client clock. `change_seq` is
-//!     stamped from a per-table Postgres **sequence** (`nextval` on `<table>_change_seq_seq`, surfc
-//!     migration 0051 / trigger `t02_change_seq`) when the server makes a row visible — distinct from
-//!     the client-authored `updated_at` used for LWW. A sequence value is **strictly-increasing AND
-//!     unique** per table (never handed out twice, even under concurrency). The cursor advances to the
-//!     max `change_seq` seen, read from the **raw** incoming row BEFORE `apply_row` projects it away
-//!     (`change_seq` is server-only, not a local descriptor column). Because each value is UNIQUE, the
-//!     **exclusive** `change_seq > cursor` keyset is exact — the cursor lands on a page's max value and
-//!     no other row shares it, so there is no boundary tie to skip on the next `gt` fetch (the classic
-//!     keyset-on-a-non-unique-column lost row cannot occur; hence no `,id` tiebreaker, matching the PWA
-//!     oracle's bare `change_seq` order). No clock-skew lookback (the retired `PULL_CURSOR_OVERLAP_MS`),
-//!     no boundary re-pull, and a delayed/offline flush is delivered the moment the server makes it
-//!     visible — the SUR-739 fix for the hole a client-`updated_at` cursor left. Absent cursor → 0 →
-//!     one-time full re-pull (also recovers rows the old client-timestamp cursor historically skipped).
+//!     stamped by surfc migration 0051 / trigger `t02_change_seq` when the server makes a row visible
+//!     — distinct from the client-authored `updated_at` used for LWW. The cursor advances to the max
+//!     `change_seq` seen, read from the **raw** incoming row BEFORE `apply_row` projects it away
+//!     (`change_seq` is server-only, not a local descriptor column); the exclusive `change_seq >
+//!     cursor` keyset re-fetches nothing already merged. This closes the SUR-739 **primary** hole: a
+//!     delayed/offline flush's `change_seq` is allocated at flush time (high), so it's delivered on
+//!     the next pull instead of skipped by a client-clock cursor. Absent cursor → 0 → full re-pull.
+//!
+//!     **Residual — `change_seq` is allocation-ordered, not commit-ordered (SUR-743).** The
+//!     exclusive keyset is only skip-safe if `change_seq` is assigned in COMMIT order, but 0051's bare
+//!     per-table `nextval` is allocated at *statement* time. Under concurrent flushes a lower value
+//!     can commit AFTER the cursor passed a higher one (T1 allocates 100 and stays open; T2 allocates
+//!     101 and commits; a pull advances to 101; T1 then commits 100 → `> 101` skips it until a full
+//!     re-pull). Uniqueness does NOT make a sequence a commit-ordered watermark — this is a real
+//!     concurrent-flush convergence gap, shared with the merged PWA leg. The durable fix is
+//!     **server-side and trigger-only** (a per-user lock-serialized counter, so allocation order ==
+//!     commit order per user) and needs **no change here** — the client consumes a commit-ordered
+//!     watermark correctly by construction. Until it lands, a row skipped this way recovers on the
+//!     next full re-pull (cursor reset to 0).
 //!   - **Fetch is paginated** (SUR-652): one page of `PULL_PAGE_LIMIT` rows at a time, ordered by
 //!     `change_seq` asc, advancing the cursor per page (a consistent prefix — a mid-pull failure
 //!     resumes from the last merged page, never re-pulling merged rows or skipping unpulled ones),

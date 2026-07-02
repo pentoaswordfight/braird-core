@@ -119,17 +119,19 @@ impl PostgrestClient {
     /// Fetch ONE page of `table` rows with `change_seq > after_seq`, ordered by `change_seq`
     /// ascending, capped at `limit` — the incremental-pull read (SUR-739 / SUR-652). `change_seq` is
     /// the server-assigned visibility watermark (surfc migration 0051 / trigger `t02_change_seq`),
-    /// distinct from the client-authored `updated_at` used for last-write-wins. It is stamped from a
-    /// per-table Postgres **sequence** (`nextval` on `<table>_change_seq_seq`), so it is
-    /// **strictly-increasing AND unique** per table — sequences never hand out a value twice, even
-    /// under concurrency. Uniqueness is what makes the **exclusive** `gt` keyset exact: the cursor
-    /// advances to a page's max `change_seq`, and because no two rows share that value there is no
-    /// boundary tie to skip on the next `gt` fetch (the classic keyset-on-a-non-unique-column lost row
-    /// cannot occur — hence no `,id` tiebreaker, matching the PWA oracle's bare `change_seq` order).
-    /// No boundary re-pull (unlike the retired `updated_at >= cursor`) and no writer-clock-skew hazard.
-    /// The caller ([`super::pull`]) loops, advancing per page until a short page. Returns the raw
-    /// PostgREST row objects (snake_case, `change_seq` included); RLS scopes them to the token's user,
-    /// and the owner sees their own tombstones so `deleted:1` rows come back too.
+    /// distinct from the client-authored `updated_at` used for last-write-wins; it is stamped when the
+    /// server makes a row visible, so the exclusive `gt` keyset delivers a delayed/offline flush the
+    /// moment it appears (the SUR-739 primary win) and needs no writer-clock-skew lookback. The caller
+    /// ([`super::pull`]) loops, advancing per page until a short page.
+    ///
+    /// **Caveat (SUR-739 follow-up):** exact skip-safety needs `change_seq` COMMIT-ordered, but 0051's
+    /// bare per-table `nextval` is allocated at statement time — a concurrent flush that commits a
+    /// lower value after the cursor passed a higher one is skipped until a full re-pull. The durable
+    /// fix is server-side (a per-user lock-serialized counter; trigger-only, no change here). See
+    /// [`super::pull`] and SUR-743 (the SUR-739 follow-up migration).
+    ///
+    /// Returns the raw PostgREST row objects (snake_case, `change_seq` included); RLS scopes them to
+    /// the token's user, and the owner sees their own tombstones so `deleted:1` rows come back too.
     pub async fn get_page(
         &self,
         table: &str,

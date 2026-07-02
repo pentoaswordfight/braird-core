@@ -50,6 +50,13 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
     rows the old cursor historically skipped) and deleted on the first pull. Tests: keyset paging
     across boundaries, cursor-not-advanced on mid-page failure, legacy-key migration, full-page-missing
     -change_seq guard; the env-guarded coexistence matrix re-proves both directions against live 0051.
+  - **Known residual (SUR-739 follow-up).** `change_seq` (0051's bare per-table `nextval`) is
+    *allocation*-ordered, not *commit*-ordered: under concurrent flushes a lower value that commits
+    after the cursor passed a higher one is skipped until a full re-pull. Uniqueness ≠ commit-order.
+    The durable fix is server-side and trigger-only (a per-user lock-serialized counter, so allocation
+    order == commit order per user) — **no client change** (the client already consumes a commit-ordered
+    watermark correctly). The merged PWA leg shares the exposure; tracked as SUR-743 (a narrow
+    SUR-739 follow-up migration).
 - **Flush no longer wedges a queued row in a non-`books`/`notes` table (SUR-726).** The pre-fan-out
   flush dispatched only `books`/`notes` groups, so a queued row in any other synced table was neither
   sent nor failed — it sat in the outbox forever. The single topo-ordered dispatch pass sends every
