@@ -168,7 +168,10 @@ pub fn build_search_docs(store: &Store, vault: &Vault) -> rusqlite::Result<Vec<S
 
     for row in store.list_live("custom_ideas", None, -1, 0)? {
         let id = string_field(&row, "id").unwrap_or_default();
-        let title = string_field(&row, "name").unwrap_or_default().trim().to_string();
+        let title = string_field(&row, "name")
+            .unwrap_or_default()
+            .trim()
+            .to_string();
         let content = string_field(&row, "description")
             .unwrap_or_default()
             .trim()
@@ -311,7 +314,12 @@ mod tests {
         vault.encrypt_note(Some(id.to_string()), plaintext.to_string())
     }
 
-    fn note_row(id: &str, book_id: Option<&str>, text: &str, created_at: i64) -> Map<String, Value> {
+    fn note_row(
+        id: &str,
+        book_id: Option<&str>,
+        text: &str,
+        created_at: i64,
+    ) -> Map<String, Value> {
         let mut r = Map::new();
         r.insert("id".into(), json!(id));
         if let Some(b) = book_id {
@@ -332,7 +340,9 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let vault = Vault::generate();
         let ct = seal(&vault, "n1", "the unexamined life");
-        store.apply_row("notes", &note_row("n1", Some("b1"), &ct, 1000)).unwrap();
+        store
+            .apply_row("notes", &note_row("n1", Some("b1"), &ct, 1000))
+            .unwrap();
 
         let rec = get_note(&store, &vault, "n1").unwrap().expect("live note");
         assert_eq!(rec.text.as_deref(), Some("the unexamined life"));
@@ -354,8 +364,12 @@ mod tests {
         let foreign = Vault::generate();
         let good = seal(&mine, "n1", "mine to read");
         let bad = seal(&foreign, "n2", "not mine");
-        store.apply_row("notes", &note_row("n1", None, &good, 2000)).unwrap();
-        store.apply_row("notes", &note_row("n2", None, &bad, 1000)).unwrap();
+        store
+            .apply_row("notes", &note_row("n1", None, &good, 2000))
+            .unwrap();
+        store
+            .apply_row("notes", &note_row("n2", None, &bad, 1000))
+            .unwrap();
 
         let notes = list_notes(&store, &mine, None, 50, 0).unwrap();
         assert_eq!(notes.len(), 2, "one bad row must not drop the whole page");
@@ -397,8 +411,18 @@ mod tests {
         book.insert("updated_at".into(), json!(1));
         book.insert("deleted".into(), json!(false));
         store.apply_row("books", &book).unwrap();
-        store.apply_row("notes", &note_row("n1", Some("b1"), &seal(&vault, "n1", "a"), 1)).unwrap();
-        store.apply_row("notes", &note_row("n2", Some("b1"), &seal(&vault, "n2", "b"), 2)).unwrap();
+        store
+            .apply_row(
+                "notes",
+                &note_row("n1", Some("b1"), &seal(&vault, "n1", "a"), 1),
+            )
+            .unwrap();
+        store
+            .apply_row(
+                "notes",
+                &note_row("n2", Some("b1"), &seal(&vault, "n2", "b"), 2),
+            )
+            .unwrap();
         // a deleted note under b1 must not be counted
         let mut del = note_row("n3", Some("b1"), &seal(&vault, "n3", "c"), 3);
         del.insert("deleted".into(), json!(true));
@@ -414,8 +438,18 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let vault = Vault::generate();
         let foreign = Vault::generate();
-        store.apply_row("notes", &note_row("n1", None, &seal(&vault, "n1", "readable text"), 1)).unwrap();
-        store.apply_row("notes", &note_row("n2", None, &seal(&foreign, "n2", "unreadable"), 2)).unwrap();
+        store
+            .apply_row(
+                "notes",
+                &note_row("n1", None, &seal(&vault, "n1", "readable text"), 1),
+            )
+            .unwrap();
+        store
+            .apply_row(
+                "notes",
+                &note_row("n2", None, &seal(&foreign, "n2", "unreadable"), 2),
+            )
+            .unwrap();
 
         let mut idea = Map::new();
         idea.insert("id".into(), json!("i1"));
@@ -432,8 +466,15 @@ mod tests {
         // build_search_docs drops the decrypt-failed note but keeps the readable one + the idea.
         let docs = build_search_docs(&store, &vault).unwrap();
         assert_eq!(docs.len(), 2);
-        assert!(docs.iter().any(|d| d.ref_id == "n1" && d.content.contains("readable")));
-        assert!(docs.iter().any(|d| d.ref_id == "i1" && d.title == "Antifragility"));
-        assert!(!docs.iter().any(|d| d.ref_id == "n2"), "decrypt failure excluded from index");
+        assert!(docs
+            .iter()
+            .any(|d| d.ref_id == "n1" && d.content.contains("readable")));
+        assert!(docs
+            .iter()
+            .any(|d| d.ref_id == "i1" && d.title == "Antifragility"));
+        assert!(
+            !docs.iter().any(|d| d.ref_id == "n2"),
+            "decrypt failure excluded from index"
+        );
     }
 }

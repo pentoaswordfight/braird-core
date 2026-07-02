@@ -349,10 +349,7 @@ mod tests {
     #[test]
     fn tokenize_splits_on_unicode_punctuation_and_separators() {
         let terms = stem_all("Power & Justice — a, list.of\nthings");
-        assert_eq!(
-            terms,
-            vec!["power", "justice", "a", "list", "of", "thing"]
-        );
+        assert_eq!(terms, vec!["power", "justice", "a", "list", "of", "thing"]);
     }
 
     // ── SUR-754 parity fixtures (AC #5) — same verdicts as the PWA ───────────
@@ -416,7 +413,11 @@ mod tests {
 
     #[test]
     fn custom_ideas_index_name_and_description() {
-        let docs = vec![idea("i1", "Antifragility", "improvement by removing, not adding")];
+        let docs = vec![idea(
+            "i1",
+            "Antifragility",
+            "improvement by removing, not adding",
+        )];
         assert_eq!(hit_ids(&search(&docs, "antifragility", 10)), vec!["i1"]); // name
         assert_eq!(hit_ids(&search(&docs, "removing", 10)), vec!["i1"]); // description
     }
@@ -438,7 +439,9 @@ mod tests {
 
     #[test]
     fn limit_caps_results() {
-        let docs: Vec<SearchDoc> = (0..5).map(|i| note(&format!("n{i}"), "shared keyword")).collect();
+        let docs: Vec<SearchDoc> = (0..5)
+            .map(|i| note(&format!("n{i}"), "shared keyword"))
+            .collect();
         assert_eq!(search(&docs, "keyword", 3).len(), 3);
     }
 }

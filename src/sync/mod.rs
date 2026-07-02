@@ -563,8 +563,14 @@ impl SyncEngine {
         offset: u32,
     ) -> Result<Vec<NoteRecord>, SyncError> {
         let store = lock!(self.store);
-        read::list_notes(&store, &self.vault, book_id.as_deref(), limit as i64, offset as i64)
-            .map_err(store_err)
+        read::list_notes(
+            &store,
+            &self.vault,
+            book_id.as_deref(),
+            limit as i64,
+            offset as i64,
+        )
+        .map_err(store_err)
     }
 
     /// One note by id, decrypted, or `None` if absent or soft-deleted.
@@ -730,9 +736,7 @@ mod tests {
 
         // …yet the marker never reaches the SQLite file — only enc:v2 ciphertext is at rest.
         let bytes = std::fs::read(db_path).unwrap();
-        let leaked = bytes
-            .windows(marker.len())
-            .any(|w| w == marker.as_bytes());
+        let leaked = bytes.windows(marker.len()).any(|w| w == marker.as_bytes());
         assert!(!leaked, "plaintext note text must never be written to disk");
     }
 
@@ -779,7 +783,9 @@ mod tests {
         // Second instance B pulls the row, then reads it back to plaintext.
         let b_store = Store::open_in_memory().unwrap();
         b_store.apply_row("notes", &row).unwrap();
-        let note = read::get_note(&b_store, &vault, "n1").unwrap().expect("row reflected on B");
+        let note = read::get_note(&b_store, &vault, "n1")
+            .unwrap()
+            .expect("row reflected on B");
         assert_eq!(note.text.as_deref(), Some("cross-device plaintext"));
         assert!(!note.decrypt_failed);
         assert_eq!(note.book_id.as_deref(), Some("b1"));
