@@ -22,15 +22,18 @@ pub mod http;
 pub mod outbox;
 pub mod pull;
 pub mod push;
+mod read;
 
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Map, Value};
 
+use crate::search::SearchHit;
 use crate::store::{synced_table_names, Store};
 use crate::vault::Vault;
 use http::{user_id_from_jwt, PostgrestClient};
+use read::{BookRecord, CustomIdeaRecord, NoteRecord, StoreCounts};
 
 /// Errors that cross the FFI from the sync engine. Coarse like [`crate::CryptoError`]: enough
 /// for a host to distinguish "couldn't open the store" from "the flush hit the network", never
@@ -532,6 +535,68 @@ impl SyncEngine {
             },
         })
     }
+
+    // ── read/query surface (SUR-744) ─────────────────────────────────────────
+    // Decrypt-in-core reads for the native list/search screens (SUR-754). Every method
+    // excludes soft-deleted rows and orders newest-first; note text is decrypted on the way
+    // out (`read::note_record` → `Vault::decrypt_note`), never written back to the store.
+    // The shape + the crypto boundary live in `sync::read`; these are thin locks-and-maps.
+
+    /// Books for the Library / Sources grid, newest-first, each with its live `note_count`.
+    pub fn list_books(&self, limit: u32, offset: u32) -> Result<Vec<BookRecord>, SyncError> {
+        let store = lock!(self.store);
+        read::list_books(&store, limit as i64, offset as i64).map_err(store_err)
+    }
+
+    /// One book by id, or `None` if absent or soft-deleted.
+    pub fn get_book(&self, id: String) -> Result<Option<BookRecord>, SyncError> {
+        let store = lock!(self.store);
+        read::get_book(&store, &id).map_err(store_err)
+    }
+
+    /// Notes newest-first. `book_id = None` → the Commonplace flat list (all notes); `Some` →
+    /// that book's notes. `text` is decrypted plaintext, or `None` with `decrypt_failed = true`.
+    pub fn list_notes(
+        &self,
+        book_id: Option<String>,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<NoteRecord>, SyncError> {
+        let store = lock!(self.store);
+        read::list_notes(&store, &self.vault, book_id.as_deref(), limit as i64, offset as i64)
+            .map_err(store_err)
+    }
+
+    /// One note by id, decrypted, or `None` if absent or soft-deleted.
+    pub fn get_note(&self, id: String) -> Result<Option<NoteRecord>, SyncError> {
+        let store = lock!(self.store);
+        read::get_note(&store, &self.vault, &id).map_err(store_err)
+    }
+
+    /// Custom ideas for the AddIdeaSheet "Your Ideas" section, newest-first.
+    pub fn list_custom_ideas(
+        &self,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<CustomIdeaRecord>, SyncError> {
+        let store = lock!(self.store);
+        read::list_custom_ideas(&store, limit as i64, offset as i64).map_err(store_err)
+    }
+
+    /// Live (non-deleted) row totals for books / notes / custom ideas.
+    pub fn counts(&self) -> Result<StoreCounts, SyncError> {
+        let store = lock!(self.store);
+        read::counts(&store).map_err(store_err)
+    }
+
+    /// Lexical search over decrypted note text + custom-idea name/description (SUR-527 parity).
+    /// Rebuilds the in-memory index from the live store per call — no plaintext touches disk —
+    /// and returns up to `limit` hits, best-first.
+    pub fn search(&self, query: String, limit: u32) -> Result<Vec<SearchHit>, SyncError> {
+        let store = lock!(self.store);
+        let docs = read::build_search_docs(&store, &self.vault).map_err(store_err)?;
+        Ok(crate::search::search(&docs, &query, limit as usize))
+    }
 }
 
 impl SyncEngine {
@@ -592,6 +657,12 @@ pub fn membership_id(collection_id: String, note_id: String) -> String {
     crate::store::membership_id(&collection_id, &note_id)
 }
 
+/// Wrap a `rusqlite` read error as the coarse FFI `SyncError::Store` — the same mapping the
+/// write path uses (`open`), so the read surface leaks no per-row SQL detail across the FFI.
+fn store_err(e: rusqlite::Error) -> SyncError {
+    SyncError::Store(e.to_string())
+}
+
 /// Insert `key` into an outbox payload only when `Some` — the SUR-741 partial-patch rule: an
 /// absent optional is OMITTED (so the server `merge-duplicates` upsert + the local merge patch
 /// only supplied columns), never emitted as an explicit `null` that would clobber a pulled-only
@@ -615,6 +686,105 @@ fn epoch_ms() -> i64 {
 mod tests {
     use super::*;
     use serde_json::Value;
+
+    #[test]
+    fn search_writes_no_plaintext_note_text_to_disk() {
+        // AC #4 (SUR-744): the search path decrypts into memory only — no plaintext note text is
+        // ever persisted. Enqueue a note carrying a distinctive plaintext marker (sealed at write),
+        // run search (which decrypts + indexes in memory), then scan the on-disk DB bytes: only
+        // ciphertext must be there. There is no separate on-disk index — the in-memory `SearchDoc`
+        // corpus IS the index (rebuilt per call), so "index target is :memory:" holds by design.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = SyncEngine::open(
+            db_path.into(),
+            "https://x.supabase.co".into(),
+            "anon".into(),
+            Vault::generate(),
+        )
+        .unwrap();
+        let marker = "plaintextmarkerzzz";
+        engine
+            .enqueue_note(
+                "n1".into(),
+                None,
+                format!("a note about {marker}"),
+                None,
+                vec![],
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                0,
+                false,
+            )
+            .unwrap();
+
+        // The search round-trip works (decrypted plaintext is searchable)…
+        let hits = engine.search(marker.into(), 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].ref_id, "n1");
+
+        // …yet the marker never reaches the SQLite file — only enc:v2 ciphertext is at rest.
+        let bytes = std::fs::read(db_path).unwrap();
+        let leaked = bytes
+            .windows(marker.len())
+            .any(|w| w == marker.as_bytes());
+        assert!(!leaked, "plaintext note text must never be written to disk");
+    }
+
+    #[test]
+    fn a_note_enqueued_on_one_engine_reads_back_as_plaintext_on_a_second() {
+        // AC #6 (SUR-744): enqueue on instance A seals the note; a second instance that receives
+        // the row via pull (apply_row = the pull sink, storing ciphertext verbatim) reads it back
+        // to plaintext — the same user's MK on both devices. The full networked
+        // enqueue→flush→pull path stays in the #[ignore]d Docker suite; this proves the read leg.
+        let vault = Vault::generate();
+        let dir = tempfile::tempdir().unwrap();
+        let a_path = dir.path().join("a.sqlite");
+        let a_path = a_path.to_str().unwrap();
+        let engine_a = SyncEngine::open(
+            a_path.into(),
+            "https://x.supabase.co".into(),
+            "anon".into(),
+            vault.clone(),
+        )
+        .unwrap();
+        engine_a
+            .enqueue_note(
+                "n1".into(),
+                Some("b1".into()),
+                "cross-device plaintext".into(),
+                None,
+                vec!["tag".into()],
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                0,
+                false,
+            )
+            .unwrap();
+
+        // A's local synced row is ciphertext at rest — exactly what a flush pushes and a pull delivers.
+        let a_store = Store::open(a_path).unwrap();
+        let row = a_store.get_row("notes", "n1").unwrap().unwrap();
+        assert!(row["text"].as_str().unwrap().starts_with("enc:v2:"));
+
+        // Second instance B pulls the row, then reads it back to plaintext.
+        let b_store = Store::open_in_memory().unwrap();
+        b_store.apply_row("notes", &row).unwrap();
+        let note = read::get_note(&b_store, &vault, "n1").unwrap().expect("row reflected on B");
+        assert_eq!(note.text.as_deref(), Some("cross-device plaintext"));
+        assert!(!note.decrypt_failed);
+        assert_eq!(note.book_id.as_deref(), Some("b1"));
+        assert_eq!(note.tags, vec!["tag"]);
+    }
 
     #[test]
     fn enqueue_note_stores_ciphertext_not_plaintext() {

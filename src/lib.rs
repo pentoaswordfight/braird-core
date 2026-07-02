@@ -30,6 +30,13 @@ pub mod store;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod sync;
 
+// In-memory lexical search (SUR-744) — a port of the PWA's MiniSearch engine, over the
+// decrypted-in-core read surface. Native-only for the same reason as `store`/`sync`: the PWA
+// keeps its own MiniSearch on wasm. Its DTOs (`SearchHit`/`SearchDocKind`) are UniFFI types
+// consumed by `SyncEngine::search`.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod search;
+
 pub use vault::Vault;
 
 uniffi::setup_scaffolding!();

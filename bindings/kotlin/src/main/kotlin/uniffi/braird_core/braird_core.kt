@@ -766,6 +766,20 @@ internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 // A JNA Library to expose the extern-C FFI definitions.
 // This is an implementation detail which will be called internally by the public API.
 
@@ -791,6 +805,8 @@ internal interface UniffiLib : Library {
     ): Unit
     fun uniffi_braird_core_fn_constructor_syncengine_open(`dbPath`: RustBuffer.ByValue,`supabaseUrl`: RustBuffer.ByValue,`anonKey`: RustBuffer.ByValue,`vault`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Pointer
+    fun uniffi_braird_core_fn_method_syncengine_counts(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_syncengine_enqueue_book(`ptr`: Pointer,`id`: RustBuffer.ByValue,`title`: RustBuffer.ByValue,`author`: RustBuffer.ByValue,`isbn`: RustBuffer.ByValue,`coverUrl`: RustBuffer.ByValue,`coverSource`: RustBuffer.ByValue,`coverResolvedAt`: RustBuffer.ByValue,`createdAt`: Long,`deleted`: Byte,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     fun uniffi_braird_core_fn_method_syncengine_enqueue_collection(`ptr`: Pointer,`id`: RustBuffer.ByValue,`name`: RustBuffer.ByValue,`createdAt`: Long,`deleted`: Byte,uniffi_out_err: UniffiRustCallStatus, 
@@ -809,7 +825,19 @@ internal interface UniffiLib : Library {
     ): Unit
     fun uniffi_braird_core_fn_method_syncengine_flush(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
+    fun uniffi_braird_core_fn_method_syncengine_get_book(`ptr`: Pointer,`id`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_braird_core_fn_method_syncengine_get_note(`ptr`: Pointer,`id`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_braird_core_fn_method_syncengine_list_books(`ptr`: Pointer,`limit`: Int,`offset`: Int,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_braird_core_fn_method_syncengine_list_custom_ideas(`ptr`: Pointer,`limit`: Int,`offset`: Int,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_braird_core_fn_method_syncengine_list_notes(`ptr`: Pointer,`bookId`: RustBuffer.ByValue,`limit`: Int,`offset`: Int,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_syncengine_pull(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_braird_core_fn_method_syncengine_search(`ptr`: Pointer,`query`: RustBuffer.ByValue,`limit`: Int,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_syncengine_set_access_token(`ptr`: Pointer,`jwt`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
@@ -957,6 +985,8 @@ internal interface UniffiLib : Library {
     ): Unit
     fun uniffi_braird_core_checksum_func_membership_id(
     ): Short
+    fun uniffi_braird_core_checksum_method_syncengine_counts(
+    ): Short
     fun uniffi_braird_core_checksum_method_syncengine_enqueue_book(
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_enqueue_collection(
@@ -975,7 +1005,19 @@ internal interface UniffiLib : Library {
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_flush(
     ): Short
+    fun uniffi_braird_core_checksum_method_syncengine_get_book(
+    ): Short
+    fun uniffi_braird_core_checksum_method_syncengine_get_note(
+    ): Short
+    fun uniffi_braird_core_checksum_method_syncengine_list_books(
+    ): Short
+    fun uniffi_braird_core_checksum_method_syncengine_list_custom_ideas(
+    ): Short
+    fun uniffi_braird_core_checksum_method_syncengine_list_notes(
+    ): Short
     fun uniffi_braird_core_checksum_method_syncengine_pull(
+    ): Short
+    fun uniffi_braird_core_checksum_method_syncengine_search(
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_set_access_token(
     ): Short
@@ -1025,6 +1067,9 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_braird_core_checksum_func_membership_id() != 9610.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_braird_core_checksum_method_syncengine_counts() != 56423.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_book() != 63811.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1052,7 +1097,25 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_braird_core_checksum_method_syncengine_flush() != 39156.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_braird_core_checksum_method_syncengine_get_book() != 48807.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_braird_core_checksum_method_syncengine_get_note() != 41812.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_braird_core_checksum_method_syncengine_list_books() != 22597.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_braird_core_checksum_method_syncengine_list_custom_ideas() != 63630.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_braird_core_checksum_method_syncengine_list_notes() != 26133.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_braird_core_checksum_method_syncengine_pull() != 8960.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_braird_core_checksum_method_syncengine_search() != 14411.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_set_access_token() != 47386.toShort()) {
@@ -1483,6 +1546,11 @@ private class JavaLangRefCleanable(
 public interface SyncEngineInterface {
     
     /**
+     * Live (non-deleted) row totals for books / notes / custom ideas.
+     */
+    fun `counts`(): StoreCounts
+    
+    /**
      * Enqueue a book upsert. `updated_at` is stamped in epoch ms at enqueue (never omitted —
      * the migration default is 0). Plaintext metadata only, no encryption branch (like the PWA
      * `upsertBook`). Column NAMES mirror `upsertBook` in surfc `src/supabase.js` exactly.
@@ -1580,6 +1648,32 @@ public interface SyncEngineInterface {
     fun `flush`(): FlushSummary
     
     /**
+     * One book by id, or `None` if absent or soft-deleted.
+     */
+    fun `getBook`(`id`: kotlin.String): BookRecord?
+    
+    /**
+     * One note by id, decrypted, or `None` if absent or soft-deleted.
+     */
+    fun `getNote`(`id`: kotlin.String): NoteRecord?
+    
+    /**
+     * Books for the Library / Sources grid, newest-first, each with its live `note_count`.
+     */
+    fun `listBooks`(`limit`: kotlin.UInt, `offset`: kotlin.UInt): List<BookRecord>
+    
+    /**
+     * Custom ideas for the AddIdeaSheet "Your Ideas" section, newest-first.
+     */
+    fun `listCustomIdeas`(`limit`: kotlin.UInt, `offset`: kotlin.UInt): List<CustomIdeaRecord>
+    
+    /**
+     * Notes newest-first. `book_id = None` → the Commonplace flat list (all notes); `Some` →
+     * that book's notes. `text` is decrypted plaintext, or `None` with `decrypt_failed = true`.
+     */
+    fun `listNotes`(`bookId`: kotlin.String?, `limit`: kotlin.UInt, `offset`: kotlin.UInt): List<NoteRecord>
+    
+    /**
      * Pull incrementally from Supabase for **all eight synced tables** (SUR-726 —
      * [`synced_table_names`] is the one source of the pull scope). Merges last-write-wins by
      * `updated_at`, applies tombstones without resurrecting soft-deleted rows, **rebases the outbox**
@@ -1597,6 +1691,13 @@ public interface SyncEngineInterface {
      * flush destroying a newer SERVER row before a pull can see it is the server's job, PR-3.)
      */
     fun `pull`(): PullSummary
+    
+    /**
+     * Lexical search over decrypted note text + custom-idea name/description (SUR-527 parity).
+     * Rebuilds the in-memory index from the live store per call — no plaintext touches disk —
+     * and returns up to `limit` hits, best-first.
+     */
+    fun `search`(`query`: kotlin.String, `limit`: kotlin.UInt): List<SearchHit>
     
     /**
      * Hand the core a GoTrue-issued access token (JWT). The core makes its OWN authenticated
@@ -1713,6 +1814,22 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
             UniffiLib.INSTANCE.uniffi_braird_core_fn_clone_syncengine(pointer!!, status)
         }
     }
+
+    
+    /**
+     * Live (non-deleted) row totals for books / notes / custom ideas.
+     */
+    @Throws(SyncException::class)override fun `counts`(): StoreCounts {
+            return FfiConverterTypeStoreCounts.lift(
+    callWithPointer {
+    uniffiRustCallWithError(SyncException) { _status ->
+    UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_counts(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
     
     /**
@@ -1904,6 +2021,87 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
 
     
     /**
+     * One book by id, or `None` if absent or soft-deleted.
+     */
+    @Throws(SyncException::class)override fun `getBook`(`id`: kotlin.String): BookRecord? {
+            return FfiConverterOptionalTypeBookRecord.lift(
+    callWithPointer {
+    uniffiRustCallWithError(SyncException) { _status ->
+    UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_get_book(
+        it, FfiConverterString.lower(`id`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * One note by id, decrypted, or `None` if absent or soft-deleted.
+     */
+    @Throws(SyncException::class)override fun `getNote`(`id`: kotlin.String): NoteRecord? {
+            return FfiConverterOptionalTypeNoteRecord.lift(
+    callWithPointer {
+    uniffiRustCallWithError(SyncException) { _status ->
+    UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_get_note(
+        it, FfiConverterString.lower(`id`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * Books for the Library / Sources grid, newest-first, each with its live `note_count`.
+     */
+    @Throws(SyncException::class)override fun `listBooks`(`limit`: kotlin.UInt, `offset`: kotlin.UInt): List<BookRecord> {
+            return FfiConverterSequenceTypeBookRecord.lift(
+    callWithPointer {
+    uniffiRustCallWithError(SyncException) { _status ->
+    UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_list_books(
+        it, FfiConverterUInt.lower(`limit`),FfiConverterUInt.lower(`offset`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * Custom ideas for the AddIdeaSheet "Your Ideas" section, newest-first.
+     */
+    @Throws(SyncException::class)override fun `listCustomIdeas`(`limit`: kotlin.UInt, `offset`: kotlin.UInt): List<CustomIdeaRecord> {
+            return FfiConverterSequenceTypeCustomIdeaRecord.lift(
+    callWithPointer {
+    uniffiRustCallWithError(SyncException) { _status ->
+    UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_list_custom_ideas(
+        it, FfiConverterUInt.lower(`limit`),FfiConverterUInt.lower(`offset`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * Notes newest-first. `book_id = None` → the Commonplace flat list (all notes); `Some` →
+     * that book's notes. `text` is decrypted plaintext, or `None` with `decrypt_failed = true`.
+     */
+    @Throws(SyncException::class)override fun `listNotes`(`bookId`: kotlin.String?, `limit`: kotlin.UInt, `offset`: kotlin.UInt): List<NoteRecord> {
+            return FfiConverterSequenceTypeNoteRecord.lift(
+    callWithPointer {
+    uniffiRustCallWithError(SyncException) { _status ->
+    UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_list_notes(
+        it, FfiConverterOptionalString.lower(`bookId`),FfiConverterUInt.lower(`limit`),FfiConverterUInt.lower(`offset`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
      * Pull incrementally from Supabase for **all eight synced tables** (SUR-726 —
      * [`synced_table_names`] is the one source of the pull scope). Merges last-write-wins by
      * `updated_at`, applies tombstones without resurrecting soft-deleted rows, **rebases the outbox**
@@ -1926,6 +2124,24 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
     uniffiRustCallWithError(SyncException) { _status ->
     UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_pull(
         it, _status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * Lexical search over decrypted note text + custom-idea name/description (SUR-527 parity).
+     * Rebuilds the in-memory index from the live store per call — no plaintext touches disk —
+     * and returns up to `limit` hits, best-first.
+     */
+    @Throws(SyncException::class)override fun `search`(`query`: kotlin.String, `limit`: kotlin.UInt): List<SearchHit> {
+            return FfiConverterSequenceTypeSearchHit.lift(
+    callWithPointer {
+    uniffiRustCallWithError(SyncException) { _status ->
+    UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_search(
+        it, FfiConverterString.lower(`query`),FfiConverterUInt.lower(`limit`),_status)
 }
     }
     )
@@ -2470,6 +2686,122 @@ public object FfiConverterTypeVault: FfiConverter<Vault, Pointer> {
 
 
 /**
+ * A book for the Library / Sources grid: the descriptor column set (minus `deleted`, which is
+ * always `0` for a returned row) plus `note_count` — live notes filed under this book, for the
+ * grid's count badge.
+ */
+data class BookRecord (
+    var `id`: kotlin.String, 
+    var `title`: kotlin.String?, 
+    var `author`: kotlin.String?, 
+    var `isbn`: kotlin.String?, 
+    var `coverUrl`: kotlin.String?, 
+    var `coverSource`: kotlin.String?, 
+    var `coverResolvedAt`: kotlin.Long?, 
+    var `createdAt`: kotlin.Long, 
+    var `updatedAt`: kotlin.Long, 
+    var `noteCount`: kotlin.UInt
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeBookRecord: FfiConverterRustBuffer<BookRecord> {
+    override fun read(buf: ByteBuffer): BookRecord {
+        return BookRecord(
+            FfiConverterString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalLong.read(buf),
+            FfiConverterLong.read(buf),
+            FfiConverterLong.read(buf),
+            FfiConverterUInt.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: BookRecord) = (
+            FfiConverterString.allocationSize(value.`id`) +
+            FfiConverterOptionalString.allocationSize(value.`title`) +
+            FfiConverterOptionalString.allocationSize(value.`author`) +
+            FfiConverterOptionalString.allocationSize(value.`isbn`) +
+            FfiConverterOptionalString.allocationSize(value.`coverUrl`) +
+            FfiConverterOptionalString.allocationSize(value.`coverSource`) +
+            FfiConverterOptionalLong.allocationSize(value.`coverResolvedAt`) +
+            FfiConverterLong.allocationSize(value.`createdAt`) +
+            FfiConverterLong.allocationSize(value.`updatedAt`) +
+            FfiConverterUInt.allocationSize(value.`noteCount`)
+    )
+
+    override fun write(value: BookRecord, buf: ByteBuffer) {
+            FfiConverterString.write(value.`id`, buf)
+            FfiConverterOptionalString.write(value.`title`, buf)
+            FfiConverterOptionalString.write(value.`author`, buf)
+            FfiConverterOptionalString.write(value.`isbn`, buf)
+            FfiConverterOptionalString.write(value.`coverUrl`, buf)
+            FfiConverterOptionalString.write(value.`coverSource`, buf)
+            FfiConverterOptionalLong.write(value.`coverResolvedAt`, buf)
+            FfiConverterLong.write(value.`createdAt`, buf)
+            FfiConverterLong.write(value.`updatedAt`, buf)
+            FfiConverterUInt.write(value.`noteCount`, buf)
+    }
+}
+
+
+
+/**
+ * A custom idea for the AddIdeaSheet "Your Ideas" section.
+ */
+data class CustomIdeaRecord (
+    var `id`: kotlin.String, 
+    var `name`: kotlin.String?, 
+    var `description`: kotlin.String?, 
+    var `createdAt`: kotlin.Long, 
+    var `updatedAt`: kotlin.Long
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeCustomIdeaRecord: FfiConverterRustBuffer<CustomIdeaRecord> {
+    override fun read(buf: ByteBuffer): CustomIdeaRecord {
+        return CustomIdeaRecord(
+            FfiConverterString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterLong.read(buf),
+            FfiConverterLong.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: CustomIdeaRecord) = (
+            FfiConverterString.allocationSize(value.`id`) +
+            FfiConverterOptionalString.allocationSize(value.`name`) +
+            FfiConverterOptionalString.allocationSize(value.`description`) +
+            FfiConverterLong.allocationSize(value.`createdAt`) +
+            FfiConverterLong.allocationSize(value.`updatedAt`)
+    )
+
+    override fun write(value: CustomIdeaRecord, buf: ByteBuffer) {
+            FfiConverterString.write(value.`id`, buf)
+            FfiConverterOptionalString.write(value.`name`, buf)
+            FfiConverterOptionalString.write(value.`description`, buf)
+            FfiConverterLong.write(value.`createdAt`, buf)
+            FfiConverterLong.write(value.`updatedAt`, buf)
+    }
+}
+
+
+
+/**
  * The result of a flush across the FFI: how many outbox ids were pushed vs. left queued.
  */
 data class FlushSummary (
@@ -2499,6 +2831,96 @@ public object FfiConverterTypeFlushSummary: FfiConverterRustBuffer<FlushSummary>
     override fun write(value: FlushSummary, buf: ByteBuffer) {
             FfiConverterUInt.write(value.`pushed`, buf)
             FfiConverterUInt.write(value.`stillQueued`, buf)
+    }
+}
+
+
+
+/**
+ * A note for the Commonplace list / NoteForm. `text` is **plaintext** (decrypted in core), or
+ * `None` when the row failed to decrypt (`decrypt_failed = true`) or genuinely has no text.
+ * `source_meta_json` mirrors the write-side `…Json` convention — the `source_meta` object
+ * re-serialized to a JSON string, since UniFFI has no jsonb type.
+ */
+data class NoteRecord (
+    var `id`: kotlin.String, 
+    var `bookId`: kotlin.String?, 
+    var `text`: kotlin.String?, 
+    var `decryptFailed`: kotlin.Boolean, 
+    var `page`: kotlin.String?, 
+    var `tags`: List<kotlin.String>, 
+    var `imagePath`: kotlin.String?, 
+    var `inkCropPath`: kotlin.String?, 
+    var `source`: kotlin.String?, 
+    var `sourceId`: kotlin.String?, 
+    var `sourceMetaJson`: kotlin.String?, 
+    var `chapter`: kotlin.String?, 
+    var `contentTag`: kotlin.String?, 
+    var `createdAt`: kotlin.Long, 
+    var `updatedAt`: kotlin.Long
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeNoteRecord: FfiConverterRustBuffer<NoteRecord> {
+    override fun read(buf: ByteBuffer): NoteRecord {
+        return NoteRecord(
+            FfiConverterString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterSequenceString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterLong.read(buf),
+            FfiConverterLong.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: NoteRecord) = (
+            FfiConverterString.allocationSize(value.`id`) +
+            FfiConverterOptionalString.allocationSize(value.`bookId`) +
+            FfiConverterOptionalString.allocationSize(value.`text`) +
+            FfiConverterBoolean.allocationSize(value.`decryptFailed`) +
+            FfiConverterOptionalString.allocationSize(value.`page`) +
+            FfiConverterSequenceString.allocationSize(value.`tags`) +
+            FfiConverterOptionalString.allocationSize(value.`imagePath`) +
+            FfiConverterOptionalString.allocationSize(value.`inkCropPath`) +
+            FfiConverterOptionalString.allocationSize(value.`source`) +
+            FfiConverterOptionalString.allocationSize(value.`sourceId`) +
+            FfiConverterOptionalString.allocationSize(value.`sourceMetaJson`) +
+            FfiConverterOptionalString.allocationSize(value.`chapter`) +
+            FfiConverterOptionalString.allocationSize(value.`contentTag`) +
+            FfiConverterLong.allocationSize(value.`createdAt`) +
+            FfiConverterLong.allocationSize(value.`updatedAt`)
+    )
+
+    override fun write(value: NoteRecord, buf: ByteBuffer) {
+            FfiConverterString.write(value.`id`, buf)
+            FfiConverterOptionalString.write(value.`bookId`, buf)
+            FfiConverterOptionalString.write(value.`text`, buf)
+            FfiConverterBoolean.write(value.`decryptFailed`, buf)
+            FfiConverterOptionalString.write(value.`page`, buf)
+            FfiConverterSequenceString.write(value.`tags`, buf)
+            FfiConverterOptionalString.write(value.`imagePath`, buf)
+            FfiConverterOptionalString.write(value.`inkCropPath`, buf)
+            FfiConverterOptionalString.write(value.`source`, buf)
+            FfiConverterOptionalString.write(value.`sourceId`, buf)
+            FfiConverterOptionalString.write(value.`sourceMetaJson`, buf)
+            FfiConverterOptionalString.write(value.`chapter`, buf)
+            FfiConverterOptionalString.write(value.`contentTag`, buf)
+            FfiConverterLong.write(value.`createdAt`, buf)
+            FfiConverterLong.write(value.`updatedAt`, buf)
     }
 }
 
@@ -2545,6 +2967,94 @@ public object FfiConverterTypePullSummary: FfiConverterRustBuffer<PullSummary> {
             FfiConverterUInt.write(value.`merged`, buf)
             FfiConverterUInt.write(value.`skippedTombstones`, buf)
             FfiConverterSequenceTypeSupersededEdit.write(value.`superseded`, buf)
+    }
+}
+
+
+
+/**
+ * One search result, shaped like the PWA's `runSearch` output: `refId → ref_id`, `type → kind`,
+ * plus `title`/`snippet`/`score`. `snippet` is the content (or the title when the doc has no
+ * body), matching `hit.content || hit.title`.
+ */
+data class SearchHit (
+    var `kind`: SearchDocKind, 
+    var `refId`: kotlin.String, 
+    var `title`: kotlin.String, 
+    var `snippet`: kotlin.String, 
+    var `score`: kotlin.Double
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeSearchHit: FfiConverterRustBuffer<SearchHit> {
+    override fun read(buf: ByteBuffer): SearchHit {
+        return SearchHit(
+            FfiConverterTypeSearchDocKind.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterDouble.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: SearchHit) = (
+            FfiConverterTypeSearchDocKind.allocationSize(value.`kind`) +
+            FfiConverterString.allocationSize(value.`refId`) +
+            FfiConverterString.allocationSize(value.`title`) +
+            FfiConverterString.allocationSize(value.`snippet`) +
+            FfiConverterDouble.allocationSize(value.`score`)
+    )
+
+    override fun write(value: SearchHit, buf: ByteBuffer) {
+            FfiConverterTypeSearchDocKind.write(value.`kind`, buf)
+            FfiConverterString.write(value.`refId`, buf)
+            FfiConverterString.write(value.`title`, buf)
+            FfiConverterString.write(value.`snippet`, buf)
+            FfiConverterDouble.write(value.`score`, buf)
+    }
+}
+
+
+
+/**
+ * Live (non-deleted) row totals for stat / empty-state surfaces.
+ */
+data class StoreCounts (
+    var `books`: kotlin.UInt, 
+    var `notes`: kotlin.UInt, 
+    var `customIdeas`: kotlin.UInt
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeStoreCounts: FfiConverterRustBuffer<StoreCounts> {
+    override fun read(buf: ByteBuffer): StoreCounts {
+        return StoreCounts(
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: StoreCounts) = (
+            FfiConverterUInt.allocationSize(value.`books`) +
+            FfiConverterUInt.allocationSize(value.`notes`) +
+            FfiConverterUInt.allocationSize(value.`customIdeas`)
+    )
+
+    override fun write(value: StoreCounts, buf: ByteBuffer) {
+            FfiConverterUInt.write(value.`books`, buf)
+            FfiConverterUInt.write(value.`notes`, buf)
+            FfiConverterUInt.write(value.`customIdeas`, buf)
     }
 }
 
@@ -2750,6 +3260,42 @@ public object FfiConverterTypeCryptoError : FfiConverterRustBuffer<CryptoExcepti
 
 
 
+/**
+ * Which entity a [`SearchHit`] points at. Mirrors the PWA's `type` field (`'note'`/`'idea'`),
+ * but a closed enum gives Swift/Kotlin an exhaustive switch instead of a stringly-typed field.
+ * Scope is notes + custom-ideas only (SUR-744 decision 1); books aren't indexed by the PWA and
+ * lenses/collections have no v1 read surface.
+ */
+
+enum class SearchDocKind {
+    
+    NOTE,
+    IDEA;
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeSearchDocKind: FfiConverterRustBuffer<SearchDocKind> {
+    override fun read(buf: ByteBuffer) = try {
+        SearchDocKind.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: SearchDocKind) = 4UL
+
+    override fun write(value: SearchDocKind, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
 
 
 /**
@@ -2903,6 +3449,70 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
 /**
  * @suppress
  */
+public object FfiConverterOptionalTypeBookRecord: FfiConverterRustBuffer<BookRecord?> {
+    override fun read(buf: ByteBuffer): BookRecord? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeBookRecord.read(buf)
+    }
+
+    override fun allocationSize(value: BookRecord?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeBookRecord.allocationSize(value)
+        }
+    }
+
+    override fun write(value: BookRecord?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeBookRecord.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalTypeNoteRecord: FfiConverterRustBuffer<NoteRecord?> {
+    override fun read(buf: ByteBuffer): NoteRecord? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeNoteRecord.read(buf)
+    }
+
+    override fun allocationSize(value: NoteRecord?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeNoteRecord.allocationSize(value)
+        }
+    }
+
+    override fun write(value: NoteRecord?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeNoteRecord.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
 public object FfiConverterSequenceString: FfiConverterRustBuffer<List<kotlin.String>> {
     override fun read(buf: ByteBuffer): List<kotlin.String> {
         val len = buf.getInt()
@@ -2921,6 +3531,118 @@ public object FfiConverterSequenceString: FfiConverterRustBuffer<List<kotlin.Str
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterString.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeBookRecord: FfiConverterRustBuffer<List<BookRecord>> {
+    override fun read(buf: ByteBuffer): List<BookRecord> {
+        val len = buf.getInt()
+        return List<BookRecord>(len) {
+            FfiConverterTypeBookRecord.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<BookRecord>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeBookRecord.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<BookRecord>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeBookRecord.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeCustomIdeaRecord: FfiConverterRustBuffer<List<CustomIdeaRecord>> {
+    override fun read(buf: ByteBuffer): List<CustomIdeaRecord> {
+        val len = buf.getInt()
+        return List<CustomIdeaRecord>(len) {
+            FfiConverterTypeCustomIdeaRecord.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<CustomIdeaRecord>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeCustomIdeaRecord.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<CustomIdeaRecord>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeCustomIdeaRecord.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeNoteRecord: FfiConverterRustBuffer<List<NoteRecord>> {
+    override fun read(buf: ByteBuffer): List<NoteRecord> {
+        val len = buf.getInt()
+        return List<NoteRecord>(len) {
+            FfiConverterTypeNoteRecord.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<NoteRecord>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeNoteRecord.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<NoteRecord>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeNoteRecord.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeSearchHit: FfiConverterRustBuffer<List<SearchHit>> {
+    override fun read(buf: ByteBuffer): List<SearchHit> {
+        val len = buf.getInt()
+        return List<SearchHit>(len) {
+            FfiConverterTypeSearchHit.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<SearchHit>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeSearchHit.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<SearchHit>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeSearchHit.write(it, buf)
         }
     }
 }

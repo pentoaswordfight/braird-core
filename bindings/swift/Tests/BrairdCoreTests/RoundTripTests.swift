@@ -107,4 +107,65 @@ final class RoundTripTests: XCTestCase {
                 source: nil, sourceId: nil, sourceMetaJson: "not json", chapter: nil,
                 imagePath: nil, inkCropPath: nil, createdAt: 0, deleted: false))
     }
+
+    /// SUR-744: the read/query surface over the FFI — list/get/counts/search against a populated
+    /// store. Proves note text crosses the binding as decrypted PLAINTEXT (never an `enc:` sentinel,
+    /// AC #2), the Library note-count badge, newest-first ordering, and lexical-search parity
+    /// (stemming, doc-kind typing) exactly as an iOS host consumes them.
+    func testReadAndSearchSurfaceOverFfi() throws {
+        let db = FileManager.default.temporaryDirectory
+            .appendingPathComponent("braird-rt-\(UUID().uuidString).sqlite")
+        let engine = try SyncEngine.open(
+            dbPath: db.path, supabaseUrl: "https://x.supabase.co", anonKey: "anon",
+            vault: Vault.generate())
+
+        try engine.enqueueBook(
+            id: "b1", title: "Meditations", author: "Aurelius", isbn: nil, coverUrl: nil,
+            coverSource: nil, coverResolvedAt: nil, createdAt: 1, deleted: false)
+        try engine.enqueueNote(
+            id: "n1", bookId: "b1", plaintext: "the unexamined life is not worth living",
+            page: nil, tags: ["philosophy"], source: nil, sourceId: nil, sourceMetaJson: nil,
+            chapter: nil, imagePath: nil, inkCropPath: nil, createdAt: 10, deleted: false)
+        try engine.enqueueNote(
+            id: "n2", bookId: nil, plaintext: "running toward the good", page: nil, tags: [],
+            source: nil, sourceId: nil, sourceMetaJson: nil, chapter: nil, imagePath: nil,
+            inkCropPath: nil, createdAt: 20, deleted: false)
+        try engine.enqueueCustomIdea(
+            id: "i1", name: "Antifragility", description: "gains from disorder",
+            createdAt: 5, deleted: false)
+
+        let counts = try engine.counts()
+        XCTAssertEqual(counts.books, 1)
+        XCTAssertEqual(counts.notes, 2)
+        XCTAssertEqual(counts.customIdeas, 1)
+
+        // Library grid: the book carries its live note count.
+        let books = try engine.listBooks(limit: 50, offset: 0)
+        XCTAssertEqual(books.count, 1)
+        XCTAssertEqual(books[0].title, "Meditations")
+        XCTAssertEqual(books[0].noteCount, 1)
+
+        // Commonplace flat list: newest-first, decrypted plaintext, never a ciphertext sentinel.
+        let all = try engine.listNotes(bookId: nil, limit: 50, offset: 0)
+        XCTAssertEqual(all.map { $0.id }, ["n2", "n1"])
+        XCTAssertEqual(all[1].text, "the unexamined life is not worth living")
+        XCTAssertFalse(all[1].decryptFailed)
+        for n in all { XCTAssertFalse((n.text ?? "").hasPrefix("enc:v")) }
+
+        // Per-book filter + single-note fetch.
+        XCTAssertEqual(try engine.listNotes(bookId: "b1", limit: 50, offset: 0).map { $0.id }, ["n1"])
+        let n1 = try engine.getNote(id: "n1")
+        XCTAssertEqual(n1?.text, "the unexamined life is not worth living")
+        XCTAssertEqual(n1?.tags, ["philosophy"])
+
+        // AddIdeaSheet "Your Ideas".
+        XCTAssertEqual(try engine.listCustomIdeas(limit: 50, offset: 0).map { $0.name }, ["Antifragility"])
+
+        // Lexical search: stemming (running ⇄ run) hits the note; idea by name; miss returns [].
+        let runHits = try engine.search(query: "run", limit: 10)
+        XCTAssertTrue(runHits.contains { $0.refId == "n2" && $0.kind == .note })
+        let ideaHits = try engine.search(query: "antifragility", limit: 10)
+        XCTAssertTrue(ideaHits.contains { $0.refId == "i1" && $0.kind == .idea })
+        XCTAssertTrue(try engine.search(query: "zzznomatch", limit: 10).isEmpty)
+    }
 }

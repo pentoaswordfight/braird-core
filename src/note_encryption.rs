@@ -9,6 +9,15 @@ use crate::CryptoError;
 const SENTINEL_V1: &str = "enc:v1:";
 const SENTINEL_V2: &str = "enc:v2:";
 
+/// Structural check: does this stored `text` carry an `enc:v1`/`enc:v2` sentinel? Mirrors the
+/// PWA's `isEncrypted()` — a prefix test only, it does NOT attempt decryption. The read API
+/// (SUR-744) uses it to decide whether a `notes.text` needs `decrypt_note` (ciphertext at rest)
+/// or is already plaintext/empty, so an unencrypted or empty note is never mislabelled a decrypt
+/// failure, and a genuine ciphertext value can never leak across the FFI undecrypted.
+pub fn is_encrypted(value: &str) -> bool {
+    value.starts_with(SENTINEL_V1) || value.starts_with(SENTINEL_V2)
+}
+
 /// Seal plaintext. `note_id = Some` → enc:v2 (AAD = UTF-8 noteId); `None` → enc:v1.
 pub fn encrypt_note(mk: &[u8], note_id: Option<&str>, plaintext: &str, iv: &[u8]) -> String {
     let (aad, sentinel) = match note_id {
