@@ -535,6 +535,71 @@ impl Store {
             .optional()
     }
 
+    // ── read/query surface (SUR-744) ─────────────────────────────────────────
+    // Paginated, soft-delete-filtered reads for the native list/search screens. All
+    // descriptor-driven like `get_row`, so a new synced table joins by extending
+    // `synced_schema`. `text` on `notes` stays ciphertext here — decryption happens one
+    // layer up in the FFI (`SyncEngine`, which holds the `Vault`); the store never sees a
+    // master key, so the ADR 0003 ciphertext-at-rest boundary is preserved.
+
+    /// List live (`deleted = 0`) rows of a synced table, newest-first (`created_at DESC`,
+    /// `id DESC` tiebreak for deterministic offset pagination), as JSON objects. An optional
+    /// single-column equality filter serves notes-by-book. `limit < 0` = no limit (the
+    /// search-index scan wants the whole corpus). The table + filter-column identifiers are
+    /// descriptor-derived or fixed literals from the caller — **never host input** — so
+    /// interpolating them is safe (same posture as `get_row`/`apply_row`); the filter VALUE
+    /// is always a bound parameter.
+    pub fn list_live(
+        &self,
+        table: &str,
+        filter: Option<(&str, &str)>,
+        limit: i64,
+        offset: i64,
+    ) -> rusqlite::Result<Vec<Map<String, Value>>> {
+        let schema = schema_or_err(table)?;
+        let col_list = schema
+            .columns
+            .iter()
+            .map(|(n, _)| *n)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut sql = format!("SELECT {col_list} FROM {} WHERE deleted = 0", schema.name);
+        let mut params: Vec<SqlValue> = Vec::new();
+        if let Some((col, val)) = filter {
+            sql.push_str(&format!(" AND {col} = ?"));
+            params.push(SqlValue::Text(val.to_string()));
+        }
+        sql.push_str(" ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?");
+        params.push(SqlValue::Integer(limit));
+        params.push(SqlValue::Integer(offset));
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(params), |row| {
+            let mut map = Map::new();
+            for (i, (name, ty)) in schema.columns.iter().enumerate() {
+                let sv: SqlValue = row.get(i)?;
+                map.insert((*name).to_string(), sql_to_json(sv, *ty));
+            }
+            Ok(map)
+        })?;
+        rows.collect()
+    }
+
+    /// Count live (`deleted = 0`) rows of a synced table, with the same optional single-column
+    /// equality filter as [`Store::list_live`] (used for a book's note-count badge). Identifier
+    /// safety is identical: table/column are caller-fixed, the value is bound.
+    pub fn count_live(&self, table: &str, filter: Option<(&str, &str)>) -> rusqlite::Result<i64> {
+        let schema = schema_or_err(table)?;
+        let mut sql = format!("SELECT count(*) FROM {} WHERE deleted = 0", schema.name);
+        match filter {
+            Some((col, val)) => {
+                sql.push_str(&format!(" AND {col} = ?1"));
+                self.conn.query_row(&sql, [val], |row| row.get(0))
+            }
+            None => self.conn.query_row(&sql, [], |row| row.get(0)),
+        }
+    }
+
     /// Upsert a remote row into a synced table (the pull sink). The row is **projected onto the
     /// descriptor's known columns** — `user_id` (the one server-only column on the wire) and any
     /// future additive server column are dropped, and `Json` columns are stored as TEXT. A stray

@@ -539,6 +539,11 @@ fileprivate struct FfiConverterData: FfiConverterRustBuffer {
 public protocol SyncEngineProtocol : AnyObject {
     
     /**
+     * Live (non-deleted) row totals for books / notes / custom ideas.
+     */
+    func counts() throws  -> StoreCounts
+    
+    /**
      * Enqueue a book upsert. `updated_at` is stamped in epoch ms at enqueue (never omitted —
      * the migration default is 0). Plaintext metadata only, no encryption branch (like the PWA
      * `upsertBook`). Column NAMES mirror `upsertBook` in surfc `src/supabase.js` exactly.
@@ -636,6 +641,32 @@ public protocol SyncEngineProtocol : AnyObject {
     func flush() throws  -> FlushSummary
     
     /**
+     * One book by id, or `None` if absent or soft-deleted.
+     */
+    func getBook(id: String) throws  -> BookRecord?
+    
+    /**
+     * One note by id, decrypted, or `None` if absent or soft-deleted.
+     */
+    func getNote(id: String) throws  -> NoteRecord?
+    
+    /**
+     * Books for the Library / Sources grid, newest-first, each with its live `note_count`.
+     */
+    func listBooks(limit: UInt32, offset: UInt32) throws  -> [BookRecord]
+    
+    /**
+     * Custom ideas for the AddIdeaSheet "Your Ideas" section, newest-first.
+     */
+    func listCustomIdeas(limit: UInt32, offset: UInt32) throws  -> [CustomIdeaRecord]
+    
+    /**
+     * Notes newest-first. `book_id = None` → the Commonplace flat list (all notes); `Some` →
+     * that book's notes. `text` is decrypted plaintext, or `None` with `decrypt_failed = true`.
+     */
+    func listNotes(bookId: String?, limit: UInt32, offset: UInt32) throws  -> [NoteRecord]
+    
+    /**
      * Pull incrementally from Supabase for **all eight synced tables** (SUR-726 —
      * [`synced_table_names`] is the one source of the pull scope). Merges last-write-wins by
      * `updated_at`, applies tombstones without resurrecting soft-deleted rows, **rebases the outbox**
@@ -653,6 +684,13 @@ public protocol SyncEngineProtocol : AnyObject {
      * flush destroying a newer SERVER row before a pull can see it is the server's job, PR-3.)
      */
     func pull() throws  -> PullSummary
+    
+    /**
+     * Lexical search over decrypted note text + custom-idea name/description (SUR-527 parity).
+     * Rebuilds the in-memory index from the live store per call — no plaintext touches disk —
+     * and returns up to `limit` hits, best-first.
+     */
+    func search(query: String, limit: UInt32) throws  -> [SearchHit]
     
     /**
      * Hand the core a GoTrue-issued access token (JWT). The core makes its OWN authenticated
@@ -754,6 +792,16 @@ public static func `open`(dbPath: String, supabaseUrl: String, anonKey: String, 
 }
     
 
+    
+    /**
+     * Live (non-deleted) row totals for books / notes / custom ideas.
+     */
+open func counts()throws  -> StoreCounts {
+    return try  FfiConverterTypeStoreCounts.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_braird_core_fn_method_syncengine_counts(self.uniffiClonePointer(),$0
+    )
+})
+}
     
     /**
      * Enqueue a book upsert. `updated_at` is stamped in epoch ms at enqueue (never omitted —
@@ -948,6 +996,66 @@ open func flush()throws  -> FlushSummary {
 }
     
     /**
+     * One book by id, or `None` if absent or soft-deleted.
+     */
+open func getBook(id: String)throws  -> BookRecord? {
+    return try  FfiConverterOptionTypeBookRecord.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_braird_core_fn_method_syncengine_get_book(self.uniffiClonePointer(),
+        FfiConverterString.lower(id),$0
+    )
+})
+}
+    
+    /**
+     * One note by id, decrypted, or `None` if absent or soft-deleted.
+     */
+open func getNote(id: String)throws  -> NoteRecord? {
+    return try  FfiConverterOptionTypeNoteRecord.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_braird_core_fn_method_syncengine_get_note(self.uniffiClonePointer(),
+        FfiConverterString.lower(id),$0
+    )
+})
+}
+    
+    /**
+     * Books for the Library / Sources grid, newest-first, each with its live `note_count`.
+     */
+open func listBooks(limit: UInt32, offset: UInt32)throws  -> [BookRecord] {
+    return try  FfiConverterSequenceTypeBookRecord.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_braird_core_fn_method_syncengine_list_books(self.uniffiClonePointer(),
+        FfiConverterUInt32.lower(limit),
+        FfiConverterUInt32.lower(offset),$0
+    )
+})
+}
+    
+    /**
+     * Custom ideas for the AddIdeaSheet "Your Ideas" section, newest-first.
+     */
+open func listCustomIdeas(limit: UInt32, offset: UInt32)throws  -> [CustomIdeaRecord] {
+    return try  FfiConverterSequenceTypeCustomIdeaRecord.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_braird_core_fn_method_syncengine_list_custom_ideas(self.uniffiClonePointer(),
+        FfiConverterUInt32.lower(limit),
+        FfiConverterUInt32.lower(offset),$0
+    )
+})
+}
+    
+    /**
+     * Notes newest-first. `book_id = None` → the Commonplace flat list (all notes); `Some` →
+     * that book's notes. `text` is decrypted plaintext, or `None` with `decrypt_failed = true`.
+     */
+open func listNotes(bookId: String?, limit: UInt32, offset: UInt32)throws  -> [NoteRecord] {
+    return try  FfiConverterSequenceTypeNoteRecord.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_braird_core_fn_method_syncengine_list_notes(self.uniffiClonePointer(),
+        FfiConverterOptionString.lower(bookId),
+        FfiConverterUInt32.lower(limit),
+        FfiConverterUInt32.lower(offset),$0
+    )
+})
+}
+    
+    /**
      * Pull incrementally from Supabase for **all eight synced tables** (SUR-726 —
      * [`synced_table_names`] is the one source of the pull scope). Merges last-write-wins by
      * `updated_at`, applies tombstones without resurrecting soft-deleted rows, **rebases the outbox**
@@ -967,6 +1075,20 @@ open func flush()throws  -> FlushSummary {
 open func pull()throws  -> PullSummary {
     return try  FfiConverterTypePullSummary.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
     uniffi_braird_core_fn_method_syncengine_pull(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * Lexical search over decrypted note text + custom-idea name/description (SUR-527 parity).
+     * Rebuilds the in-memory index from the live store per call — no plaintext touches disk —
+     * and returns up to `limit` hits, best-first.
+     */
+open func search(query: String, limit: UInt32)throws  -> [SearchHit] {
+    return try  FfiConverterSequenceTypeSearchHit.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_braird_core_fn_method_syncengine_search(self.uniffiClonePointer(),
+        FfiConverterString.lower(query),
+        FfiConverterUInt32.lower(limit),$0
     )
 })
 }
@@ -1351,6 +1473,234 @@ public func FfiConverterTypeVault_lower(_ value: Vault) -> UnsafeMutableRawPoint
 
 
 /**
+ * A book for the Library / Sources grid: the descriptor column set (minus `deleted`, which is
+ * always `0` for a returned row) plus `note_count` — live notes filed under this book, for the
+ * grid's count badge.
+ */
+public struct BookRecord {
+    public var id: String
+    public var title: String?
+    public var author: String?
+    public var isbn: String?
+    public var coverUrl: String?
+    public var coverSource: String?
+    public var coverResolvedAt: Int64?
+    public var createdAt: Int64
+    public var updatedAt: Int64
+    public var noteCount: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(id: String, title: String?, author: String?, isbn: String?, coverUrl: String?, coverSource: String?, coverResolvedAt: Int64?, createdAt: Int64, updatedAt: Int64, noteCount: UInt32) {
+        self.id = id
+        self.title = title
+        self.author = author
+        self.isbn = isbn
+        self.coverUrl = coverUrl
+        self.coverSource = coverSource
+        self.coverResolvedAt = coverResolvedAt
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+        self.noteCount = noteCount
+    }
+}
+
+
+
+extension BookRecord: Equatable, Hashable {
+    public static func ==(lhs: BookRecord, rhs: BookRecord) -> Bool {
+        if lhs.id != rhs.id {
+            return false
+        }
+        if lhs.title != rhs.title {
+            return false
+        }
+        if lhs.author != rhs.author {
+            return false
+        }
+        if lhs.isbn != rhs.isbn {
+            return false
+        }
+        if lhs.coverUrl != rhs.coverUrl {
+            return false
+        }
+        if lhs.coverSource != rhs.coverSource {
+            return false
+        }
+        if lhs.coverResolvedAt != rhs.coverResolvedAt {
+            return false
+        }
+        if lhs.createdAt != rhs.createdAt {
+            return false
+        }
+        if lhs.updatedAt != rhs.updatedAt {
+            return false
+        }
+        if lhs.noteCount != rhs.noteCount {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(id)
+        hasher.combine(title)
+        hasher.combine(author)
+        hasher.combine(isbn)
+        hasher.combine(coverUrl)
+        hasher.combine(coverSource)
+        hasher.combine(coverResolvedAt)
+        hasher.combine(createdAt)
+        hasher.combine(updatedAt)
+        hasher.combine(noteCount)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeBookRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> BookRecord {
+        return
+            try BookRecord(
+                id: FfiConverterString.read(from: &buf), 
+                title: FfiConverterOptionString.read(from: &buf), 
+                author: FfiConverterOptionString.read(from: &buf), 
+                isbn: FfiConverterOptionString.read(from: &buf), 
+                coverUrl: FfiConverterOptionString.read(from: &buf), 
+                coverSource: FfiConverterOptionString.read(from: &buf), 
+                coverResolvedAt: FfiConverterOptionInt64.read(from: &buf), 
+                createdAt: FfiConverterInt64.read(from: &buf), 
+                updatedAt: FfiConverterInt64.read(from: &buf), 
+                noteCount: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: BookRecord, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.id, into: &buf)
+        FfiConverterOptionString.write(value.title, into: &buf)
+        FfiConverterOptionString.write(value.author, into: &buf)
+        FfiConverterOptionString.write(value.isbn, into: &buf)
+        FfiConverterOptionString.write(value.coverUrl, into: &buf)
+        FfiConverterOptionString.write(value.coverSource, into: &buf)
+        FfiConverterOptionInt64.write(value.coverResolvedAt, into: &buf)
+        FfiConverterInt64.write(value.createdAt, into: &buf)
+        FfiConverterInt64.write(value.updatedAt, into: &buf)
+        FfiConverterUInt32.write(value.noteCount, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeBookRecord_lift(_ buf: RustBuffer) throws -> BookRecord {
+    return try FfiConverterTypeBookRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeBookRecord_lower(_ value: BookRecord) -> RustBuffer {
+    return FfiConverterTypeBookRecord.lower(value)
+}
+
+
+/**
+ * A custom idea for the AddIdeaSheet "Your Ideas" section.
+ */
+public struct CustomIdeaRecord {
+    public var id: String
+    public var name: String?
+    public var description: String?
+    public var createdAt: Int64
+    public var updatedAt: Int64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(id: String, name: String?, description: String?, createdAt: Int64, updatedAt: Int64) {
+        self.id = id
+        self.name = name
+        self.description = description
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+    }
+}
+
+
+
+extension CustomIdeaRecord: Equatable, Hashable {
+    public static func ==(lhs: CustomIdeaRecord, rhs: CustomIdeaRecord) -> Bool {
+        if lhs.id != rhs.id {
+            return false
+        }
+        if lhs.name != rhs.name {
+            return false
+        }
+        if lhs.description != rhs.description {
+            return false
+        }
+        if lhs.createdAt != rhs.createdAt {
+            return false
+        }
+        if lhs.updatedAt != rhs.updatedAt {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(id)
+        hasher.combine(name)
+        hasher.combine(description)
+        hasher.combine(createdAt)
+        hasher.combine(updatedAt)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCustomIdeaRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CustomIdeaRecord {
+        return
+            try CustomIdeaRecord(
+                id: FfiConverterString.read(from: &buf), 
+                name: FfiConverterOptionString.read(from: &buf), 
+                description: FfiConverterOptionString.read(from: &buf), 
+                createdAt: FfiConverterInt64.read(from: &buf), 
+                updatedAt: FfiConverterInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CustomIdeaRecord, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.id, into: &buf)
+        FfiConverterOptionString.write(value.name, into: &buf)
+        FfiConverterOptionString.write(value.description, into: &buf)
+        FfiConverterInt64.write(value.createdAt, into: &buf)
+        FfiConverterInt64.write(value.updatedAt, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCustomIdeaRecord_lift(_ buf: RustBuffer) throws -> CustomIdeaRecord {
+    return try FfiConverterTypeCustomIdeaRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCustomIdeaRecord_lower(_ value: CustomIdeaRecord) -> RustBuffer {
+    return FfiConverterTypeCustomIdeaRecord.lower(value)
+}
+
+
+/**
  * The result of a flush across the FFI: how many outbox ids were pushed vs. left queued.
  */
 public struct FlushSummary {
@@ -1416,6 +1766,182 @@ public func FfiConverterTypeFlushSummary_lift(_ buf: RustBuffer) throws -> Flush
 #endif
 public func FfiConverterTypeFlushSummary_lower(_ value: FlushSummary) -> RustBuffer {
     return FfiConverterTypeFlushSummary.lower(value)
+}
+
+
+/**
+ * A note for the Commonplace list / NoteForm. `text` is **plaintext** (decrypted in core), or
+ * `None` when the row failed to decrypt (`decrypt_failed = true`) or genuinely has no text.
+ * `source_meta_json` mirrors the write-side `…Json` convention — the `source_meta` object
+ * re-serialized to a JSON string, since UniFFI has no jsonb type.
+ */
+public struct NoteRecord {
+    public var id: String
+    public var bookId: String?
+    public var text: String?
+    public var decryptFailed: Bool
+    public var page: String?
+    public var tags: [String]
+    public var imagePath: String?
+    public var inkCropPath: String?
+    public var source: String?
+    public var sourceId: String?
+    public var sourceMetaJson: String?
+    public var chapter: String?
+    public var contentTag: String?
+    public var createdAt: Int64
+    public var updatedAt: Int64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(id: String, bookId: String?, text: String?, decryptFailed: Bool, page: String?, tags: [String], imagePath: String?, inkCropPath: String?, source: String?, sourceId: String?, sourceMetaJson: String?, chapter: String?, contentTag: String?, createdAt: Int64, updatedAt: Int64) {
+        self.id = id
+        self.bookId = bookId
+        self.text = text
+        self.decryptFailed = decryptFailed
+        self.page = page
+        self.tags = tags
+        self.imagePath = imagePath
+        self.inkCropPath = inkCropPath
+        self.source = source
+        self.sourceId = sourceId
+        self.sourceMetaJson = sourceMetaJson
+        self.chapter = chapter
+        self.contentTag = contentTag
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+    }
+}
+
+
+
+extension NoteRecord: Equatable, Hashable {
+    public static func ==(lhs: NoteRecord, rhs: NoteRecord) -> Bool {
+        if lhs.id != rhs.id {
+            return false
+        }
+        if lhs.bookId != rhs.bookId {
+            return false
+        }
+        if lhs.text != rhs.text {
+            return false
+        }
+        if lhs.decryptFailed != rhs.decryptFailed {
+            return false
+        }
+        if lhs.page != rhs.page {
+            return false
+        }
+        if lhs.tags != rhs.tags {
+            return false
+        }
+        if lhs.imagePath != rhs.imagePath {
+            return false
+        }
+        if lhs.inkCropPath != rhs.inkCropPath {
+            return false
+        }
+        if lhs.source != rhs.source {
+            return false
+        }
+        if lhs.sourceId != rhs.sourceId {
+            return false
+        }
+        if lhs.sourceMetaJson != rhs.sourceMetaJson {
+            return false
+        }
+        if lhs.chapter != rhs.chapter {
+            return false
+        }
+        if lhs.contentTag != rhs.contentTag {
+            return false
+        }
+        if lhs.createdAt != rhs.createdAt {
+            return false
+        }
+        if lhs.updatedAt != rhs.updatedAt {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(id)
+        hasher.combine(bookId)
+        hasher.combine(text)
+        hasher.combine(decryptFailed)
+        hasher.combine(page)
+        hasher.combine(tags)
+        hasher.combine(imagePath)
+        hasher.combine(inkCropPath)
+        hasher.combine(source)
+        hasher.combine(sourceId)
+        hasher.combine(sourceMetaJson)
+        hasher.combine(chapter)
+        hasher.combine(contentTag)
+        hasher.combine(createdAt)
+        hasher.combine(updatedAt)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeNoteRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> NoteRecord {
+        return
+            try NoteRecord(
+                id: FfiConverterString.read(from: &buf), 
+                bookId: FfiConverterOptionString.read(from: &buf), 
+                text: FfiConverterOptionString.read(from: &buf), 
+                decryptFailed: FfiConverterBool.read(from: &buf), 
+                page: FfiConverterOptionString.read(from: &buf), 
+                tags: FfiConverterSequenceString.read(from: &buf), 
+                imagePath: FfiConverterOptionString.read(from: &buf), 
+                inkCropPath: FfiConverterOptionString.read(from: &buf), 
+                source: FfiConverterOptionString.read(from: &buf), 
+                sourceId: FfiConverterOptionString.read(from: &buf), 
+                sourceMetaJson: FfiConverterOptionString.read(from: &buf), 
+                chapter: FfiConverterOptionString.read(from: &buf), 
+                contentTag: FfiConverterOptionString.read(from: &buf), 
+                createdAt: FfiConverterInt64.read(from: &buf), 
+                updatedAt: FfiConverterInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: NoteRecord, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.id, into: &buf)
+        FfiConverterOptionString.write(value.bookId, into: &buf)
+        FfiConverterOptionString.write(value.text, into: &buf)
+        FfiConverterBool.write(value.decryptFailed, into: &buf)
+        FfiConverterOptionString.write(value.page, into: &buf)
+        FfiConverterSequenceString.write(value.tags, into: &buf)
+        FfiConverterOptionString.write(value.imagePath, into: &buf)
+        FfiConverterOptionString.write(value.inkCropPath, into: &buf)
+        FfiConverterOptionString.write(value.source, into: &buf)
+        FfiConverterOptionString.write(value.sourceId, into: &buf)
+        FfiConverterOptionString.write(value.sourceMetaJson, into: &buf)
+        FfiConverterOptionString.write(value.chapter, into: &buf)
+        FfiConverterOptionString.write(value.contentTag, into: &buf)
+        FfiConverterInt64.write(value.createdAt, into: &buf)
+        FfiConverterInt64.write(value.updatedAt, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeNoteRecord_lift(_ buf: RustBuffer) throws -> NoteRecord {
+    return try FfiConverterTypeNoteRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeNoteRecord_lower(_ value: NoteRecord) -> RustBuffer {
+    return FfiConverterTypeNoteRecord.lower(value)
 }
 
 
@@ -1504,6 +2030,178 @@ public func FfiConverterTypePullSummary_lift(_ buf: RustBuffer) throws -> PullSu
 #endif
 public func FfiConverterTypePullSummary_lower(_ value: PullSummary) -> RustBuffer {
     return FfiConverterTypePullSummary.lower(value)
+}
+
+
+/**
+ * One search result, shaped like the PWA's `runSearch` output: `refId → ref_id`, `type → kind`,
+ * plus `title`/`snippet`/`score`. `snippet` is the content (or the title when the doc has no
+ * body), matching `hit.content || hit.title`.
+ */
+public struct SearchHit {
+    public var kind: SearchDocKind
+    public var refId: String
+    public var title: String
+    public var snippet: String
+    public var score: Double
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(kind: SearchDocKind, refId: String, title: String, snippet: String, score: Double) {
+        self.kind = kind
+        self.refId = refId
+        self.title = title
+        self.snippet = snippet
+        self.score = score
+    }
+}
+
+
+
+extension SearchHit: Equatable, Hashable {
+    public static func ==(lhs: SearchHit, rhs: SearchHit) -> Bool {
+        if lhs.kind != rhs.kind {
+            return false
+        }
+        if lhs.refId != rhs.refId {
+            return false
+        }
+        if lhs.title != rhs.title {
+            return false
+        }
+        if lhs.snippet != rhs.snippet {
+            return false
+        }
+        if lhs.score != rhs.score {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(kind)
+        hasher.combine(refId)
+        hasher.combine(title)
+        hasher.combine(snippet)
+        hasher.combine(score)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSearchHit: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SearchHit {
+        return
+            try SearchHit(
+                kind: FfiConverterTypeSearchDocKind.read(from: &buf), 
+                refId: FfiConverterString.read(from: &buf), 
+                title: FfiConverterString.read(from: &buf), 
+                snippet: FfiConverterString.read(from: &buf), 
+                score: FfiConverterDouble.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SearchHit, into buf: inout [UInt8]) {
+        FfiConverterTypeSearchDocKind.write(value.kind, into: &buf)
+        FfiConverterString.write(value.refId, into: &buf)
+        FfiConverterString.write(value.title, into: &buf)
+        FfiConverterString.write(value.snippet, into: &buf)
+        FfiConverterDouble.write(value.score, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSearchHit_lift(_ buf: RustBuffer) throws -> SearchHit {
+    return try FfiConverterTypeSearchHit.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSearchHit_lower(_ value: SearchHit) -> RustBuffer {
+    return FfiConverterTypeSearchHit.lower(value)
+}
+
+
+/**
+ * Live (non-deleted) row totals for stat / empty-state surfaces.
+ */
+public struct StoreCounts {
+    public var books: UInt32
+    public var notes: UInt32
+    public var customIdeas: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(books: UInt32, notes: UInt32, customIdeas: UInt32) {
+        self.books = books
+        self.notes = notes
+        self.customIdeas = customIdeas
+    }
+}
+
+
+
+extension StoreCounts: Equatable, Hashable {
+    public static func ==(lhs: StoreCounts, rhs: StoreCounts) -> Bool {
+        if lhs.books != rhs.books {
+            return false
+        }
+        if lhs.notes != rhs.notes {
+            return false
+        }
+        if lhs.customIdeas != rhs.customIdeas {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(books)
+        hasher.combine(notes)
+        hasher.combine(customIdeas)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeStoreCounts: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> StoreCounts {
+        return
+            try StoreCounts(
+                books: FfiConverterUInt32.read(from: &buf), 
+                notes: FfiConverterUInt32.read(from: &buf), 
+                customIdeas: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: StoreCounts, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.books, into: &buf)
+        FfiConverterUInt32.write(value.notes, into: &buf)
+        FfiConverterUInt32.write(value.customIdeas, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeStoreCounts_lift(_ buf: RustBuffer) throws -> StoreCounts {
+    return try FfiConverterTypeStoreCounts.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeStoreCounts_lower(_ value: StoreCounts) -> RustBuffer {
+    return FfiConverterTypeStoreCounts.lower(value)
 }
 
 
@@ -1807,6 +2505,76 @@ extension CryptoError: Foundation.LocalizedError {
     }
 }
 
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Which entity a [`SearchHit`] points at. Mirrors the PWA's `type` field (`'note'`/`'idea'`),
+ * but a closed enum gives Swift/Kotlin an exhaustive switch instead of a stringly-typed field.
+ * Scope is notes + custom-ideas only (SUR-744 decision 1); books aren't indexed by the PWA and
+ * lenses/collections have no v1 read surface.
+ */
+
+public enum SearchDocKind {
+    
+    case note
+    case idea
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSearchDocKind: FfiConverterRustBuffer {
+    typealias SwiftType = SearchDocKind
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SearchDocKind {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .note
+        
+        case 2: return .idea
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: SearchDocKind, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .note:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .idea:
+            writeInt(&buf, Int32(2))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSearchDocKind_lift(_ buf: RustBuffer) throws -> SearchDocKind {
+    return try FfiConverterTypeSearchDocKind.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSearchDocKind_lower(_ value: SearchDocKind) -> RustBuffer {
+    return FfiConverterTypeSearchDocKind.lower(value)
+}
+
+
+
+extension SearchDocKind: Equatable, Hashable {}
+
+
+
 
 /**
  * Errors that cross the FFI from the sync engine. Coarse like [`crate::CryptoError`]: enough
@@ -1928,6 +2696,54 @@ fileprivate struct FfiConverterOptionString: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeBookRecord: FfiConverterRustBuffer {
+    typealias SwiftType = BookRecord?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeBookRecord.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeBookRecord.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeNoteRecord: FfiConverterRustBuffer {
+    typealias SwiftType = NoteRecord?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeNoteRecord.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeNoteRecord.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceString: FfiConverterRustBuffer {
     typealias SwiftType = [String]
 
@@ -1945,6 +2761,106 @@ fileprivate struct FfiConverterSequenceString: FfiConverterRustBuffer {
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterString.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeBookRecord: FfiConverterRustBuffer {
+    typealias SwiftType = [BookRecord]
+
+    public static func write(_ value: [BookRecord], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeBookRecord.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [BookRecord] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [BookRecord]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeBookRecord.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeCustomIdeaRecord: FfiConverterRustBuffer {
+    typealias SwiftType = [CustomIdeaRecord]
+
+    public static func write(_ value: [CustomIdeaRecord], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeCustomIdeaRecord.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [CustomIdeaRecord] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [CustomIdeaRecord]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeCustomIdeaRecord.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeNoteRecord: FfiConverterRustBuffer {
+    typealias SwiftType = [NoteRecord]
+
+    public static func write(_ value: [NoteRecord], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeNoteRecord.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [NoteRecord] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [NoteRecord]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeNoteRecord.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeSearchHit: FfiConverterRustBuffer {
+    typealias SwiftType = [SearchHit]
+
+    public static func write(_ value: [SearchHit], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeSearchHit.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [SearchHit] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [SearchHit]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeSearchHit.read(from: &buf))
         }
         return seq
     }
@@ -2007,6 +2923,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_braird_core_checksum_func_membership_id() != 9610) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_braird_core_checksum_method_syncengine_counts() != 56423) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_braird_core_checksum_method_syncengine_enqueue_book() != 63811) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -2034,7 +2953,25 @@ private var initializationResult: InitializationResult = {
     if (uniffi_braird_core_checksum_method_syncengine_flush() != 39156) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_braird_core_checksum_method_syncengine_get_book() != 48807) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_braird_core_checksum_method_syncengine_get_note() != 41812) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_braird_core_checksum_method_syncengine_list_books() != 22597) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_braird_core_checksum_method_syncengine_list_custom_ideas() != 63630) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_braird_core_checksum_method_syncengine_list_notes() != 26133) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_braird_core_checksum_method_syncengine_pull() != 8960) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_braird_core_checksum_method_syncengine_search() != 14411) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_set_access_token() != 47386) {

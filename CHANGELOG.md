@@ -7,6 +7,32 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 ## [Unreleased]
 
 ### Added
+- **Read/query API over the FFI + in-memory lexical search (SUR-744, Phase 2b).** The first read
+  surface on the core — hosts can now list and search books/notes/ideas without ever touching the
+  core's SQLite (unblocks SUR-660 M6 / SUR-754). New `#[uniffi::export]` methods on `SyncEngine`:
+  `list_books`, `get_book`, `list_notes` (`book_id: None` = the Commonplace flat list, `Some` =
+  per-book), `get_note`, `list_custom_ideas`, `counts`, and `search`; plus the `BookRecord`
+  (with a live `note_count`), `NoteRecord`, `CustomIdeaRecord`, `StoreCounts`, `SearchHit`, and
+  `SearchDocKind` DTOs. All reads exclude soft-deleted rows, order `created_at DESC`, and paginate
+  on `limit`+`offset`.
+  - **Decrypt-in-core (crypto boundary).** `NoteRecord.text` is **plaintext** — decrypted per-read
+    via the held `Vault`, so `enc:` ciphertext can never cross the FFI for display. A corrupt /
+    foreign-AAD row surfaces as `text: None, decrypt_failed: true` and is excluded from the search
+    index, never failing the whole page (mirrors the PWA's `decryptError` skip). Nothing is written
+    back to the store — ADR 0003's ciphertext-at-rest posture holds on the read side (ADR 0005).
+  - **Lexical search = a MiniSearch port, verdicts exact.** `src/search.rs` reproduces the PWA's
+    `lexicalSearch.js` (SUR-527) matching — the `stem()`/`undouble()` stemmer ported verbatim, the
+    `\p{Z}\p{P}` tokenizer (reusing `normalize.rs`'s `unicode-general-category` tables — no new
+    dep), and exact ∪ prefix ∪ fuzzy(Levenshtein) OR-matching with a 2× title boost. **Not FTS5**
+    (its Porter stemmer diverges and it has no fuzzy). Index is **in-memory, rebuilt per `search()`**
+    — no plaintext note text ever reaches disk. Scope: notes + custom_ideas (books aren't indexed
+    by the PWA; lenses/collections have no v1 read surface). Decision recorded in **ADR 0005**.
+  - **Store:** two table-generic read helpers — `Store::list_live` (paginated, soft-delete-filtered,
+    optional single-column filter for notes-by-book) and `Store::count_live`; a structural
+    `note_encryption::is_encrypted` (mirror of the PWA's `isEncrypted()`).
+  - **FFI:** new binding surface → regenerated Swift + Kotlin via `scripts/gen-bindings.sh`; Swift +
+    Kotlin round-trip tests exercise list/get/counts/search (incl. the no-`enc:`-sentinel guard).
+    New surface → `naming-reviewer` + `crypto-reviewer` gate.
 - **`docs/learnings/` — Phase-2 (SUR-659) closeout lessons.** Seed the learnings register (with the
   `_template.md` GATING.md references) and record the two non-obvious keepers from the fast-follows:
   a unique/monotonic sequence is **not** a commit-ordered watermark (`nextval` allocates
