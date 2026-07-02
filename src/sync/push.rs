@@ -248,7 +248,12 @@ mod tests {
         }
 
         // The push tests never pull; the flush path only drives `upsert`.
-        async fn fetch_since(&self, _table: &str, _cursor: i64) -> Result<Vec<Value>, String> {
+        async fn fetch_page(
+            &self,
+            _table: &str,
+            _after_seq: i64,
+            _limit: i64,
+        ) -> Result<Vec<Value>, String> {
             Ok(Vec::new())
         }
     }

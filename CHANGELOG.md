@@ -30,6 +30,26 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
     `membership_id` parity vectors, and topo/hold-back flush ordering.
 
 ### Fixed
+- **Pull now tracks the server `change_seq` watermark + paginates (SUR-739 + SUR-652 core leg).** The
+  incremental-pull cursor is keyed on the server-assigned monotonic `change_seq` (surfc migration 0051
+  / trigger `t02_change_seq`) instead of the puller's own clock, closing two holes:
+  - **SUR-739 (delivery):** a delayed/offline flush lands on the server with a client `updated_at`
+    older than other devices' cursors and was skipped forever. `change_seq` is stamped at
+    write-visibility, so an exclusive `change_seq > cursor` keyset delivers it the moment it appears —
+    retiring the 24h `PULL_CURSOR_OVERLAP_MS` lookback (a bounded heuristic that still missed longer
+    delays). LWW is unchanged (still client `updated_at`); only the delivery axis moved.
+  - **SUR-652 (pagination):** `get_since` (a single unpaged GET) advanced the cursor past any rows
+    beyond PostgREST's `max_rows` cap — a permanent skip on accounts over ~1000 rows/table. `get_page`
+    now pages by `change_seq` (`gt`, asc, `limit=1000`) and the pull loops until a short page, advancing
+    the cursor per merged page (a consistent prefix: a mid-pull failure resumes from the last merged
+    page, never re-pulling or skipping). Matches the PWA's `SYNC_PAGE_SIZE` keyset (surfc PR-3).
+  - `change_seq` is server-only ordering metadata: read from the raw incoming row for the cursor, then
+    projected away by `apply_row` — never added to a descriptor or outbox payload (keeps the
+    vendored-schema drift guard green). New cursor namespace `sync:seq:<table>`; the retired epoch-ms
+    `sync:cursor:<table>` key is ignored (absent new key → 0 → one-time full re-pull, also recovering
+    rows the old cursor historically skipped) and deleted on the first pull. Tests: keyset paging
+    across boundaries, cursor-not-advanced on mid-page failure, legacy-key migration, full-page-missing
+    -change_seq guard; the env-guarded coexistence matrix re-proves both directions against live 0051.
 - **Flush no longer wedges a queued row in a non-`books`/`notes` table (SUR-726).** The pre-fan-out
   flush dispatched only `books`/`notes` groups, so a queued row in any other synced table was neither
   sent nor failed — it sat in the outbox forever. The single topo-ordered dispatch pass sends every

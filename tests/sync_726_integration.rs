@@ -229,8 +229,8 @@ fn eight_store_roundtrip_both_directions() {
         "note_signals",
     ] {
         assert!(
-            store_b.get_sync_cursor(table).unwrap().unwrap_or(0) > 0,
-            "{table} cursor advanced after the pull"
+            store_b.get_seq_cursor(table).unwrap().unwrap_or(0) > 0,
+            "{table} change_seq cursor advanced after the pull"
         );
     }
 
