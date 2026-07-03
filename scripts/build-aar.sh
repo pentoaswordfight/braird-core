@@ -59,7 +59,12 @@ check_alignment() {
 }
 
 echo "▸ refreshing the committed binding (atomic with the .so built below)"
-scripts/gen-bindings.sh release
+# DEBUG build, not release: profile.release has `strip = true`, and UniFFI library-mode bindgen
+# reads its metadata from the cdylib's symbols — a stripped .so yields no bindings on Linux ELF
+# (works on Windows PE, which is why local build succeeds; the bindings-drift CI job uses this same
+# debug path and passes). The binding TEXT is profile-independent (derived from FFI metadata), so it
+# matches the shipped release .so's UniFFI checksums exactly.
+scripts/gen-bindings.sh
 
 # 16 KB page alignment is mandatory (targetSdk 35 Play requirement). NDK r28+ links aligned by
 # default; force the linker flag too so alignment holds regardless of the NDK version in use.
