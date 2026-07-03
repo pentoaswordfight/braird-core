@@ -6,6 +6,13 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-07-03
+
+First tagged release. Cuts the accumulated `[Unreleased]` history into `v0.1.0` so
+braird-android (SUR-762) has a real published artifact — Android AAR + desktop JVM jar +
+`SHA256SUMS.txt` — to pin (tag + per-artifact SHA-256, checksum-verified fetch; `docs/pinning.md`).
+No code change vs the prior `main`; this is the release-cut commit only.
+
 ### Added
 - **Android AAR + self-contained desktop JVM jar packaging, published + pinned via GitHub Releases
   (SUR-760, M0 of the SUR-661 Android app).** The core now ships to braird-android as pinned
