@@ -6,13 +6,20 @@ name: Release
 # Written generically (a staged `dist/` + one SHA256SUMS manifest) so the future iOS xcframework
 # release attaches to the same tag with no redesign. Routed to release-integrity-reviewer
 # (GATING.md §3.1): binding↔native atomicity, tag+SHA-256 pin, 16 KB alignment, version agreement.
+#
+# Hardening (release-integrity-reviewer, SUR-760):
+#   - Published assets are IMMUTABLE: create-only, no --clobber. A re-run on an already-published
+#     tag hard-fails — a fix to a shipped version is a NEW version, never a re-publish.
+#   - This lane holds `contents: write`, so no attacker-influenceable string is interpolated into a
+#     `run:` body: the tag/version reach shell only via `env:` (GitHub sets them as env vars, not
+#     into the command text), and the tag is allowlist-validated before any use.
 on:
   push:
     tags: ['v*']
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Existing tag to build a release for, e.g. v0.1.0'
+        description: 'Existing tag to build a release for, e.g. v0.1.0 (only if it has no release yet)'
         required: true
 
 permissions:
@@ -29,23 +36,32 @@ jobs:
         with:
           ref: ${{ github.event.inputs.tag || github.ref_name }}
 
-      - name: Resolve version (tag without the leading v)
+      - name: Resolve + validate the tag
         id: v
+        env:
+          # Assigned as an env var (not interpolated into the script text) — safe. Validated below
+          # before it is used anywhere as a shell arg, gh arg, or file-path component.
+          TAG_RAW: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
-          TAG="${{ github.event.inputs.tag || github.ref_name }}"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
-
-      # Fail-closed: the tag, the crate version, and the CHANGELOG must agree before anything ships.
-      - name: Verify tag == Cargo.toml version
-        run: |
-          CARGO_VER=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')
-          if [ "${{ steps.v.outputs.version }}" != "$CARGO_VER" ]; then
-            echo "::error::tag ${{ steps.v.outputs.version }} != Cargo.toml version $CARGO_VER — bump the crate + CHANGELOG in the release commit"
+          if ! printf '%s' "$TAG_RAW" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.]+)?$'; then
+            echo "::error::refusing tag '$TAG_RAW' — expected vMAJOR.MINOR.PATCH[.-suffix]"
             exit 1
           fi
-          grep -q "\[${{ steps.v.outputs.version }}\]" CHANGELOG.md || {
-            echo "::error::CHANGELOG.md has no [${{ steps.v.outputs.version }}] section"; exit 1; }
+          echo "tag=$TAG_RAW" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG_RAW#v}" >> "$GITHUB_OUTPUT"
+
+      # Fail-closed: the tag, the crate version, and the CHANGELOG must agree before anything ships.
+      - name: Verify tag == Cargo.toml version + CHANGELOG section
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          CARGO_VER=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')
+          if [ "$VERSION" != "$CARGO_VER" ]; then
+            echo "::error::tag $VERSION != Cargo.toml version $CARGO_VER — bump the crate + CHANGELOG in the release commit"
+            exit 1
+          fi
+          grep -Eq "^## \[$VERSION\]" CHANGELOG.md || {
+            echo "::error::CHANGELOG.md has no '## [$VERSION]' section header"; exit 1; }
 
       - name: Set up JDK
         uses: actions/setup-java@v4
@@ -53,8 +69,10 @@ jobs:
           distribution: temurin
           java-version: '21'
 
+      # SHA-pinned (not @stable): this lane carries the release-write token, so the action can't be
+      # allowed to change under a moving tag. SHA = dtolnay/rust-toolchain stable @ 2026-07-03.
       - name: Install Rust toolchain + Android targets
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           targets: aarch64-linux-android, x86_64-linux-android
 
@@ -70,40 +88,47 @@ jobs:
           echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/${NDK_PIN}" >> "$GITHUB_ENV"
 
       - name: Build AAR (cross-compile → assemble → 16 KB alignment check)
-        run: bash scripts/build-aar.sh "${{ steps.v.outputs.version }}"
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+        run: bash scripts/build-aar.sh "$VERSION"
 
       - name: Build the self-contained desktop jar
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
         working-directory: bindings/kotlin
-        run: ./gradlew jar --no-daemon -PcoreVersion=${{ steps.v.outputs.version }}
+        run: ./gradlew jar --no-daemon -PcoreVersion="$VERSION"
 
       - name: Stage artifacts + SHA-256 manifest
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
         run: |
-          cp "bindings/kotlin/build/libs/braird-core-desktop-${{ steps.v.outputs.version }}.jar" dist/
+          cp "bindings/kotlin/build/libs/braird-core-desktop-$VERSION.jar" dist/
           ( cd dist && sha256sum braird-core-*.aar braird-core-desktop-*.jar | tee SHA256SUMS.txt )
 
       # Prove the EXACT bytes we're about to publish are self-contained: no jna.library.path, the
       # consumer resolves the native from the jar alone.
       - name: Consumer round-trip against the built desktop jar
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
         working-directory: bindings/consumer-smoke
-        run: >
-          ./gradlew test --no-daemon
-          -PcoreVersion=${{ steps.v.outputs.version }}
-          -PcoreJar="$GITHUB_WORKSPACE/dist/braird-core-desktop-${{ steps.v.outputs.version }}.jar"
+        run: ./gradlew test --no-daemon -PcoreVersion="$VERSION" -PcoreJar="$GITHUB_WORKSPACE/dist/braird-core-desktop-$VERSION.jar"
 
-      - name: Publish GitHub Release + attach artifacts
+      # Create-only. Published assets are immutable: if a release for this tag already exists we
+      # hard-fail rather than overwrite — every consumer pin (tag + SHA-256) stays valid forever.
+      - name: Publish GitHub Release + attach artifacts (create-only)
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.v.outputs.tag }}
+          VERSION: ${{ steps.v.outputs.version }}
         run: |
-          FILES=(
-            "dist/braird-core-${{ steps.v.outputs.version }}.aar"
-            "dist/braird-core-desktop-${{ steps.v.outputs.version }}.jar"
-            "dist/SHA256SUMS.txt"
-          )
-          if gh release view "${{ steps.v.outputs.tag }}" >/dev/null 2>&1; then
-            gh release upload "${{ steps.v.outputs.tag }}" "${FILES[@]}" --clobber
-          else
-            gh release create "${{ steps.v.outputs.tag }}" "${FILES[@]}" \
-              --title "braird-core ${{ steps.v.outputs.tag }}" \
-              --verify-tag \
-              --notes "Pinned Android AAR (arm64-v8a + x86_64, 16 KB-aligned) + self-contained desktop JVM jar for braird-android. Add JNA >= 5.17.0 @aar alongside the AAR. Pin/bump protocol + checksum-verified fetch: docs/pinning.md. Verify downloads against SHA256SUMS.txt."
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::error::a release for $TAG already exists — published artifacts are immutable; cut a new version"
+            exit 1
           fi
+          gh release create "$TAG" \
+            "dist/braird-core-$VERSION.aar" \
+            "dist/braird-core-desktop-$VERSION.jar" \
+            "dist/SHA256SUMS.txt" \
+            --title "braird-core $TAG" \
+            --verify-tag \
+            --notes "Pinned Android AAR (arm64-v8a + x86_64, 16 KB-aligned) + self-contained desktop JVM jar for braird-android. Add JNA 5.17.0 @aar alongside the AAR. Pin/bump protocol + checksum-verified fetch: docs/pinning.md. Verify downloads against SHA256SUMS.txt."

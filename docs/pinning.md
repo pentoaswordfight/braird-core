@@ -14,9 +14,16 @@ it exists because the binding and the native are checksum-coupled and must move 
 | `braird-core-desktop-<version>.jar` | Self-contained JVM jar: the same binding + a bundled **linux-x86-64** `libbraird_core.so` at JNA's classpath-resource path — resolves with no `jna.library.path` | braird-android **JVM unit tests** (run on Linux CI) |
 | `SHA256SUMS.txt` | `sha256sum` of the two artifacts | integrity verification |
 
-Neither artifact bundles JNA. The consumer adds it alongside — the **same pinned version** the
-core built against (currently **JNA 5.17.0**): `@aar` for the AAR path (ships the 16 KB-aligned
+Neither artifact bundles JNA. The consumer adds it alongside — pinned to the **exact** version the
+core built against (**`5.17.0`**, not a range): `@aar` for the AAR path (ships the 16 KB-aligned
 per-ABI `libjnidispatch.so`), the plain jar for the desktop path.
+
+> **Alignment coverage boundary.** braird-core's release CI 16 KB-aligns and gates **its own**
+> `libbraird_core.so` (both ABIs) — that is the only native in the AAR. JNA's `libjnidispatch.so`
+> is *not* in this repo's artifact; it merges into the app at braird-android's APK build. So the
+> consumer's build (SUR-762) **must** run the 16 KB-alignment check (`zipalign -c -P 16` or the
+> NDK `check_elf_alignment.sh`) over the **merged** APK native libs, JNA included, and pin JNA to
+> the exact `5.17.0` — the version is the only thing guaranteeing `libjnidispatch.so` is aligned.
 
 ## Why pin a tag **and** a checksum
 
@@ -43,20 +50,27 @@ val brairdCoreSums = mapOf(
     "braird-core-desktop-0.1.0.jar"  to "…64 hex chars…",
 )
 
-// A download that fails closed on a checksum mismatch.
+// A download that fails closed on a checksum mismatch or a missing checksum. Download to a temp
+// file and rename only after it verifies, so a crashed/partial download can never be re-used.
 fun fetchPinned(name: String): File {
     val out = layout.buildDirectory.file("braird-core/$name").get().asFile
-    if (!out.exists()) {
-        out.parentFile.mkdirs()
-        uri("https://github.com/<org>/braird-core/releases/download/$brairdCoreTag/$name")
-            .toURL().openStream().use { it.copyTo(out.outputStream()) }
-    }
-    val got = out.inputStream().use { java.security.MessageDigest.getInstance("SHA-256")
+    val want = brairdCoreSums.getValue(name) // throws (fail-closed) if the pin has no checksum
+    fun sha256(f: File) = f.inputStream().use { java.security.MessageDigest.getInstance("SHA-256")
         .digest(it.readBytes()).joinToString("") { b -> "%02x".format(b) } }
-    check(got == brairdCoreSums.getValue(name)) { "braird-core $name checksum mismatch: $got" }
+    if (out.exists() && sha256(out) == want) return out
+    out.parentFile.mkdirs()
+    val tmp = File.createTempFile(name, ".part", out.parentFile)
+    uri("https://github.com/<org>/braird-core/releases/download/$brairdCoreTag/$name")
+        .toURL().openStream().use { tmp.outputStream().use { o -> it.copyTo(o) } }
+    val got = sha256(tmp)
+    check(got == want) { tmp.delete(); "braird-core $name checksum mismatch: got $got, want $want" }
+    tmp.renameTo(out)
     return out
 }
 ```
+
+This is illustrative; the reviewed, production fail-closed wiring lands in braird-android (SUR-762),
+where `release-integrity-reviewer` verifies it against real releases.
 
 The AAR consumer additionally declares `implementation("net.java.dev.jna:jna:5.17.0@aar")`; the
 desktop-jar (JVM test) consumer declares `testImplementation("net.java.dev.jna:jna:5.17.0")`.
