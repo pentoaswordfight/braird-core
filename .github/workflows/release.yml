@@ -32,23 +32,26 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.inputs.tag || github.ref_name }}
-
+      # Validate the tag FIRST, before anything (even checkout) consumes it. Assigned via env: (not
+      # interpolated into the script text). Whole-string bash `=~` match, not line-oriented grep: a
+      # multiline workflow_dispatch input could otherwise pass a per-line check and smuggle a newline
+      # into GITHUB_OUTPUT. Bash ERE has no REG_NEWLINE, so `$` anchors end-of-string → newline rejected.
       - name: Resolve + validate the tag
         id: v
         env:
-          # Assigned as an env var (not interpolated into the script text) — safe. Validated below
-          # before it is used anywhere as a shell arg, gh arg, or file-path component.
           TAG_RAW: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
-          if ! printf '%s' "$TAG_RAW" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.]+)?$'; then
+          re='^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.]+)?$'
+          if [[ ! "$TAG_RAW" =~ $re ]]; then
             echo "::error::refusing tag '$TAG_RAW' — expected vMAJOR.MINOR.PATCH[.-suffix]"
             exit 1
           fi
           echo "tag=$TAG_RAW" >> "$GITHUB_OUTPUT"
           echo "version=${TAG_RAW#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.v.outputs.tag }} # the validated tag, never the raw input
 
       # Fail-closed: the tag, the crate version, and the CHANGELOG must agree before anything ships.
       - name: Verify tag == Cargo.toml version + CHANGELOG section
