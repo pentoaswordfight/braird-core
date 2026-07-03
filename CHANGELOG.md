@@ -7,6 +7,13 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 ## [Unreleased]
 
 ### Added
+- **`release-integrity-reviewer` gate row for the release/packaging boundary (SUR-778).**
+  GATING.md §3.1 now routes `scripts/build-aar.sh`, `scripts/build-xcframework.sh`,
+  `.github/workflows/release.yml`, and `docs/pinning.md` to the new `release-integrity-reviewer`
+  persona (authored in gce, SUR-778): binding↔native atomicity, tag + SHA-256 pinning,
+  fail-closed checksum-verified fetch, 16 KB alignment gates. Pre-wired ahead of SUR-760 (the
+  first release pipeline) so the line auto-selects the persona for that PR's review; the fallback
+  gate stands until release CI exists.
 - **Read/query API over the FFI + in-memory lexical search (SUR-744, Phase 2b).** The first read
   surface on the core — hosts can now list and search books/notes/ideas without ever touching the
   core's SQLite (unblocks SUR-660 M6 / SUR-754). New `#[uniffi::export]` methods on `SyncEngine`:

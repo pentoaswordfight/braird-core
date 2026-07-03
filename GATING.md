@@ -64,6 +64,7 @@ repo by name (`shared/personas/<name>.md`).
 | Path | Pattern | Primary gate | Fallback gate (until primary exists) |
 |---|---|---|---|
 | The **sync engine + local store** (Phase 2, SUR-659) — `src/store.rs`, `src/sync/**`, `src/outbox.rs`, `src/http.rs`, `vendored/schema/**`, `scripts/extract-sync-schema.mjs` | **GCE only** | Schema-drift guard green — `vendored/schema/**` reconciles against `surfc/main`'s synced schema (`tests/schema_parity.rs` + `.github/workflows/schema-drift.yml`) — + founder sign-off | Founder sign-off after `sync-reviewer` (engine, PWA↔native coexistence, schema drift) **+** `crypto-reviewer` (the seal-at-flush boundary — note text must never leave unencrypted, SUR-724) pass |
+| The **release / packaging boundary** (SUR-760; row pre-wired by SUR-778) — `scripts/build-aar.sh`, `scripts/build-xcframework.sh`, `.github/workflows/release.yml`, `docs/pinning.md` | **GCE only** | Release CI green — every shipped `.so` 16 KB-aligned (bundled deps included), SHA-256 per artifact published with the release, tag / `Cargo.toml` version / CHANGELOG agree — + founder sign-off | Founder sign-off after a `release-integrity-reviewer` (binding↔native atomicity, tag + SHA-256 pin, fail-closed fetch, alignment gates) pass |
 | `bindings/**`, `src/bin/uniffi-bindgen.rs` — the generated Swift/Kotlin surface + its round-trip tests (the public API devs consume) | **GCE only** | Swift **and** Kotlin round-trip parity green + founder sign-off | Founder sign-off after `naming-reviewer` (the API *word*) **+** `crypto-reviewer` (the seam) pass |
 | `vendored/crypto-parity/**` — the crypto parity vectors vendored from `surfc/main` | **GCE only** | Vendored-drift guard green — byte-identical to `surfc/main` (§4) — + founder sign-off | `crypto-reviewer` confirms the vectors against `surfc/main` |
 | `src/**`, `tests/**`, `Cargo.toml`, `Cargo.lock` — the crate, every line of crypto, and the parity harness (`tests/parity.rs`; a harness that lies is worse than none). **Catch-all — kept LAST so the specific rows above win first-match** | **GCE only** | Parity eval green — the 10 in-scope + the normalization vectors **bit-identical**, foreign-ciphertext decrypt passes — + founder sign-off | Founder sign-off after a `crypto-reviewer` pass + a manual round-trip against a real `surfc`-written ciphertext |
@@ -73,7 +74,7 @@ repo by name (`shared/personas/<name>.md`).
 | Path | Pattern | Primary gate | Fallback gate (until primary exists) |
 |---|---|---|---|
 | `docs/adr/**` — architecture decision records (e.g. ADR 0002, the crypto backend) | **GCE only** | Founder sign-off | Founder sign-off after an `architecture-decision-reviewer` pass |
-| `.github/workflows/**` — the parity / vendored-drift / schema-drift / changelog / nightly gates themselves | **GCE only** | Founder sign-off — these set the rules | — |
+| `.github/workflows/**` — the parity / vendored-drift / schema-drift / changelog / nightly gates themselves (release.yml is carved out to §3.1's release row) | **GCE only** | Founder sign-off — these set the rules | — |
 | `GATING.md` (this file), `CLAUDE.md`, `README.md`, `CHANGELOG.md` | **GCE only** | Founder sign-off | — |
 
 **Row order matters — specific rows precede the general `src/**` catch-all.** The line's
@@ -89,6 +90,14 @@ are listed **above** the `src/**` row, and first-match isolates them correctly:
 Keep `src/**` **last**. Moving it up would shadow the specific rows and silently drop their
 reviewer — the sync-engine slice reviewed without `sync-reviewer` (SUR-724 caught this: the
 classifier honours order, not the prose, so the prose can't substitute for the ordering).
+
+**When SUR-760 lands the AAR/jar packaging module, add its path to the §3.1 release row**,
+and keep that row **above** the binding row so the module routes to
+`release-integrity-reviewer` instead of the binding row's gate. This note lives here and
+not in the row's path cell on purpose: the classifier treats **every** backticked token in
+a path cell as one of that row's globs, so naming the binding glob inline would first-match
+binding-only PRs onto the release row and silently drop `naming-reviewer` + `crypto-reviewer`
+(the SUR-778 review caught exactly that).
 
 **Test-only seams are a `crypto-reviewer` / `naming-reviewer` BLOCKER if they reach the
 public binding.** `with_raw_mk` (construct-from-raw-hex) and any IV/salt override on
