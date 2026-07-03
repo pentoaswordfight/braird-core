@@ -76,6 +76,9 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
     `membership_id` parity vectors, and topo/hold-back flush ordering.
 
 ### Changed
+- **Retired the `naming-reviewer` repo-profile "not yet in scope" note (SUR-777).** `GATING.md`
+  § "Not yet in scope" no longer says the `gce` `braird-core.md` repo-profile "does not exist yet" —
+  it's landed, so `naming-reviewer` now runs profile-injected rather than self-contained.
 - **Widened `enqueue_book` / `enqueue_note` to the full authoring surface (SUR-741).** `enqueue_book`
   now carries `isbn` / `cover_url` / `cover_source` / `cover_resolved_at`; `enqueue_note` now carries
   `source` / `source_id` / `source_meta_json` / `chapter` / `image_path` / `ink_crop_path` — columns
