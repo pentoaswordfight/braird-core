@@ -104,11 +104,6 @@ not branding — they stay `surfc-*` despite the Braird rename (SUR-680 allowlis
 
 ### Not yet in scope
 
-- **`naming-reviewer` repo-profile.** The concern-keyed `naming-reviewer` wants an injected
-  `gce/shared/personas/repo-profiles/braird-core.md` (developer-facing API-naming mode — the
-  audience is iOS/Android integrators, not end users). **It does not exist yet** — a small
-  follow-up in `gce/` before the first binding-surface review. Until then, run
-  `naming-reviewer` self-contained against the API-naming concern and note the gap.
 - **`simplicity-reviewer`** is optional and size-gated; it **defers to `crypto-reviewer`**
   wherever simplification and safety collide. Advisory, never a blocker here.
 
