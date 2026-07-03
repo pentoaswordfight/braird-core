@@ -1,0 +1,122 @@
+name: Android artifacts
+
+# SUR-760 packaging gate. Deliberately separate from parity.yml: the AAR build is heavier
+# (Android SDK + pinned NDK + AGP) and must trigger on the packaging inputs (bindings/**,
+# scripts/build-aar.sh) — parity.yml narrows its paths on purpose to avoid firing the 10x-billed
+# macOS job on binding regens. Pure crypto/src changes stay smoke-covered by parity.yml's
+# android-crosscompile + bindings-drift; this lane runs when the packaging inputs change and is
+# routed to release-integrity-reviewer (GATING.md §3.1).
+on:
+  push:
+    branches: [main]
+    paths:
+      ['Cargo.toml', 'Cargo.lock', 'src/**', 'bindings/**', 'scripts/build-aar.sh', '.github/workflows/android-artifacts.yml']
+  pull_request:
+    branches: [main]
+    paths:
+      ['Cargo.toml', 'Cargo.lock', 'src/**', 'bindings/**', 'scripts/build-aar.sh', '.github/workflows/android-artifacts.yml']
+  workflow_dispatch:
+
+env:
+  NDK_PIN: '28.2.13676358'
+
+jobs:
+  aar:
+    name: Build AAR + 16 KB alignment
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Guard — skip until the crate + android module exist
+        id: guard
+        run: |
+          if [ -f Cargo.toml ] && [ -d bindings/android ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "No crate / android module yet — skipping the AAR build."
+          fi
+
+      - name: Set up JDK
+        if: steps.guard.outputs.ready == 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Install Rust toolchain + Android targets
+        if: steps.guard.outputs.ready == 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android, x86_64-linux-android
+
+      - name: Cache cargo
+        if: steps.guard.outputs.ready == 'true'
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-ndk
+        if: steps.guard.outputs.ready == 'true'
+        run: cargo install cargo-ndk --locked
+
+      # Pin the NDK (16 KB-aligns .so by default) rather than trust the runner's floating
+      # ANDROID_NDK_LATEST_HOME — alignment is a supply-chain property, so it must be deterministic.
+      - name: Install pinned NDK ${{ env.NDK_PIN }}
+        if: steps.guard.outputs.ready == 'true'
+        run: |
+          yes | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" "ndk;${NDK_PIN}" >/dev/null
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/${NDK_PIN}" >> "$GITHUB_ENV"
+
+      # Cross-compiles both ABIs, assembles the AAR, and FAILS if any bundled .so is < 16 KB-aligned.
+      - name: Build AAR (cross-compile → assemble → alignment check)
+        if: steps.guard.outputs.ready == 'true'
+        run: bash scripts/build-aar.sh "0.0.0-ci.${GITHUB_SHA::7}"
+
+      - name: Upload AAR
+        if: steps.guard.outputs.ready == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: braird-core-aar
+          path: dist/*.aar
+          if-no-files-found: error
+
+  desktop-jar:
+    name: Desktop jar is self-contained
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Guard — skip until the bindings exist
+        id: guard
+        run: |
+          if [ -d bindings/kotlin ] && [ -d bindings/consumer-smoke ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "No bindings yet — skipping the desktop-jar check."
+          fi
+
+      - name: Set up JDK
+        if: steps.guard.outputs.ready == 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Install Rust toolchain
+        if: steps.guard.outputs.ready == 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        if: steps.guard.outputs.ready == 'true'
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build the self-contained desktop jar (bundles linux-x86-64 native)
+        if: steps.guard.outputs.ready == 'true'
+        working-directory: bindings/kotlin
+        run: ./gradlew jar --no-daemon
+
+      # The consumer sets NO jna.library.path — a pass means the native resolved from inside the jar.
+      - name: Consumer round-trip (self-containment proof)
+        if: steps.guard.outputs.ready == 'true'
+        working-directory: bindings/consumer-smoke
+        run: ./gradlew test --no-daemon

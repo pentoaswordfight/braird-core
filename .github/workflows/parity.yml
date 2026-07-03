@@ -201,7 +201,7 @@ jobs:
         run: cargo build --target aarch64-apple-ios
 
   android-crosscompile:
-    name: Android cross-compile smoke (aarch64-linux-android)
+    name: Android cross-compile smoke (arm64-v8a + x86_64)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -216,19 +216,21 @@ jobs:
             echo "No Cargo.toml yet — scaffolding only, skipping the Android smoke build."
           fi
 
-      - name: Install Rust toolchain + Android target
+      - name: Install Rust toolchain + Android targets
         if: steps.guard.outputs.ready == 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-linux-android
+          targets: aarch64-linux-android, x86_64-linux-android
 
       - name: Cache cargo
         if: steps.guard.outputs.ready == 'true'
         uses: Swatinem/rust-cache@v2
 
       # Point cc + the linker at the runner's preinstalled NDK so bundled SQLite's C
-      # cross-compiles for the Android triple (no device/emulator needed). API 24 = min.
-      - name: cargo build --target aarch64-linux-android (bundled SQLite must compile)
+      # cross-compiles for BOTH Android triples (no device/emulator needed). API 24 = min.
+      # arm64-v8a is the device ABI; x86_64 is the emulator ABI the AAR also ships (SUR-760).
+      # This is the fast per-PR smoke; the full AAR + 16 KB alignment lives in android-artifacts.yml.
+      - name: cargo build (both Android ABIs — bundled SQLite must compile)
         if: steps.guard.outputs.ready == 'true'
         run: |
           NDK_BIN="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
@@ -236,3 +238,7 @@ jobs:
           export AR_aarch64_linux_android="$NDK_BIN/llvm-ar"
           export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$NDK_BIN/aarch64-linux-android24-clang"
           cargo build --target aarch64-linux-android
+          export CC_x86_64_linux_android="$NDK_BIN/x86_64-linux-android24-clang"
+          export AR_x86_64_linux_android="$NDK_BIN/llvm-ar"
+          export CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER="$NDK_BIN/x86_64-linux-android24-clang"
+          cargo build --target x86_64-linux-android

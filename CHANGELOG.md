@@ -7,6 +7,32 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 ## [Unreleased]
 
 ### Added
+- **Android AAR + self-contained desktop JVM jar packaging, published + pinned via GitHub Releases
+  (SUR-760, M0 of the SUR-661 Android app).** The core now ships to braird-android as pinned
+  artifacts — no vendoring of core source.
+  - **`bindings/android/`** — a new AGP `com.android.library` module (compileSdk 35, minSdk 28)
+    that assembles the **AAR**: the single committed UniFFI Kotlin binding (reused from
+    `bindings/kotlin` via a srcDir — not duplicated) + per-ABI `libbraird_core.so` for
+    **arm64-v8a + x86_64**, every LOAD segment **16 KB-aligned** (targetSdk 35 Play requirement).
+    The consumer adds JNA `5.17.0@aar` (ships the aligned `libjnidispatch.so`) alongside.
+  - **Self-contained desktop jar** — `bindings/kotlin`'s `jar` now bundles the host
+    `libbraird_core` at JNA's classpath-resource path, so a consumer (braird-android's JVM unit
+    tests) resolves the native from the jar with **no `jna.library.path`** and no local cargo
+    build. `bindings/consumer-smoke` is an external-style project that proves it (round-trip with
+    the jar as its only dependency; UniFFI's checksum guard makes it double as the binding↔native
+    atomicity check). Release jars carry the **linux-x86-64** native (braird-android CI runs on Linux).
+  - **`scripts/build-aar.sh`** (mirrors `build-xcframework.sh`) — refresh binding → cargo-ndk both
+    ABIs, 16 KB-aligned via a **pinned NDK r28.2** → AGP assemble → fail if any bundled `.so` is
+    under 16 KB-aligned.
+  - **CI** — `parity.yml`'s Android smoke now covers **x86_64** as well as arm64; new
+    **`android-artifacts.yml`** gates the AAR (alignment) + desktop-jar self-containment per-PR;
+    new **`release.yml`** publishes both + a `SHA256SUMS.txt` to a `v*` tag's GitHub Release,
+    fail-closed on tag / `Cargo.toml` version / CHANGELOG disagreement.
+  - **`docs/pinning.md`** — the pin/bump protocol: pin tag **+ SHA-256 per artifact**,
+    checksum-verified (fail-closed) fetch, `chore(core): pin braird-core vX.Y.Z` app-repo PR is the
+    integration gate; no floating `latest`, no tag-only pin. Written artifact-agnostically so the
+    future iOS xcframework release inherits it.
+  - **JNA 5.14.0 → 5.17.0** across both binding paths.
 - **`release-integrity-reviewer` gate row for the release/packaging boundary (SUR-778).**
   GATING.md §3.1 now routes `scripts/build-aar.sh`, `scripts/build-xcframework.sh`,
   `.github/workflows/release.yml`, and `docs/pinning.md` to the new `release-integrity-reviewer`

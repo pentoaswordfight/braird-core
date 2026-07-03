@@ -1,0 +1,3 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Namespace is declared in build.gradle.kts (AGP 8+); this library ships no components. -->
+<manifest />

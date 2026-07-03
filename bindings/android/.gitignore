@@ -1,0 +1,5 @@
+# Build artifacts. jniLibs are produced by cargo-ndk (scripts/build-aar.sh), not committed —
+# same posture as the gitignored xcframework: the .so ships only inside the released AAR.
+/build
+/.gradle
+/src/main/jniLibs
