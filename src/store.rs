@@ -948,6 +948,49 @@ mod tests {
     }
 
     #[test]
+    fn stage_local_write_distinguishes_explicit_null_clear_from_omitted_keep() {
+        // SUR-775 tri-state hinge at the store seam the enqueue_* clear path relies on: an EXPLICIT
+        // JSON null in the partial clears the column to SQL NULL; an OMITTED key keeps the prior
+        // value. (`json_to_sql` maps Some(Value::Null) → NULL; the merge loop only overwrites keys
+        // the partial actually carries.)
+        use serde_json::json;
+        let store = Store::open_in_memory().unwrap();
+        // Seed a book carrying both an isbn and a cover.
+        store
+            .apply_row(
+                "books",
+                json!({
+                    "id": "b1", "title": "T", "isbn": "978-x", "cover_url": "http://c",
+                    "created_at": 1, "updated_at": 1, "deleted": false
+                })
+                .as_object()
+                .unwrap(),
+            )
+            .unwrap();
+
+        // Partial: isbn EXPLICITLY null (clear), cover_url OMITTED (keep).
+        let mut partial = Map::new();
+        partial.insert("id".into(), json!("b1"));
+        partial.insert("title".into(), json!("T"));
+        partial.insert("isbn".into(), Value::Null);
+        partial.insert("updated_at".into(), json!(2));
+        partial.insert("deleted".into(), json!(false));
+        store.stage_local_write("books", "b1", partial, 2).unwrap();
+
+        let row = store.get_row("books", "b1").unwrap().unwrap();
+        assert_eq!(
+            row["isbn"],
+            Value::Null,
+            "explicit null cleared the column to SQL NULL"
+        );
+        assert_eq!(
+            row["cover_url"],
+            json!("http://c"),
+            "an omitted key kept the prior value (not nulled)"
+        );
+    }
+
+    #[test]
     fn seq_cursor_defaults_none_then_roundtrips_per_table() {
         let store = Store::open_in_memory().unwrap();
         assert_eq!(store.get_seq_cursor("notes").unwrap(), None);

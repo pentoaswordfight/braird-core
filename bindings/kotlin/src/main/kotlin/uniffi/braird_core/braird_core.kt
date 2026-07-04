@@ -807,7 +807,7 @@ internal interface UniffiLib : Library {
     ): Pointer
     fun uniffi_braird_core_fn_method_syncengine_counts(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
-    fun uniffi_braird_core_fn_method_syncengine_enqueue_book(`ptr`: Pointer,`id`: RustBuffer.ByValue,`title`: RustBuffer.ByValue,`author`: RustBuffer.ByValue,`isbn`: RustBuffer.ByValue,`coverUrl`: RustBuffer.ByValue,`coverSource`: RustBuffer.ByValue,`coverResolvedAt`: RustBuffer.ByValue,`createdAt`: Long,`deleted`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+    fun uniffi_braird_core_fn_method_syncengine_enqueue_book(`ptr`: Pointer,`id`: RustBuffer.ByValue,`title`: RustBuffer.ByValue,`author`: RustBuffer.ByValue,`isbn`: RustBuffer.ByValue,`coverUrl`: RustBuffer.ByValue,`coverSource`: RustBuffer.ByValue,`coverResolvedAt`: RustBuffer.ByValue,`createdAt`: Long,`deleted`: Byte,`clearNullableFields`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     fun uniffi_braird_core_fn_method_syncengine_enqueue_collection(`ptr`: Pointer,`id`: RustBuffer.ByValue,`name`: RustBuffer.ByValue,`createdAt`: Long,`deleted`: Byte,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
@@ -817,7 +817,7 @@ internal interface UniffiLib : Library {
     ): Unit
     fun uniffi_braird_core_fn_method_syncengine_enqueue_lens(`ptr`: Pointer,`id`: RustBuffer.ByValue,`name`: RustBuffer.ByValue,`leafIds`: RustBuffer.ByValue,`combinator`: RustBuffer.ByValue,`threshold`: RustBuffer.ByValue,`createdAt`: Long,`deleted`: Byte,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
-    fun uniffi_braird_core_fn_method_syncengine_enqueue_note(`ptr`: Pointer,`id`: RustBuffer.ByValue,`bookId`: RustBuffer.ByValue,`plaintext`: RustBuffer.ByValue,`page`: RustBuffer.ByValue,`tags`: RustBuffer.ByValue,`source`: RustBuffer.ByValue,`sourceId`: RustBuffer.ByValue,`sourceMetaJson`: RustBuffer.ByValue,`chapter`: RustBuffer.ByValue,`imagePath`: RustBuffer.ByValue,`inkCropPath`: RustBuffer.ByValue,`createdAt`: Long,`deleted`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+    fun uniffi_braird_core_fn_method_syncengine_enqueue_note(`ptr`: Pointer,`id`: RustBuffer.ByValue,`bookId`: RustBuffer.ByValue,`plaintext`: RustBuffer.ByValue,`page`: RustBuffer.ByValue,`tags`: RustBuffer.ByValue,`source`: RustBuffer.ByValue,`sourceId`: RustBuffer.ByValue,`sourceMetaJson`: RustBuffer.ByValue,`chapter`: RustBuffer.ByValue,`imagePath`: RustBuffer.ByValue,`inkCropPath`: RustBuffer.ByValue,`createdAt`: Long,`deleted`: Byte,`clearNullableFields`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     fun uniffi_braird_core_fn_method_syncengine_enqueue_note_link(`ptr`: Pointer,`id`: RustBuffer.ByValue,`fromNoteId`: RustBuffer.ByValue,`toNoteId`: RustBuffer.ByValue,`relationType`: RustBuffer.ByValue,`createdAt`: Long,`deleted`: Byte,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
@@ -1070,7 +1070,7 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_braird_core_checksum_method_syncengine_counts() != 56423.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_book() != 63811.toShort()) {
+    if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_book() != 57249.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_collection() != 43786.toShort()) {
@@ -1085,7 +1085,7 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_lens() != 60504.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_note() != 38590.toShort()) {
+    if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_note() != 7740.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_note_link() != 53465.toShort()) {
@@ -1555,15 +1555,16 @@ public interface SyncEngineInterface {
      * the migration default is 0). Plaintext metadata only, no encryption branch (like the PWA
      * `upsertBook`). Column NAMES mirror `upsertBook` in surfc `src/supabase.js` exactly.
      *
-     * PARTIAL-PATCH SEMANTICS (SUR-741). Every optional is `None` → the column is OMITTED from the
-     * payload, so the server upsert (`merge-duplicates`) and the local `stage_write` merge patch
-     * only the columns actually supplied — a `None` never clobbers a pulled-only column (e.g. a
-     * title-only rename keeps the server's cover). Consequence (founder decision, deferred to a
-     * 660/661 follow-up): native cannot yet *clear* a field to NULL — `None` means "leave it",
-     * `Some(v)` means "set it to v" (incl. `Some("")`). Tri-state (absent | null | value) over
-     * UniFFI is awkward and out of scope here.
+     * TRI-STATE PATCH SEMANTICS (SUR-741 keep/set + SUR-775 clear). Each optional is `None` → the
+     * column is OMITTED from the payload, so the server upsert (`merge-duplicates`) and the local
+     * `stage_write` merge patch only the columns actually supplied — a `None` never clobbers a
+     * pulled-only column (a title-only rename keeps the server's cover). `Some(v)` sets it to `v`
+     * (incl. `Some("")`). To CLEAR a column back to NULL, name it in `clear_nullable_fields`: it is written
+     * as an explicit JSON `null` (→ SQL NULL locally, → server column NULLed on flush). Only the
+     * `?? null` columns are clearable ([`clearable_columns`] — `isbn`/covers here); a column both
+     * set and cleared, or a non-clearable name, is rejected and nothing is staged.
      */
-    fun `enqueueBook`(`id`: kotlin.String, `title`: kotlin.String, `author`: kotlin.String?, `isbn`: kotlin.String?, `coverUrl`: kotlin.String?, `coverSource`: kotlin.String?, `coverResolvedAt`: kotlin.Long?, `createdAt`: kotlin.Long, `deleted`: kotlin.Boolean)
+    fun `enqueueBook`(`id`: kotlin.String, `title`: kotlin.String, `author`: kotlin.String?, `isbn`: kotlin.String?, `coverUrl`: kotlin.String?, `coverSource`: kotlin.String?, `coverResolvedAt`: kotlin.Long?, `createdAt`: kotlin.Long, `deleted`: kotlin.Boolean, `clearNullableFields`: List<kotlin.String>)
     
     /**
      * Enqueue a collection upsert (SUR-726). Plaintext metadata only.
@@ -1606,9 +1607,14 @@ public interface SyncEngineInterface {
      * JSON or a non-object → `SyncError::Store` and **nothing is staged** (no seal, no write). None of
      * the new fields touch the Vault — only `plaintext` is ever sealed.
      *
-     * PARTIAL-PATCH SEMANTICS (SUR-741): every optional is `None` → column OMITTED (patch, never
-     * clobbers a pulled-only column; see [`SyncEngine::enqueue_book`]). `source` is the one
-     * exception — `None` → `"manual"` (the PWA's `|| 'manual'` / the prior hardcode), always sent.
+     * TRI-STATE PATCH SEMANTICS (SUR-741 keep/set + SUR-775 clear): every optional is `None` →
+     * column OMITTED (patch, never clobbers a pulled-only column; see [`SyncEngine::enqueue_book`]).
+     * `source` is the one exception — `None` → `"manual"` (the PWA's `|| 'manual'` / the prior
+     * hardcode), always sent, so it is not clearable. To clear a `?? null` column to NULL name it
+     * in `clear_nullable_fields` (notes: `book_id`/`chapter`/`image_path`/`ink_crop_path`/`source_id` —
+     * [`clearable_columns`]). `page` is `|| ''`, not NULL-clearable — clearing it is `Some("")`.
+     * `text` (sealed) and `content_tag` (derived) are never clearable; a bad/contradictory
+     * `clear_nullable_fields` is rejected and nothing is staged.
      *
      * STALE-TAG EDGE (deliberate, mirrors surfc — do not "fix"): the content_tag bakes in the
      * note's `book_id`, but the flush repoints `book_id` via `bookIdRemap` after an offline
@@ -1618,7 +1624,7 @@ public interface SyncEngineInterface {
      * stale-tag-after-offline-merge self-heals on the note's next edit (which re-enqueues with a
      * freshly-computed tag). The tag is never NULL because it is computed pre-seal, from plaintext.
      */
-    fun `enqueueNote`(`id`: kotlin.String, `bookId`: kotlin.String?, `plaintext`: kotlin.String, `page`: kotlin.String?, `tags`: List<kotlin.String>, `source`: kotlin.String?, `sourceId`: kotlin.String?, `sourceMetaJson`: kotlin.String?, `chapter`: kotlin.String?, `imagePath`: kotlin.String?, `inkCropPath`: kotlin.String?, `createdAt`: kotlin.Long, `deleted`: kotlin.Boolean)
+    fun `enqueueNote`(`id`: kotlin.String, `bookId`: kotlin.String?, `plaintext`: kotlin.String, `page`: kotlin.String?, `tags`: List<kotlin.String>, `source`: kotlin.String?, `sourceId`: kotlin.String?, `sourceMetaJson`: kotlin.String?, `chapter`: kotlin.String?, `imagePath`: kotlin.String?, `inkCropPath`: kotlin.String?, `createdAt`: kotlin.Long, `deleted`: kotlin.Boolean, `clearNullableFields`: List<kotlin.String>)
     
     /**
      * Enqueue a note-link upsert (SUR-726) — a parent→child annotation edge. Plaintext only;
@@ -1837,20 +1843,21 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
      * the migration default is 0). Plaintext metadata only, no encryption branch (like the PWA
      * `upsertBook`). Column NAMES mirror `upsertBook` in surfc `src/supabase.js` exactly.
      *
-     * PARTIAL-PATCH SEMANTICS (SUR-741). Every optional is `None` → the column is OMITTED from the
-     * payload, so the server upsert (`merge-duplicates`) and the local `stage_write` merge patch
-     * only the columns actually supplied — a `None` never clobbers a pulled-only column (e.g. a
-     * title-only rename keeps the server's cover). Consequence (founder decision, deferred to a
-     * 660/661 follow-up): native cannot yet *clear* a field to NULL — `None` means "leave it",
-     * `Some(v)` means "set it to v" (incl. `Some("")`). Tri-state (absent | null | value) over
-     * UniFFI is awkward and out of scope here.
+     * TRI-STATE PATCH SEMANTICS (SUR-741 keep/set + SUR-775 clear). Each optional is `None` → the
+     * column is OMITTED from the payload, so the server upsert (`merge-duplicates`) and the local
+     * `stage_write` merge patch only the columns actually supplied — a `None` never clobbers a
+     * pulled-only column (a title-only rename keeps the server's cover). `Some(v)` sets it to `v`
+     * (incl. `Some("")`). To CLEAR a column back to NULL, name it in `clear_nullable_fields`: it is written
+     * as an explicit JSON `null` (→ SQL NULL locally, → server column NULLed on flush). Only the
+     * `?? null` columns are clearable ([`clearable_columns`] — `isbn`/covers here); a column both
+     * set and cleared, or a non-clearable name, is rejected and nothing is staged.
      */
-    @Throws(SyncException::class)override fun `enqueueBook`(`id`: kotlin.String, `title`: kotlin.String, `author`: kotlin.String?, `isbn`: kotlin.String?, `coverUrl`: kotlin.String?, `coverSource`: kotlin.String?, `coverResolvedAt`: kotlin.Long?, `createdAt`: kotlin.Long, `deleted`: kotlin.Boolean)
+    @Throws(SyncException::class)override fun `enqueueBook`(`id`: kotlin.String, `title`: kotlin.String, `author`: kotlin.String?, `isbn`: kotlin.String?, `coverUrl`: kotlin.String?, `coverSource`: kotlin.String?, `coverResolvedAt`: kotlin.Long?, `createdAt`: kotlin.Long, `deleted`: kotlin.Boolean, `clearNullableFields`: List<kotlin.String>)
         = 
     callWithPointer {
     uniffiRustCallWithError(SyncException) { _status ->
     UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_enqueue_book(
-        it, FfiConverterString.lower(`id`),FfiConverterString.lower(`title`),FfiConverterOptionalString.lower(`author`),FfiConverterOptionalString.lower(`isbn`),FfiConverterOptionalString.lower(`coverUrl`),FfiConverterOptionalString.lower(`coverSource`),FfiConverterOptionalLong.lower(`coverResolvedAt`),FfiConverterLong.lower(`createdAt`),FfiConverterBoolean.lower(`deleted`),_status)
+        it, FfiConverterString.lower(`id`),FfiConverterString.lower(`title`),FfiConverterOptionalString.lower(`author`),FfiConverterOptionalString.lower(`isbn`),FfiConverterOptionalString.lower(`coverUrl`),FfiConverterOptionalString.lower(`coverSource`),FfiConverterOptionalLong.lower(`coverResolvedAt`),FfiConverterLong.lower(`createdAt`),FfiConverterBoolean.lower(`deleted`),FfiConverterSequenceString.lower(`clearNullableFields`),_status)
 }
     }
     
@@ -1938,9 +1945,14 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
      * JSON or a non-object → `SyncError::Store` and **nothing is staged** (no seal, no write). None of
      * the new fields touch the Vault — only `plaintext` is ever sealed.
      *
-     * PARTIAL-PATCH SEMANTICS (SUR-741): every optional is `None` → column OMITTED (patch, never
-     * clobbers a pulled-only column; see [`SyncEngine::enqueue_book`]). `source` is the one
-     * exception — `None` → `"manual"` (the PWA's `|| 'manual'` / the prior hardcode), always sent.
+     * TRI-STATE PATCH SEMANTICS (SUR-741 keep/set + SUR-775 clear): every optional is `None` →
+     * column OMITTED (patch, never clobbers a pulled-only column; see [`SyncEngine::enqueue_book`]).
+     * `source` is the one exception — `None` → `"manual"` (the PWA's `|| 'manual'` / the prior
+     * hardcode), always sent, so it is not clearable. To clear a `?? null` column to NULL name it
+     * in `clear_nullable_fields` (notes: `book_id`/`chapter`/`image_path`/`ink_crop_path`/`source_id` —
+     * [`clearable_columns`]). `page` is `|| ''`, not NULL-clearable — clearing it is `Some("")`.
+     * `text` (sealed) and `content_tag` (derived) are never clearable; a bad/contradictory
+     * `clear_nullable_fields` is rejected and nothing is staged.
      *
      * STALE-TAG EDGE (deliberate, mirrors surfc — do not "fix"): the content_tag bakes in the
      * note's `book_id`, but the flush repoints `book_id` via `bookIdRemap` after an offline
@@ -1950,12 +1962,12 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
      * stale-tag-after-offline-merge self-heals on the note's next edit (which re-enqueues with a
      * freshly-computed tag). The tag is never NULL because it is computed pre-seal, from plaintext.
      */
-    @Throws(SyncException::class)override fun `enqueueNote`(`id`: kotlin.String, `bookId`: kotlin.String?, `plaintext`: kotlin.String, `page`: kotlin.String?, `tags`: List<kotlin.String>, `source`: kotlin.String?, `sourceId`: kotlin.String?, `sourceMetaJson`: kotlin.String?, `chapter`: kotlin.String?, `imagePath`: kotlin.String?, `inkCropPath`: kotlin.String?, `createdAt`: kotlin.Long, `deleted`: kotlin.Boolean)
+    @Throws(SyncException::class)override fun `enqueueNote`(`id`: kotlin.String, `bookId`: kotlin.String?, `plaintext`: kotlin.String, `page`: kotlin.String?, `tags`: List<kotlin.String>, `source`: kotlin.String?, `sourceId`: kotlin.String?, `sourceMetaJson`: kotlin.String?, `chapter`: kotlin.String?, `imagePath`: kotlin.String?, `inkCropPath`: kotlin.String?, `createdAt`: kotlin.Long, `deleted`: kotlin.Boolean, `clearNullableFields`: List<kotlin.String>)
         = 
     callWithPointer {
     uniffiRustCallWithError(SyncException) { _status ->
     UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_enqueue_note(
-        it, FfiConverterString.lower(`id`),FfiConverterOptionalString.lower(`bookId`),FfiConverterString.lower(`plaintext`),FfiConverterOptionalString.lower(`page`),FfiConverterSequenceString.lower(`tags`),FfiConverterOptionalString.lower(`source`),FfiConverterOptionalString.lower(`sourceId`),FfiConverterOptionalString.lower(`sourceMetaJson`),FfiConverterOptionalString.lower(`chapter`),FfiConverterOptionalString.lower(`imagePath`),FfiConverterOptionalString.lower(`inkCropPath`),FfiConverterLong.lower(`createdAt`),FfiConverterBoolean.lower(`deleted`),_status)
+        it, FfiConverterString.lower(`id`),FfiConverterOptionalString.lower(`bookId`),FfiConverterString.lower(`plaintext`),FfiConverterOptionalString.lower(`page`),FfiConverterSequenceString.lower(`tags`),FfiConverterOptionalString.lower(`source`),FfiConverterOptionalString.lower(`sourceId`),FfiConverterOptionalString.lower(`sourceMetaJson`),FfiConverterOptionalString.lower(`chapter`),FfiConverterOptionalString.lower(`imagePath`),FfiConverterOptionalString.lower(`inkCropPath`),FfiConverterLong.lower(`createdAt`),FfiConverterBoolean.lower(`deleted`),FfiConverterSequenceString.lower(`clearNullableFields`),_status)
 }
     }
     

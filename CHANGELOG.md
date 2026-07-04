@@ -6,6 +6,21 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+### Added
+- **Tri-state field clearing over the enqueue FFI (SUR-775).** `enqueue_book` / `enqueue_note` gain
+  a `clear_nullable_fields: Vec<String>` parameter — the third state past SUR-741's keep (`None`) / set
+  (`Some`) pair. A column named in `clear_nullable_fields` is written as an explicit JSON `null`, which flows
+  unchanged through the local `stage_local_write` merge (→ SQL NULL) and the flush (→ server column
+  patched NULL under `merge-duplicates`), so a native host can now clear a field back to NULL (e.g.
+  remove a book's `isbn`/cover, unlink a note from its book, drop a `chapter`). Clearable columns are
+  restricted to the surfc `upsert*` `?? null` set (books: `isbn`, `cover_url`, `cover_source`,
+  `cover_resolved_at`; notes: `book_id`, `chapter`, `image_path`, `ink_crop_path`, `source_id`) so a
+  clear stays a wire shape the PWA can also produce and merge (byte-for-byte parity). `page`/`author`
+  (`|| ''`) are deliberately not NULL-clearable — clearing those is `Some("")`; `text` (sealed) and
+  `content_tag` (derived) are never clearable. A non-clearable/unknown name, or a column both set and
+  cleared, is rejected up front and **nothing is staged** (host-supplied names are kept out of the
+  FFI error text). **Binding-surface change** — Swift + Kotlin bindings regenerated (`touches-ffi`).
+
 ## [0.1.0] - 2026-07-03
 
 First tagged release. Cuts the accumulated `[Unreleased]` history into `v0.1.0` so

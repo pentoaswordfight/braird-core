@@ -88,6 +88,7 @@ fn enqueue_full_graph(dev: &SyncEngine, user_id: &str) -> Ids {
         None,
         TS,
         false,
+        vec![],
     )
     .unwrap();
     dev.enqueue_note(
@@ -104,6 +105,7 @@ fn enqueue_full_graph(dev: &SyncEngine, user_id: &str) -> Ids {
         None,
         TS,
         false,
+        vec![],
     )
     .unwrap();
     dev.enqueue_note(
@@ -120,6 +122,7 @@ fn enqueue_full_graph(dev: &SyncEngine, user_id: &str) -> Ids {
         None,
         TS,
         false,
+        vec![],
     )
     .unwrap();
     dev.enqueue_custom_idea(
@@ -528,6 +531,7 @@ fn concurrent_membership_add_converges_to_one_row() {
             None,
             TS,
             false,
+            vec![],
         )
         .unwrap();
     device_a
@@ -671,6 +675,7 @@ fn export_import_parity_every_column_roundtrips_and_partial_edit_preserves_colum
             None,
             TS,
             false,
+            vec![],
         )
         .expect("partial rename");
     device.flush().expect("flush partial edit");
@@ -717,6 +722,7 @@ fn native_authors_cover_and_source_metadata_to_the_server() {
             Some(TS),
             TS,
             false,
+            vec![],
         )
         .expect("author book with cover");
     device
@@ -734,6 +740,7 @@ fn native_authors_cover_and_source_metadata_to_the_server() {
             Some("ink/n.jpg".into()),
             TS,
             false,
+            vec![],
         )
         .expect("author note with source metadata");
     device.flush().expect("flush authored rows");

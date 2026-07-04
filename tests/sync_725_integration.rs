@@ -70,6 +70,7 @@ fn pull_roundtrips_notes_and_books_from_the_server() {
             None,
             1_700_000_000_000,
             false,
+            vec![],
         )
         .expect("enqueue book");
     device_a
@@ -87,6 +88,7 @@ fn pull_roundtrips_notes_and_books_from_the_server() {
             None,
             1_700_000_000_000,
             false,
+            vec![],
         )
         .expect("enqueue note");
     let pushed = device_a.flush().expect("flush");
@@ -176,6 +178,7 @@ fn pull_applies_tombstone_and_never_resurrects() {
             None,
             1_700_000_000_000,
             false,
+            vec![],
         )
         .expect("enqueue book");
     device_a
@@ -193,6 +196,7 @@ fn pull_applies_tombstone_and_never_resurrects() {
             None,
             1_700_000_000_000,
             false,
+            vec![],
         )
         .expect("enqueue note");
     device_a.flush().expect("flush create");
@@ -223,6 +227,7 @@ fn pull_applies_tombstone_and_never_resurrects() {
             None,
             1_700_000_000_000,
             true, // deleted
+            vec![],
         )
         .expect("enqueue delete");
     device_a.flush().expect("flush delete");
