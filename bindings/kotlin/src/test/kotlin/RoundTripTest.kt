@@ -108,6 +108,7 @@ class RoundTripTest {
             inkCropPath = null,
             createdAt = 0L,
             deleted = false,
+            clearNullableFields = emptyList(),
         )
         assertThrows(SyncException::class.java) {
             engine.enqueueNote(
@@ -124,6 +125,7 @@ class RoundTripTest {
                 inkCropPath = null,
                 createdAt = 0L,
                 deleted = false,
+                clearNullableFields = emptyList(),
             )
         }
     }
@@ -140,17 +142,20 @@ class RoundTripTest {
         engine.enqueueBook(
             id = "b1", title = "Meditations", author = "Aurelius", isbn = null, coverUrl = null,
             coverSource = null, coverResolvedAt = null, createdAt = 1L, deleted = false,
+            clearNullableFields = emptyList(),
         )
         engine.enqueueNote(
             id = "n1", bookId = "b1", plaintext = "the unexamined life is not worth living",
             page = null, tags = listOf("philosophy"), source = null, sourceId = null,
             sourceMetaJson = null, chapter = null, imagePath = null, inkCropPath = null,
             createdAt = 10L, deleted = false,
+            clearNullableFields = emptyList(),
         )
         engine.enqueueNote(
             id = "n2", bookId = null, plaintext = "running toward the good", page = null,
             tags = emptyList(), source = null, sourceId = null, sourceMetaJson = null,
             chapter = null, imagePath = null, inkCropPath = null, createdAt = 20L, deleted = false,
+            clearNullableFields = emptyList(),
         )
         engine.enqueueCustomIdea(
             id = "i1", name = "Antifragility", description = "gains from disorder",

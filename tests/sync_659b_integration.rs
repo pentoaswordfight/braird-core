@@ -100,6 +100,7 @@ fn flush_seals_text_and_upserts_via_token_handoff() {
             None,
             1_700_000_000_000,
             false,
+            vec![],
         )
         .expect("enqueue book");
     engine
@@ -117,6 +118,7 @@ fn flush_seals_text_and_upserts_via_token_handoff() {
             None,
             1_700_000_000_000,
             false,
+            vec![],
         )
         .expect("enqueue note");
 

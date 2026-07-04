@@ -144,13 +144,14 @@ impl SyncEngine {
     /// the migration default is 0). Plaintext metadata only, no encryption branch (like the PWA
     /// `upsertBook`). Column NAMES mirror `upsertBook` in surfc `src/supabase.js` exactly.
     ///
-    /// PARTIAL-PATCH SEMANTICS (SUR-741). Every optional is `None` → the column is OMITTED from the
-    /// payload, so the server upsert (`merge-duplicates`) and the local `stage_write` merge patch
-    /// only the columns actually supplied — a `None` never clobbers a pulled-only column (e.g. a
-    /// title-only rename keeps the server's cover). Consequence (founder decision, deferred to a
-    /// 660/661 follow-up): native cannot yet *clear* a field to NULL — `None` means "leave it",
-    /// `Some(v)` means "set it to v" (incl. `Some("")`). Tri-state (absent | null | value) over
-    /// UniFFI is awkward and out of scope here.
+    /// TRI-STATE PATCH SEMANTICS (SUR-741 keep/set + SUR-775 clear). Each optional is `None` → the
+    /// column is OMITTED from the payload, so the server upsert (`merge-duplicates`) and the local
+    /// `stage_write` merge patch only the columns actually supplied — a `None` never clobbers a
+    /// pulled-only column (a title-only rename keeps the server's cover). `Some(v)` sets it to `v`
+    /// (incl. `Some("")`). To CLEAR a column back to NULL, name it in `clear_nullable_fields`: it is written
+    /// as an explicit JSON `null` (→ SQL NULL locally, → server column NULLed on flush). Only the
+    /// `?? null` columns are clearable ([`clearable_columns`] — `isbn`/covers here); a column both
+    /// set and cleared, or a non-clearable name, is rejected and nothing is staged.
     #[allow(clippy::too_many_arguments)]
     pub fn enqueue_book(
         &self,
@@ -163,6 +164,7 @@ impl SyncEngine {
         cover_resolved_at: Option<i64>,
         created_at: i64,
         deleted: bool,
+        clear_nullable_fields: Vec<String>,
     ) -> Result<(), SyncError> {
         let now = epoch_ms();
         let mut row = Map::new();
@@ -176,6 +178,8 @@ impl SyncEngine {
         row.insert("created_at".into(), json!(created_at));
         row.insert("updated_at".into(), json!(now));
         row.insert("deleted".into(), json!(deleted));
+        // Tri-state clears — validated against the clearable allowlist; nothing staged on reject.
+        apply_clears("books", &mut row, &clear_nullable_fields)?;
         self.stage_write("books", &id, row)
     }
 
@@ -192,9 +196,14 @@ impl SyncEngine {
     /// JSON or a non-object → `SyncError::Store` and **nothing is staged** (no seal, no write). None of
     /// the new fields touch the Vault — only `plaintext` is ever sealed.
     ///
-    /// PARTIAL-PATCH SEMANTICS (SUR-741): every optional is `None` → column OMITTED (patch, never
-    /// clobbers a pulled-only column; see [`SyncEngine::enqueue_book`]). `source` is the one
-    /// exception — `None` → `"manual"` (the PWA's `|| 'manual'` / the prior hardcode), always sent.
+    /// TRI-STATE PATCH SEMANTICS (SUR-741 keep/set + SUR-775 clear): every optional is `None` →
+    /// column OMITTED (patch, never clobbers a pulled-only column; see [`SyncEngine::enqueue_book`]).
+    /// `source` is the one exception — `None` → `"manual"` (the PWA's `|| 'manual'` / the prior
+    /// hardcode), always sent, so it is not clearable. To clear a `?? null` column to NULL name it
+    /// in `clear_nullable_fields` (notes: `book_id`/`chapter`/`image_path`/`ink_crop_path`/`source_id` —
+    /// [`clearable_columns`]). `page` is `|| ''`, not NULL-clearable — clearing it is `Some("")`.
+    /// `text` (sealed) and `content_tag` (derived) are never clearable; a bad/contradictory
+    /// `clear_nullable_fields` is rejected and nothing is staged.
     ///
     /// STALE-TAG EDGE (deliberate, mirrors surfc — do not "fix"): the content_tag bakes in the
     /// note's `book_id`, but the flush repoints `book_id` via `bookIdRemap` after an offline
@@ -219,6 +228,7 @@ impl SyncEngine {
         ink_crop_path: Option<String>,
         created_at: i64,
         deleted: bool,
+        clear_nullable_fields: Vec<String>,
     ) -> Result<(), SyncError> {
         // Validate source_meta_json BEFORE any seal/stage — a bad payload stages nothing.
         let source_meta = match source_meta_json {
@@ -265,6 +275,9 @@ impl SyncEngine {
         row.insert("created_at".into(), json!(created_at));
         row.insert("updated_at".into(), json!(now));
         row.insert("deleted".into(), json!(deleted));
+        // Tri-state clears — validated against the clearable allowlist; on reject nothing is staged
+        // (the seal above is discarded, never persisted). `text`/`content_tag` aren't clearable.
+        apply_clears("notes", &mut row, &clear_nullable_fields)?;
         self.stage_write("notes", &id, row)
     }
 
@@ -679,6 +692,59 @@ fn insert_opt<T: Into<Value>>(row: &mut Map<String, Value>, key: &str, val: Opti
     }
 }
 
+/// The columns a host may clear to NULL via `clear_nullable_fields` (SUR-775) — the third state past the
+/// SUR-741 keep (`None`) / set (`Some`) pair. Kept to **exactly** the surfc `upsert*` columns
+/// written with `?? null` (`isbn`/covers on books; `book_id`/`chapter`/`image_path`/
+/// `ink_crop_path`/`source_id` on notes), so a clear stays a wire shape the PWA can also produce
+/// and merge (byte-for-byte parity). A `|| ''`/`|| {}`/defaulted column (`page`, `author`,
+/// `source_meta`, `source`) can't be NULL under parity — "clearing" those is `Some("")`/the
+/// default, not a NULL clear — so they are deliberately absent. `text` (sealed, not a field),
+/// `content_tag` (derived), and every pk/timestamp/`deleted` are never clearable.
+fn clearable_columns(table: &str) -> &'static [&'static str] {
+    match table {
+        "books" => &["isbn", "cover_url", "cover_source", "cover_resolved_at"],
+        "notes" => &[
+            "book_id",
+            "chapter",
+            "image_path",
+            "ink_crop_path",
+            "source_id",
+        ],
+        _ => &[],
+    }
+}
+
+/// Apply the SUR-775 `clear_nullable_fields` directive to a partial outbox `row`: set each named column to
+/// an explicit JSON `null` (the tri-state "clear" — vs an omitted key's "keep"). The null then
+/// flows unchanged through `stage_local_write` (→ SQL NULL locally) and the flush (→ server column
+/// patched NULL under `merge-duplicates`); both seams are already null-transparent, so this enqueue
+/// step is the whole feature. Rejected — nothing staged, mirroring the up-front `source_meta_json`
+/// reject — when a name is not a clearable column for `table`, or is ALSO supplied as a value (a
+/// set-and-clear contradiction, detected by the key already being present from `insert_opt`).
+/// Host-supplied names are NOT echoed into the error (crypto-reviewer: host content must stay out
+/// of FFI error strings that may be host-logged); `table` is a caller-side literal, so it is safe.
+fn apply_clears(
+    table: &str,
+    row: &mut Map<String, Value>,
+    clear_nullable_fields: &[String],
+) -> Result<(), SyncError> {
+    let allowed = clearable_columns(table);
+    for field in clear_nullable_fields {
+        if !allowed.contains(&field.as_str()) {
+            return Err(SyncError::Store(format!(
+                "a column requested for clearing is not clearable on {table}"
+            )));
+        }
+        if row.contains_key(field) {
+            return Err(SyncError::Store(format!(
+                "a {table} column is both set and cleared — pass a value or clear it, not both"
+            )));
+        }
+        row.insert(field.clone(), Value::Null);
+    }
+    Ok(())
+}
+
 /// Epoch milliseconds — the PWA `Date.now()` unit the cloud data is stamped in. `SystemTime`
 /// before the epoch is impossible on a sane clock; clamp to 0 rather than panic.
 fn epoch_ms() -> i64 {
@@ -726,6 +792,7 @@ mod tests {
                 None,
                 0,
                 false,
+                vec![],
             )
             .unwrap();
 
@@ -772,6 +839,7 @@ mod tests {
                 None,
                 0,
                 false,
+                vec![],
             )
             .unwrap();
 
@@ -822,6 +890,7 @@ mod tests {
                 None,
                 0,
                 false,
+                vec![],
             )
             .unwrap();
 
@@ -876,6 +945,7 @@ mod tests {
                 None,
                 0,
                 false,
+                vec![],
             )
             .unwrap();
 
@@ -943,6 +1013,7 @@ mod tests {
                 None,
                 1,
                 false,
+                vec![],
             )
             .unwrap();
 
@@ -979,6 +1050,7 @@ mod tests {
                 Some(1_700_000_000_000),
                 1,
                 false,
+                vec![],
             )
             .unwrap();
         let row = Store::open(db_path)
@@ -1014,6 +1086,7 @@ mod tests {
                 None,
                 1,
                 false,
+                vec![],
             )
             .unwrap();
         let p = outbox_payload(db_path, 0);
@@ -1050,6 +1123,7 @@ mod tests {
                 Some("images/n1-ink.jpg".into()),
                 7,
                 false,
+                vec![],
             )
             .unwrap();
         let p = outbox_payload(db_path, 0);
@@ -1093,6 +1167,7 @@ mod tests {
                 None,
                 0,
                 false,
+                vec![],
             )
             .unwrap();
         let p = outbox_payload(db_path, 0);
@@ -1135,6 +1210,7 @@ mod tests {
                     None,
                     0,
                     false,
+                    vec![],
                 )
                 .is_err(),
             "invalid JSON rejected"
@@ -1155,6 +1231,7 @@ mod tests {
                     None,
                     0,
                     false,
+                    vec![],
                 )
                 .is_err(),
             "non-object JSON rejected"
@@ -1212,6 +1289,7 @@ mod tests {
                 None,
                 2,
                 false,
+                vec![],
             )
             .unwrap();
         let row = Store::open(db_path)
@@ -1234,6 +1312,187 @@ mod tests {
             row["source"],
             json!("manual"),
             "source is always sent (None→manual) — a source-less edit resets it (host must pass it)"
+        );
+    }
+
+    // ── SUR-775: tri-state field clearing (clear_nullable_fields → explicit NULL) ─────────
+
+    #[test]
+    fn enqueue_book_clear_nullable_fields_emits_explicit_null_and_leaves_omitted_absent() {
+        // The tri-state trio in one call: CLEAR isbn (→ explicit null), SET cover_url, KEEP the
+        // rest (omitted). The cleared key must be PRESENT-and-null (the wire signal PostgREST
+        // patches to NULL); an omitted optional must stay absent (never a stray null that clobbers).
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        engine_at(db_path)
+            .enqueue_book(
+                "b1".into(),
+                "T".into(),
+                None,
+                None,
+                Some("https://cover".into()),
+                None,
+                None,
+                1,
+                false,
+                vec!["isbn".into()],
+            )
+            .unwrap();
+        let p = outbox_payload(db_path, 0);
+        let obj = p.as_object().unwrap();
+        assert!(
+            obj.contains_key("isbn"),
+            "a cleared column is PRESENT in the payload"
+        );
+        assert_eq!(
+            p["isbn"],
+            Value::Null,
+            "…as an explicit null (clear), not omitted"
+        );
+        assert_eq!(
+            p["cover_url"],
+            json!("https://cover"),
+            "a set column still sets"
+        );
+        for k in ["author", "cover_source", "cover_resolved_at"] {
+            assert!(
+                !obj.contains_key(k),
+                "{k} stays omitted (keep), never a stray null"
+            );
+        }
+        // The local synced row's column is SQL NULL too (reads back as JSON null).
+        let row = Store::open(db_path)
+            .unwrap()
+            .get_row("books", "b1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row["isbn"], Value::Null, "local column nulled by the clear");
+    }
+
+    #[test]
+    fn enqueue_note_clear_nullable_fields_nulls_columns_without_touching_the_seal() {
+        // Clearing `?? null` note columns (book_id = unlink, chapter) must NOT disturb seal-at-write:
+        // text stays enc:v2 ciphertext and content_tag stays present.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        engine_at(db_path)
+            .enqueue_note(
+                "n1".into(),
+                None,
+                "plaintext".into(),
+                None,
+                vec![],
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                0,
+                false,
+                vec!["book_id".into(), "chapter".into()],
+            )
+            .unwrap();
+        let p = outbox_payload(db_path, 0);
+        assert_eq!(
+            p["book_id"],
+            Value::Null,
+            "book_id cleared (note unlinked from its book)"
+        );
+        assert_eq!(p["chapter"], Value::Null, "chapter cleared");
+        let text = p["text"].as_str().unwrap();
+        assert!(
+            text.starts_with("enc:v2:"),
+            "text still sealed — a clear never touches it"
+        );
+        assert!(
+            !text.contains("plaintext"),
+            "plaintext never reaches the outbox"
+        );
+        assert!(
+            p["content_tag"].as_str().is_some_and(|t| !t.is_empty()),
+            "content_tag intact"
+        );
+    }
+
+    #[test]
+    fn enqueue_note_clearing_a_non_clearable_column_is_rejected_atomically() {
+        // `text` (sealed, not a field), `page` (`|| ''` → clear is `Some("")`, not NULL), and an
+        // unknown name are all rejected BEFORE any stage — nothing queued, no local row.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        for bad in [
+            vec!["text".to_string()],
+            vec!["page".to_string()],
+            vec!["nonsense".to_string()],
+        ] {
+            assert!(
+                engine
+                    .enqueue_note(
+                        "n1".into(),
+                        None,
+                        "x".into(),
+                        None,
+                        vec![],
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        0,
+                        false,
+                        bad.clone(),
+                    )
+                    .is_err(),
+                "clearing {bad:?} must be rejected"
+            );
+        }
+        let store = Store::open(db_path).unwrap();
+        assert_eq!(
+            store.outbox_items().unwrap().len(),
+            0,
+            "nothing queued on reject"
+        );
+        assert!(
+            store.get_row("notes", "n1").unwrap().is_none(),
+            "no local row staged on reject"
+        );
+    }
+
+    #[test]
+    fn enqueue_book_set_and_clear_of_one_column_is_rejected() {
+        // A column supplied as BOTH a value (Some) and in clear_nullable_fields is a contradiction — reject
+        // and stage nothing, so a host bug can't silently resolve to one interpretation.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        assert!(
+            engine
+                .enqueue_book(
+                    "b1".into(),
+                    "T".into(),
+                    None,
+                    Some("978-x".into()), // isbn set…
+                    None,
+                    None,
+                    None,
+                    1,
+                    false,
+                    vec!["isbn".into()], // …and cleared → contradiction
+                )
+                .is_err(),
+            "set-and-clear of the same column is rejected"
+        );
+        assert_eq!(
+            Store::open(db_path).unwrap().outbox_items().unwrap().len(),
+            0,
+            "nothing staged on the contradiction"
         );
     }
 
@@ -1265,6 +1524,7 @@ mod tests {
                 None,
                 0,
                 false,
+                vec![],
             )
             .unwrap();
 

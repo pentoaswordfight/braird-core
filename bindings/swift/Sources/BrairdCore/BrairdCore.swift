@@ -548,15 +548,16 @@ public protocol SyncEngineProtocol : AnyObject {
      * the migration default is 0). Plaintext metadata only, no encryption branch (like the PWA
      * `upsertBook`). Column NAMES mirror `upsertBook` in surfc `src/supabase.js` exactly.
      *
-     * PARTIAL-PATCH SEMANTICS (SUR-741). Every optional is `None` → the column is OMITTED from the
-     * payload, so the server upsert (`merge-duplicates`) and the local `stage_write` merge patch
-     * only the columns actually supplied — a `None` never clobbers a pulled-only column (e.g. a
-     * title-only rename keeps the server's cover). Consequence (founder decision, deferred to a
-     * 660/661 follow-up): native cannot yet *clear* a field to NULL — `None` means "leave it",
-     * `Some(v)` means "set it to v" (incl. `Some("")`). Tri-state (absent | null | value) over
-     * UniFFI is awkward and out of scope here.
+     * TRI-STATE PATCH SEMANTICS (SUR-741 keep/set + SUR-775 clear). Each optional is `None` → the
+     * column is OMITTED from the payload, so the server upsert (`merge-duplicates`) and the local
+     * `stage_write` merge patch only the columns actually supplied — a `None` never clobbers a
+     * pulled-only column (a title-only rename keeps the server's cover). `Some(v)` sets it to `v`
+     * (incl. `Some("")`). To CLEAR a column back to NULL, name it in `clear_nullable_fields`: it is written
+     * as an explicit JSON `null` (→ SQL NULL locally, → server column NULLed on flush). Only the
+     * `?? null` columns are clearable ([`clearable_columns`] — `isbn`/covers here); a column both
+     * set and cleared, or a non-clearable name, is rejected and nothing is staged.
      */
-    func enqueueBook(id: String, title: String, author: String?, isbn: String?, coverUrl: String?, coverSource: String?, coverResolvedAt: Int64?, createdAt: Int64, deleted: Bool) throws 
+    func enqueueBook(id: String, title: String, author: String?, isbn: String?, coverUrl: String?, coverSource: String?, coverResolvedAt: Int64?, createdAt: Int64, deleted: Bool, clearNullableFields: [String]) throws 
     
     /**
      * Enqueue a collection upsert (SUR-726). Plaintext metadata only.
@@ -599,9 +600,14 @@ public protocol SyncEngineProtocol : AnyObject {
      * JSON or a non-object → `SyncError::Store` and **nothing is staged** (no seal, no write). None of
      * the new fields touch the Vault — only `plaintext` is ever sealed.
      *
-     * PARTIAL-PATCH SEMANTICS (SUR-741): every optional is `None` → column OMITTED (patch, never
-     * clobbers a pulled-only column; see [`SyncEngine::enqueue_book`]). `source` is the one
-     * exception — `None` → `"manual"` (the PWA's `|| 'manual'` / the prior hardcode), always sent.
+     * TRI-STATE PATCH SEMANTICS (SUR-741 keep/set + SUR-775 clear): every optional is `None` →
+     * column OMITTED (patch, never clobbers a pulled-only column; see [`SyncEngine::enqueue_book`]).
+     * `source` is the one exception — `None` → `"manual"` (the PWA's `|| 'manual'` / the prior
+     * hardcode), always sent, so it is not clearable. To clear a `?? null` column to NULL name it
+     * in `clear_nullable_fields` (notes: `book_id`/`chapter`/`image_path`/`ink_crop_path`/`source_id` —
+     * [`clearable_columns`]). `page` is `|| ''`, not NULL-clearable — clearing it is `Some("")`.
+     * `text` (sealed) and `content_tag` (derived) are never clearable; a bad/contradictory
+     * `clear_nullable_fields` is rejected and nothing is staged.
      *
      * STALE-TAG EDGE (deliberate, mirrors surfc — do not "fix"): the content_tag bakes in the
      * note's `book_id`, but the flush repoints `book_id` via `bookIdRemap` after an offline
@@ -611,7 +617,7 @@ public protocol SyncEngineProtocol : AnyObject {
      * stale-tag-after-offline-merge self-heals on the note's next edit (which re-enqueues with a
      * freshly-computed tag). The tag is never NULL because it is computed pre-seal, from plaintext.
      */
-    func enqueueNote(id: String, bookId: String?, plaintext: String, page: String?, tags: [String], source: String?, sourceId: String?, sourceMetaJson: String?, chapter: String?, imagePath: String?, inkCropPath: String?, createdAt: Int64, deleted: Bool) throws 
+    func enqueueNote(id: String, bookId: String?, plaintext: String, page: String?, tags: [String], source: String?, sourceId: String?, sourceMetaJson: String?, chapter: String?, imagePath: String?, inkCropPath: String?, createdAt: Int64, deleted: Bool, clearNullableFields: [String]) throws 
     
     /**
      * Enqueue a note-link upsert (SUR-726) — a parent→child annotation edge. Plaintext only;
@@ -808,15 +814,16 @@ open func counts()throws  -> StoreCounts {
      * the migration default is 0). Plaintext metadata only, no encryption branch (like the PWA
      * `upsertBook`). Column NAMES mirror `upsertBook` in surfc `src/supabase.js` exactly.
      *
-     * PARTIAL-PATCH SEMANTICS (SUR-741). Every optional is `None` → the column is OMITTED from the
-     * payload, so the server upsert (`merge-duplicates`) and the local `stage_write` merge patch
-     * only the columns actually supplied — a `None` never clobbers a pulled-only column (e.g. a
-     * title-only rename keeps the server's cover). Consequence (founder decision, deferred to a
-     * 660/661 follow-up): native cannot yet *clear* a field to NULL — `None` means "leave it",
-     * `Some(v)` means "set it to v" (incl. `Some("")`). Tri-state (absent | null | value) over
-     * UniFFI is awkward and out of scope here.
+     * TRI-STATE PATCH SEMANTICS (SUR-741 keep/set + SUR-775 clear). Each optional is `None` → the
+     * column is OMITTED from the payload, so the server upsert (`merge-duplicates`) and the local
+     * `stage_write` merge patch only the columns actually supplied — a `None` never clobbers a
+     * pulled-only column (a title-only rename keeps the server's cover). `Some(v)` sets it to `v`
+     * (incl. `Some("")`). To CLEAR a column back to NULL, name it in `clear_nullable_fields`: it is written
+     * as an explicit JSON `null` (→ SQL NULL locally, → server column NULLed on flush). Only the
+     * `?? null` columns are clearable ([`clearable_columns`] — `isbn`/covers here); a column both
+     * set and cleared, or a non-clearable name, is rejected and nothing is staged.
      */
-open func enqueueBook(id: String, title: String, author: String?, isbn: String?, coverUrl: String?, coverSource: String?, coverResolvedAt: Int64?, createdAt: Int64, deleted: Bool)throws  {try rustCallWithError(FfiConverterTypeSyncError.lift) {
+open func enqueueBook(id: String, title: String, author: String?, isbn: String?, coverUrl: String?, coverSource: String?, coverResolvedAt: Int64?, createdAt: Int64, deleted: Bool, clearNullableFields: [String])throws  {try rustCallWithError(FfiConverterTypeSyncError.lift) {
     uniffi_braird_core_fn_method_syncengine_enqueue_book(self.uniffiClonePointer(),
         FfiConverterString.lower(id),
         FfiConverterString.lower(title),
@@ -826,7 +833,8 @@ open func enqueueBook(id: String, title: String, author: String?, isbn: String?,
         FfiConverterOptionString.lower(coverSource),
         FfiConverterOptionInt64.lower(coverResolvedAt),
         FfiConverterInt64.lower(createdAt),
-        FfiConverterBool.lower(deleted),$0
+        FfiConverterBool.lower(deleted),
+        FfiConverterSequenceString.lower(clearNullableFields),$0
     )
 }
 }
@@ -908,9 +916,14 @@ open func enqueueLens(id: String, name: String, leafIds: [String], combinator: S
      * JSON or a non-object → `SyncError::Store` and **nothing is staged** (no seal, no write). None of
      * the new fields touch the Vault — only `plaintext` is ever sealed.
      *
-     * PARTIAL-PATCH SEMANTICS (SUR-741): every optional is `None` → column OMITTED (patch, never
-     * clobbers a pulled-only column; see [`SyncEngine::enqueue_book`]). `source` is the one
-     * exception — `None` → `"manual"` (the PWA's `|| 'manual'` / the prior hardcode), always sent.
+     * TRI-STATE PATCH SEMANTICS (SUR-741 keep/set + SUR-775 clear): every optional is `None` →
+     * column OMITTED (patch, never clobbers a pulled-only column; see [`SyncEngine::enqueue_book`]).
+     * `source` is the one exception — `None` → `"manual"` (the PWA's `|| 'manual'` / the prior
+     * hardcode), always sent, so it is not clearable. To clear a `?? null` column to NULL name it
+     * in `clear_nullable_fields` (notes: `book_id`/`chapter`/`image_path`/`ink_crop_path`/`source_id` —
+     * [`clearable_columns`]). `page` is `|| ''`, not NULL-clearable — clearing it is `Some("")`.
+     * `text` (sealed) and `content_tag` (derived) are never clearable; a bad/contradictory
+     * `clear_nullable_fields` is rejected and nothing is staged.
      *
      * STALE-TAG EDGE (deliberate, mirrors surfc — do not "fix"): the content_tag bakes in the
      * note's `book_id`, but the flush repoints `book_id` via `bookIdRemap` after an offline
@@ -920,7 +933,7 @@ open func enqueueLens(id: String, name: String, leafIds: [String], combinator: S
      * stale-tag-after-offline-merge self-heals on the note's next edit (which re-enqueues with a
      * freshly-computed tag). The tag is never NULL because it is computed pre-seal, from plaintext.
      */
-open func enqueueNote(id: String, bookId: String?, plaintext: String, page: String?, tags: [String], source: String?, sourceId: String?, sourceMetaJson: String?, chapter: String?, imagePath: String?, inkCropPath: String?, createdAt: Int64, deleted: Bool)throws  {try rustCallWithError(FfiConverterTypeSyncError.lift) {
+open func enqueueNote(id: String, bookId: String?, plaintext: String, page: String?, tags: [String], source: String?, sourceId: String?, sourceMetaJson: String?, chapter: String?, imagePath: String?, inkCropPath: String?, createdAt: Int64, deleted: Bool, clearNullableFields: [String])throws  {try rustCallWithError(FfiConverterTypeSyncError.lift) {
     uniffi_braird_core_fn_method_syncengine_enqueue_note(self.uniffiClonePointer(),
         FfiConverterString.lower(id),
         FfiConverterOptionString.lower(bookId),
@@ -934,7 +947,8 @@ open func enqueueNote(id: String, bookId: String?, plaintext: String, page: Stri
         FfiConverterOptionString.lower(imagePath),
         FfiConverterOptionString.lower(inkCropPath),
         FfiConverterInt64.lower(createdAt),
-        FfiConverterBool.lower(deleted),$0
+        FfiConverterBool.lower(deleted),
+        FfiConverterSequenceString.lower(clearNullableFields),$0
     )
 }
 }
@@ -2926,7 +2940,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_braird_core_checksum_method_syncengine_counts() != 56423) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_braird_core_checksum_method_syncengine_enqueue_book() != 63811) {
+    if (uniffi_braird_core_checksum_method_syncengine_enqueue_book() != 57249) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_enqueue_collection() != 43786) {
@@ -2941,7 +2955,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_braird_core_checksum_method_syncengine_enqueue_lens() != 60504) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_braird_core_checksum_method_syncengine_enqueue_note() != 38590) {
+    if (uniffi_braird_core_checksum_method_syncengine_enqueue_note() != 7740) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_enqueue_note_link() != 53465) {

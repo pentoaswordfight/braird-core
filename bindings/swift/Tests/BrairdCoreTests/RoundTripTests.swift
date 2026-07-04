@@ -100,12 +100,14 @@ final class RoundTripTests: XCTestCase {
         try engine.enqueueNote(
             id: "n1", bookId: "b1", plaintext: "secret", page: "5", tags: ["philosophy"],
             source: "readwise", sourceId: "rw-1", sourceMetaJson: "{\"highlight_id\":\"h1\"}",
-            chapter: "1", imagePath: "img/1.jpg", inkCropPath: nil, createdAt: 0, deleted: false)
+            chapter: "1", imagePath: "img/1.jpg", inkCropPath: nil, createdAt: 0, deleted: false,
+            clearNullableFields: [])
         XCTAssertThrowsError(
             try engine.enqueueNote(
                 id: "n2", bookId: nil, plaintext: "x", page: nil, tags: [],
                 source: nil, sourceId: nil, sourceMetaJson: "not json", chapter: nil,
-                imagePath: nil, inkCropPath: nil, createdAt: 0, deleted: false))
+                imagePath: nil, inkCropPath: nil, createdAt: 0, deleted: false,
+                clearNullableFields: []))
     }
 
     /// SUR-744: the read/query surface over the FFI — list/get/counts/search against a populated
@@ -121,15 +123,18 @@ final class RoundTripTests: XCTestCase {
 
         try engine.enqueueBook(
             id: "b1", title: "Meditations", author: "Aurelius", isbn: nil, coverUrl: nil,
-            coverSource: nil, coverResolvedAt: nil, createdAt: 1, deleted: false)
+            coverSource: nil, coverResolvedAt: nil, createdAt: 1, deleted: false,
+            clearNullableFields: [])
         try engine.enqueueNote(
             id: "n1", bookId: "b1", plaintext: "the unexamined life is not worth living",
             page: nil, tags: ["philosophy"], source: nil, sourceId: nil, sourceMetaJson: nil,
-            chapter: nil, imagePath: nil, inkCropPath: nil, createdAt: 10, deleted: false)
+            chapter: nil, imagePath: nil, inkCropPath: nil, createdAt: 10, deleted: false,
+            clearNullableFields: [])
         try engine.enqueueNote(
             id: "n2", bookId: nil, plaintext: "running toward the good", page: nil, tags: [],
             source: nil, sourceId: nil, sourceMetaJson: nil, chapter: nil, imagePath: nil,
-            inkCropPath: nil, createdAt: 20, deleted: false)
+            inkCropPath: nil, createdAt: 20, deleted: false,
+            clearNullableFields: [])
         try engine.enqueueCustomIdea(
             id: "i1", name: "Antifragility", description: "gains from disorder",
             createdAt: 5, deleted: false)
