@@ -6,6 +6,15 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-04
+
+Second tagged release. Cuts the `[Unreleased]` history accumulated since `v0.1.0` into `v0.2.0`:
+the **iOS `BrairdCore.xcframework` release leg** (SUR-745) — so braird-android's sibling
+braird-ios (SUR-660) has a published, checksum-pinned xcframework **+ `BrairdCore.swift`** to pin —
+and the **tri-state enqueue field-clearing FFI** (SUR-775). This is the first release to exercise
+the macOS `build-ios` leg end-to-end (`release.yml` runs on tags only, so the leg had never run
+until this tag).
+
 ### Added
 - **Tri-state field clearing over the enqueue FFI (SUR-775).** `enqueue_book` / `enqueue_note` gain
   a `clear_nullable_fields: Vec<String>` parameter — the third state past SUR-741's keep (`None`) / set
