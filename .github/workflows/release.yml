@@ -1,18 +1,25 @@
 name: Release
 
-# SUR-760: on a version tag, build + publish the pinned artifacts (Android AAR + desktop JVM jar)
-# to a GitHub Release with a SHA-256 per artifact. Consumers pin the tag + checksums; the
-# `chore(core): pin braird-core vX.Y.Z` PR in the app repo is the integration gate (docs/pinning.md).
-# Written generically (a staged `dist/` + one SHA256SUMS manifest) so the future iOS xcframework
-# release attaches to the same tag with no redesign. Routed to release-integrity-reviewer
-# (GATING.md §3.1): binding↔native atomicity, tag+SHA-256 pin, 16 KB alignment, version agreement.
+# SUR-760 + SUR-745: on a version tag, build + publish the pinned artifacts — Android AAR +
+# desktop JVM jar (SUR-760) and the iOS BrairdCore.xcframework (SUR-745) — to one GitHub Release
+# with a SHA-256 per artifact. Consumers pin the tag + checksums; the `chore(core): pin
+# braird-core vX.Y.Z` PR in the app repo is the integration gate (docs/pinning.md).
+# Routed to release-integrity-reviewer (GATING.md §3.1): binding↔native atomicity, tag+SHA-256
+# pin, 16 KB alignment (Android), version agreement.
 #
-# Hardening (release-integrity-reviewer, SUR-760):
+# Job DAG (SUR-745): validate → {build-android (ubuntu), build-ios (macos-14)} → publish (ubuntu).
+# The two build legs run in parallel off the same validated tag; a single publish job assembles
+# every artifact into one SHA256SUMS.txt and cuts the release once. Splitting the iOS leg onto a
+# macOS runner is unavoidable (only xcodebuild builds an xcframework) — it carries a 10x
+# runner-minute multiplier, but fires only on a version tag.
+#
+# Hardening (release-integrity-reviewer, SUR-760 + SUR-745):
 #   - Published assets are IMMUTABLE: create-only, no --clobber. A re-run on an already-published
 #     tag hard-fails — a fix to a shipped version is a NEW version, never a re-publish.
-#   - This lane holds `contents: write`, so no attacker-influenceable string is interpolated into a
-#     `run:` body: the tag/version reach shell only via `env:` (GitHub sets them as env vars, not
-#     into the command text), and the tag is allowlist-validated before any use.
+#   - `contents: write` is held by the `publish` job ALONE (SUR-745). The build legs run with the
+#     default read-only token: an attacker-influenceable string never reaches a lane that can
+#     write a release. The tag/version reach shell only via `env:` (never interpolated into a
+#     `run:` body) and the tag is allowlist-validated in `validate` before any job consumes it.
 on:
   push:
     tags: ['v*']
@@ -22,20 +29,25 @@ on:
         description: 'Existing tag to build a release for, e.g. v0.1.0 (only if it has no release yet)'
         required: true
 
+# Read-only by default; only `publish` escalates to contents: write (see that job).
 permissions:
-  contents: write
+  contents: read
 
 env:
   NDK_PIN: '28.2.13676358'
 
 jobs:
-  publish:
+  # Validate the tag FIRST, before any build lane consumes it. Assigned via env: (not interpolated
+  # into the script text). Whole-string bash `=~` match, not line-oriented grep: a multiline
+  # workflow_dispatch input could otherwise pass a per-line check and smuggle a newline into
+  # GITHUB_OUTPUT. Bash ERE has no REG_NEWLINE, so `$` anchors end-of-string → newline rejected.
+  # The validated tag/version are exposed as job outputs the build + publish jobs pin to.
+  validate:
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.v.outputs.tag }}
+      version: ${{ steps.v.outputs.version }}
     steps:
-      # Validate the tag FIRST, before anything (even checkout) consumes it. Assigned via env: (not
-      # interpolated into the script text). Whole-string bash `=~` match, not line-oriented grep: a
-      # multiline workflow_dispatch input could otherwise pass a per-line check and smuggle a newline
-      # into GITHUB_OUTPUT. Bash ERE has no REG_NEWLINE, so `$` anchors end-of-string → newline rejected.
       - name: Resolve + validate the tag
         id: v
         env:
@@ -49,14 +61,20 @@ jobs:
           echo "tag=$TAG_RAW" >> "$GITHUB_OUTPUT"
           echo "version=${TAG_RAW#v}" >> "$GITHUB_OUTPUT"
 
+  # Android AAR (arm64-v8a + x86_64, 16 KB-aligned) + self-contained desktop JVM jar. Uploads both
+  # as a workflow artifact for `publish` to attach — this leg never touches the release itself.
+  build-android:
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ steps.v.outputs.tag }} # the validated tag, never the raw input
+          ref: ${{ needs.validate.outputs.tag }} # the validated tag, never the raw input
 
-      # Fail-closed: the tag, the crate version, and the CHANGELOG must agree before anything ships.
+      # Fail-closed: the tag, the crate version, and the CHANGELOG must agree before anything builds.
       - name: Verify tag == Cargo.toml version + CHANGELOG section
         env:
-          VERSION: ${{ steps.v.outputs.version }}
+          VERSION: ${{ needs.validate.outputs.version }}
         run: |
           CARGO_VER=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')
           if [ "$VERSION" != "$CARGO_VER" ]; then
@@ -72,8 +90,9 @@ jobs:
           distribution: temurin
           java-version: '21'
 
-      # SHA-pinned (not @stable): this lane carries the release-write token, so the action can't be
-      # allowed to change under a moving tag. SHA = dtolnay/rust-toolchain stable @ 2026-07-03.
+      # SHA-pinned (not @stable): a compromised toolchain action could inject into the shipped .so
+      # BEFORE it is checksummed, and the checksum would faithfully cover the poisoned bytes.
+      # SHA = dtolnay/rust-toolchain stable @ 2026-07-03.
       - name: Install Rust toolchain + Android targets
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
@@ -92,37 +111,128 @@ jobs:
 
       - name: Build AAR (cross-compile → assemble → 16 KB alignment check)
         env:
-          VERSION: ${{ steps.v.outputs.version }}
+          VERSION: ${{ needs.validate.outputs.version }}
         run: bash scripts/build-aar.sh "$VERSION"
 
       - name: Build the self-contained desktop jar
         env:
-          VERSION: ${{ steps.v.outputs.version }}
+          VERSION: ${{ needs.validate.outputs.version }}
         working-directory: bindings/kotlin
         run: ./gradlew jar --no-daemon -PcoreVersion="$VERSION"
 
-      - name: Stage artifacts + SHA-256 manifest
+      - name: Stage desktop jar into dist/
         env:
-          VERSION: ${{ steps.v.outputs.version }}
-        run: |
-          cp "bindings/kotlin/build/libs/braird-core-desktop-$VERSION.jar" dist/
-          ( cd dist && sha256sum braird-core-*.aar braird-core-desktop-*.jar | tee SHA256SUMS.txt )
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: cp "bindings/kotlin/build/libs/braird-core-desktop-$VERSION.jar" dist/
 
       # Prove the EXACT bytes we're about to publish are self-contained: no jna.library.path, the
-      # consumer resolves the native from the jar alone.
+      # consumer resolves the native from the jar alone. Runs BEFORE the artifact is handed to publish.
       - name: Consumer round-trip against the built desktop jar
         env:
-          VERSION: ${{ steps.v.outputs.version }}
+          VERSION: ${{ needs.validate.outputs.version }}
         working-directory: bindings/consumer-smoke
         run: ./gradlew test --no-daemon -PcoreVersion="$VERSION" -PcoreJar="$GITHUB_WORKSPACE/dist/braird-core-desktop-$VERSION.jar"
+
+      - name: Upload Android artifacts for publish
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-artifacts
+          path: |
+            dist/braird-core-*.aar
+            dist/braird-core-desktop-*.jar
+          if-no-files-found: error
+          retention-days: 1
+
+  # iOS BrairdCore.xcframework (macOS host + iOS device + iOS sim, arm64). macOS-only: only
+  # xcodebuild assembles an xcframework. Uploads the pinned zip for `publish` to attach.
+  build-ios:
+    needs: validate
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.tag }} # the validated tag, never the raw input
+
+      # Same fail-closed agreement check as the Android leg, so a mismatched tag fails this leg
+      # too rather than burning macOS minutes on a build that publish would reject.
+      - name: Verify tag == Cargo.toml version + CHANGELOG section
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          CARGO_VER=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')
+          if [ "$VERSION" != "$CARGO_VER" ]; then
+            echo "::error::tag $VERSION != Cargo.toml version $CARGO_VER — bump the crate + CHANGELOG in the release commit"
+            exit 1
+          fi
+          grep -Eq "^## \[$VERSION\]" CHANGELOG.md || {
+            echo "::error::CHANGELOG.md has no '## [$VERSION]' section header"; exit 1; }
+
+      - name: Install Rust toolchain + iOS targets
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          targets: aarch64-apple-ios, aarch64-apple-ios-sim
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # Builds the xcframework AND (given a version) stages dist/braird-core-<version>.xcframework.zip
+      # + prints its SwiftPM checksum. The committed bindings-drift guard (parity.yml) already covers
+      # the binding refresh this triggers; nothing published here is committed.
+      - name: Build + zip BrairdCore.xcframework
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: scripts/build-xcframework.sh "$VERSION"
+
+      # Prove the exact xcframework we're about to zip + publish works through the FFI — the iOS
+      # analog of the Android consumer round-trip, runs BEFORE the artifact is handed to publish.
+      - name: Swift round-trip against the built xcframework
+        working-directory: bindings/swift
+        run: swift test
+
+      - name: Upload xcframework artifact for publish
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-artifacts
+          path: dist/braird-core-*.xcframework.zip
+          if-no-files-found: error
+          retention-days: 1
+
+  # Assemble every artifact into one SHA256SUMS.txt and cut the release once. This is the ONLY job
+  # with contents: write, and the ONLY job that touches the release — so create-only immutability
+  # can't be raced by a parallel lane.
+  publish:
+    needs: [validate, build-android, build-ios]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.tag }} # the validated tag, never the raw input
+
+      - name: Download build artifacts into dist/
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true # flatten android-artifacts/ + ios-artifacts/ into dist/
+
+      - name: Stage SHA-256 manifest
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          cd dist
+          ( sha256sum \
+              "braird-core-$VERSION.aar" \
+              "braird-core-desktop-$VERSION.jar" \
+              "braird-core-$VERSION.xcframework.zip" | tee SHA256SUMS.txt )
 
       # Create-only. Published assets are immutable: if a release for this tag already exists we
       # hard-fail rather than overwrite — every consumer pin (tag + SHA-256) stays valid forever.
       - name: Publish GitHub Release + attach artifacts (create-only)
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.v.outputs.tag }}
-          VERSION: ${{ steps.v.outputs.version }}
+          TAG: ${{ needs.validate.outputs.tag }}
+          VERSION: ${{ needs.validate.outputs.version }}
         run: |
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "::error::a release for $TAG already exists — published artifacts are immutable; cut a new version"
@@ -131,7 +241,11 @@ jobs:
           gh release create "$TAG" \
             "dist/braird-core-$VERSION.aar" \
             "dist/braird-core-desktop-$VERSION.jar" \
+            "dist/braird-core-$VERSION.xcframework.zip" \
             "dist/SHA256SUMS.txt" \
             --title "braird-core $TAG" \
             --verify-tag \
-            --notes "Pinned Android AAR (arm64-v8a + x86_64, 16 KB-aligned) + self-contained desktop JVM jar for braird-android. Add JNA 5.17.0 @aar alongside the AAR. Pin/bump protocol + checksum-verified fetch: docs/pinning.md. Verify downloads against SHA256SUMS.txt."
+            --notes "Pinned artifacts for the Braird native clients — verify every download against SHA256SUMS.txt. Pin/bump protocol: docs/pinning.md.
+
+          - **iOS** (braird-ios): \`braird-core-$VERSION.xcframework.zip\` — arm64 iOS device + arm64 iOS simulator (+ an arm64 macOS-host slice). The zip's SHA-256 (in SHA256SUMS.txt) is the value for SwiftPM's \`.binaryTarget(checksum:)\`. Vendor the matching \`BrairdCore.swift\` wrapper from tag $TAG.
+          - **Android** (braird-android): \`braird-core-$VERSION.aar\` (arm64-v8a + x86_64, 16 KB-aligned) + self-contained \`braird-core-desktop-$VERSION.jar\`. Add JNA 5.17.0 @aar alongside the AAR."

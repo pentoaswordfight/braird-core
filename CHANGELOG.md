@@ -20,6 +20,31 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   `content_tag` (derived) are never clearable. A non-clearable/unknown name, or a column both set and
   cleared, is rejected up front and **nothing is staged** (host-supplied names are kept out of the
   FFI error text). **Binding-surface change** — Swift + Kotlin bindings regenerated (`touches-ffi`).
+- **iOS `BrairdCore.xcframework` release leg — versioned, checksum-pinned SwiftPM binary artifact
+  (SUR-745, M0 prerequisite for the SUR-660 iOS app).** The core now ships to braird-ios as a pinned
+  artifact on the **same `v*` tag** as the Android AAR/jar — no moving-core build, no UniFFI API
+  drift going undetected.
+  - **`release.yml` restructured into a `validate → {build-android, build-ios} → publish` DAG.** The
+    two build legs run in parallel off one validated tag; a single `publish` job assembles every
+    artifact into one `SHA256SUMS.txt` and cuts the release once (create-only immutability
+    preserved). The new **`build-ios`** leg (`macos-14`) builds the xcframework and runs the Swift
+    FFI round-trip (`swift test`) against the exact bytes it zips, mirroring the Android leg's
+    consumer self-containment round-trip. `contents: write` is now held by the `publish` job **alone**
+    — the build legs run read-only, so no attacker-influenceable string reaches a release-writing lane.
+  - **`scripts/build-xcframework.sh` takes an optional `[version]`** (mirrors `build-aar.sh`): with a
+    version it additionally stages `dist/braird-core-<version>.xcframework.zip` (via `ditto
+    --keepParent`, the layout SwiftPM's remote binary target requires) and prints its
+    `swift package compute-checksum` value. No version → xcframework-only, so `nightly-macos.yml`'s
+    bare call is unchanged.
+  - **`docs/pinning.md`** gains the xcframework artifact row + a *Consumer pin — iOS* section: pin the
+    zip by `url` + `checksum` (the `SHA256SUMS.txt` entry is the SwiftPM checksum) **and** vendor the
+    matching `BrairdCore.swift` wrapper from the same tag — the iOS analog of the AAR bundling the
+    Kotlin binding, since the xcframework carries only the C FFI + native slices. Slices: arm64 iOS
+    device + arm64 iOS simulator + arm64 macOS host (the bytes `swift test` runs against; inert for
+    an iOS consumer). Apple-Silicon-only simulator; an Intel-sim (`x86_64`) slice is out of scope.
+  - Deliberately **not** changed: `bindings/swift/Package.swift` stays path-based (this repo's own
+    `swift test` consumes the local xcframework); the reviewed remote-`binaryTarget` consuming
+    manifest lands in braird-ios (SUR-660), as the Android consumer wiring did in braird-android.
 
 ## [0.1.0] - 2026-07-03
 
