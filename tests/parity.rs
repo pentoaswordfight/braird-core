@@ -194,3 +194,59 @@ fn production_random_iv_roundtrips() {
         .expect("open seal");
     assert_eq!(opened, vec![1, 2, 3, 4]);
 }
+
+/// SUR-812: `unlock_from_blobs` selects the right wrapper by TRIAL DECRYPT, not by position.
+/// The production bug was a positional "first" pick: with ≥2 active prf-v1 wrappers it
+/// throws unless the first row is the asserted credential's. Here three wrappers of ONE
+/// MK under three distinct PRFs all recover the same MK regardless of list order; a
+/// non-matching PRF and an empty list fail; a malformed candidate is skipped; and a
+/// PWA-produced (foreign) wrapper is selected out of a decoy set (coexistence).
+#[test]
+fn unlock_from_blobs_selects_by_trial_decrypt() {
+    let vault = Vault::generate();
+    let probe = |v: &Vault| v.content_tag("probe".to_string(), Some("b".to_string()));
+    let mk_tag = probe(&vault);
+
+    // Three wrappers of the SAME MK under three distinct PRFs (multi-device rewrap).
+    let prfs: [&[u8]; 3] = [b"prf-alpha", b"prf-bravo", b"prf-charlie"];
+    let blobs: Vec<WrappedBlob> = prfs
+        .iter()
+        .map(|p| vault.wrap_with_prf(p.to_vec()))
+        .collect();
+
+    // Every PRF recovers the SAME MK, and the pick is order-independent: a reversed
+    // candidate list (asserted credential no longer first) must still unlock.
+    for (i, prf) in prfs.iter().enumerate() {
+        for candidates in [
+            blobs.clone(),
+            blobs.iter().rev().cloned().collect::<Vec<_>>(),
+        ] {
+            let reopened = Vault::unlock_from_blobs(prf.to_vec(), candidates)
+                .unwrap_or_else(|_| panic!("prf {i} must unlock via trial-decrypt"));
+            assert_eq!(probe(&reopened), mk_tag, "prf {i}: same MK recovered");
+        }
+    }
+
+    // A PRF matching no candidate fails; so does an empty candidate set.
+    assert!(Vault::unlock_from_blobs(b"prf-none".to_vec(), blobs.clone()).is_err());
+    assert!(Vault::unlock_from_blobs(prfs[0].to_vec(), vec![]).is_err());
+
+    // A malformed candidate (non-base64) is SKIPPED, not fatal — a good blob still unlocks.
+    let junk = WrappedBlob {
+        wrapped_key: "!!not base64!!".into(),
+        iv: "!!".into(),
+        salt: "!!".into(),
+    };
+    Vault::unlock_from_blobs(prfs[1].to_vec(), vec![junk, blobs[1].clone()])
+        .expect("skip malformed, unlock via the good blob");
+
+    // Coexistence: a PWA-produced (foreign) prf-v1 wrapper, dropped among decoys, is
+    // selected by trial-decrypt — no wire-format change, frozen constants untouched.
+    let vectors = load("vectors.json");
+    let vectors = vectors.as_array().unwrap();
+    let inputs = load("inputs.json");
+    let foreign = blob(&find(vectors, "mk-wrap")["expected"]);
+    let decoys = vec![blobs[0].clone(), foreign, blobs[2].clone()];
+    Vault::unlock_from_blobs(hexb(&inputs, "prf"), decoys)
+        .expect("unlock_from_blobs selects the foreign PWA wrapper");
+}

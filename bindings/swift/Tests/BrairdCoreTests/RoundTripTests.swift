@@ -89,6 +89,26 @@ final class RoundTripTests: XCTestCase {
         XCTAssertEqual(try vault.openBytes(sealed: sealed, aad: "note-1"), Data([1, 2, 3, 4]))
     }
 
+    /// SUR-812: unlockFromBlobs picks the wrapper that decrypts out of many, over the FFI. Two
+    /// wrappers of one MK under two PRFs → unlockFromBlobs with the asserted PRF recovers it even
+    /// when that wrapper is NOT first in the list (a positional pick would fail); a
+    /// non-matching PRF throws.
+    func testUnlockFromBlobsSelectsMatchingWrapper() throws {
+        let vault = Vault.generate()
+        let prfA = Data(repeating: 0x0A, count: 32)
+        let prfB = Data(repeating: 0x0B, count: 32)
+        let blobA = vault.wrapWithPrf(prf: prfA)
+        let blobB = vault.wrapWithPrf(prf: prfB)
+
+        // Asserted credential (A) is second in the list — trial-decrypt still finds it.
+        let reopened = try Vault.unlockFromBlobs(prf: prfA, blobs: [blobB, blobA])
+        let ct = vault.encryptNote(noteId: "note-1", plaintext: "secret 🔐")
+        XCTAssertEqual(try reopened.decryptNote(noteId: "note-1", ciphertext: ct), "secret 🔐")
+
+        XCTAssertThrowsError(
+            try Vault.unlockFromBlobs(prf: Data(repeating: 0x0C, count: 32), blobs: [blobA, blobB]))
+    }
+
     /// SUR-741: the widened enqueue surface crosses the FFI, and source_meta_json validation
     /// (which runs in Rust) surfaces as a thrown error on the Swift side.
     func testEnqueueNoteWidenedFieldsOverFfi() throws {

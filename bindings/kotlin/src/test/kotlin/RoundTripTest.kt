@@ -88,6 +88,28 @@ class RoundTripTest {
         assertEquals(listOf<Byte>(1, 2, 3, 4), vault.openBytes(sealed, "note-1").toList())
     }
 
+    /** SUR-812: unlockFromBlobs picks the wrapper that decrypts out of many, over the FFI. Two
+     * wrappers of one MK under two PRFs → unlockFromBlobs with the asserted PRF recovers it even
+     * when that wrapper is NOT first in the list (a positional pick would fail); a
+     * non-matching PRF throws. */
+    @Test
+    fun unlockFromBlobsSelectsMatchingWrapper() {
+        val vault = Vault.generate()
+        val prfA = ByteArray(32) { 0x0A }
+        val prfB = ByteArray(32) { 0x0B }
+        val blobA = vault.wrapWithPrf(prfA)
+        val blobB = vault.wrapWithPrf(prfB)
+
+        // Asserted credential (A) is second in the list — trial-decrypt still finds it.
+        val reopened = Vault.unlockFromBlobs(prfA, listOf(blobB, blobA))
+        val ct = vault.encryptNote("note-1", "secret 🔐")
+        assertEquals("secret 🔐", reopened.decryptNote("note-1", ct))
+
+        assertThrows(CryptoException::class.java) {
+            Vault.unlockFromBlobs(ByteArray(32) { 0x0C }, listOf(blobA, blobB))
+        }
+    }
+
     /** SUR-741: the widened enqueue surface crosses the FFI, and source_meta_json validation
      * (which runs in Rust) surfaces as a thrown SyncException on the Kotlin side. */
     @Test

@@ -1391,6 +1391,29 @@ public static func unlock(prf: Data, blob: WrappedBlob)throws  -> Vault {
 })
 }
     
+    /**
+     * Unlock by trying each active prf-v1 blob with the asserted PRF and keeping the one
+     * that decrypts. Hosts pass ALL active prf-v1 blobs for the account: a blob is bound
+     * to exactly one credential's PRF, so a positional "first" pick fails whenever the
+     * account has more than one wrapper (linked devices / synced passkeys). Correctness is
+     * the trial decrypt — exactly one candidate's PRF derives the right AES key; the rest
+     * fail their GCM tag. Ordering the list by a known `credential_id` match is a valid
+     * host-side fast path, never a filter. A malformed candidate is skipped, not fatal;
+     * `DecryptFailed` iff none decrypt.
+     *
+     * Device-transfer create is this plus a PIN-wrap: `Vault::unlock_from_blobs(prf, blobs)` then
+     * [`Vault::pin_wrap`]. The single-blob [`Vault::unlock`] and the
+     * [`Vault::redeem_pin_transfer`] redeem path are unchanged.
+     */
+public static func unlockFromBlobs(prf: Data, blobs: [WrappedBlob])throws  -> Vault {
+    return try  FfiConverterTypeVault.lift(try rustCallWithError(FfiConverterTypeCryptoError.lift) {
+    uniffi_braird_core_fn_constructor_vault_unlock_from_blobs(
+        FfiConverterData.lower(prf),
+        FfiConverterSequenceTypeWrappedBlob.lower(blobs),$0
+    )
+})
+}
+    
 
     
     /**
@@ -2981,6 +3004,31 @@ fileprivate struct FfiConverterSequenceTypeSupersededEdit: FfiConverterRustBuffe
         return seq
     }
 }
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeWrappedBlob: FfiConverterRustBuffer {
+    typealias SwiftType = [WrappedBlob]
+
+    public static func write(_ value: [WrappedBlob], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeWrappedBlob.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [WrappedBlob] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [WrappedBlob]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeWrappedBlob.read(from: &buf))
+        }
+        return seq
+    }
+}
 /**
  * Derive a `collection_memberships` primary key from its `(collection_id, note_id)` pair — the
  * FFI-exported mirror of surfc's `membershipId(collectionId, noteId)`, so a host can look up or
@@ -3111,6 +3159,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_constructor_vault_unlock() != 13169) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_braird_core_checksum_constructor_vault_unlock_from_blobs() != 62598) {
         return InitializationResult.apiChecksumMismatch
     }
 
