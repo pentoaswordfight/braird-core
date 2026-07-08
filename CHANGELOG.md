@@ -6,6 +6,14 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-08
+
+Fourth tagged release. Ships **`Vault::unlock_from_blobs`** (SUR-812) — the trial-decrypt
+wrapper-selection primitive the native iOS/Android hosts (and the PWA-WASM host) share, so the
+multi-wrapper `OperationError` can't be reinvented per host. Additive `#[uniffi::export]` constructor;
+no wire-format change, frozen constants untouched. Cut so braird-android 661e (SUR-765) can pin a core
+that carries the primitive its walking-skeleton unlock calls.
+
 ### Added
 - **`Vault::unlock_from_blobs(prf, blobs)` — trial-decrypt wrapper selection (SUR-812).** A shared-core
   primitive so the native iOS/Android hosts and the PWA-WASM host share one correct wrapper-selection
