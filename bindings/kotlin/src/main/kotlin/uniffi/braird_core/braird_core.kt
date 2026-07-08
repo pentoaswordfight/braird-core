@@ -780,6 +780,10 @@ internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
 
 
 
+
+
+
+
 // A JNA Library to expose the extern-C FFI definitions.
 // This is an implementation detail which will be called internally by the public API.
 
@@ -835,7 +839,11 @@ internal interface UniffiLib : Library {
     ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_syncengine_list_notes(`ptr`: Pointer,`bookId`: RustBuffer.ByValue,`limit`: Int,`offset`: Int,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
+    fun uniffi_braird_core_fn_method_syncengine_notes_this_week(`ptr`: Pointer,`nowMs`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): Int
     fun uniffi_braird_core_fn_method_syncengine_pull(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_braird_core_fn_method_syncengine_recent_note(`ptr`: Pointer,`nowMs`: Long,`seed`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_syncengine_search(`ptr`: Pointer,`query`: RustBuffer.ByValue,`limit`: Int,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
@@ -1015,7 +1023,11 @@ internal interface UniffiLib : Library {
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_list_notes(
     ): Short
+    fun uniffi_braird_core_checksum_method_syncengine_notes_this_week(
+    ): Short
     fun uniffi_braird_core_checksum_method_syncengine_pull(
+    ): Short
+    fun uniffi_braird_core_checksum_method_syncengine_recent_note(
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_search(
     ): Short
@@ -1067,7 +1079,7 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_braird_core_checksum_func_membership_id() != 9610.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_braird_core_checksum_method_syncengine_counts() != 56423.toShort()) {
+    if (lib.uniffi_braird_core_checksum_method_syncengine_counts() != 34830.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_book() != 57249.toShort()) {
@@ -1112,7 +1124,13 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_braird_core_checksum_method_syncengine_list_notes() != 26133.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_braird_core_checksum_method_syncengine_notes_this_week() != 50990.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_braird_core_checksum_method_syncengine_pull() != 8960.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_braird_core_checksum_method_syncengine_recent_note() != 17557.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_search() != 14411.toShort()) {
@@ -1227,6 +1245,29 @@ public object FfiConverterUInt: FfiConverter<UInt, Int> {
 
     override fun write(value: UInt, buf: ByteBuffer) {
         buf.putInt(value.toInt())
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterULong: FfiConverter<ULong, Long> {
+    override fun lift(value: Long): ULong {
+        return value.toULong()
+    }
+
+    override fun read(buf: ByteBuffer): ULong {
+        return lift(buf.getLong())
+    }
+
+    override fun lower(value: ULong): Long {
+        return value.toLong()
+    }
+
+    override fun allocationSize(value: ULong) = 8UL
+
+    override fun write(value: ULong, buf: ByteBuffer) {
+        buf.putLong(value.toLong())
     }
 }
 
@@ -1546,7 +1587,8 @@ private class JavaLangRefCleanable(
 public interface SyncEngineInterface {
     
     /**
-     * Live (non-deleted) row totals for books / notes / custom ideas.
+     * Live (non-deleted) row totals for books / notes / custom ideas, plus `active_ideas` — the
+     * count of distinct idea tags on live notes (the Home stat row, SUR-806).
      */
     fun `counts`(): StoreCounts
     
@@ -1680,6 +1722,12 @@ public interface SyncEngineInterface {
     fun `listNotes`(`bookId`: kotlin.String?, `limit`: kotlin.UInt, `offset`: kotlin.UInt): List<NoteRecord>
     
     /**
+     * Home "this week" count (SUR-806) — live notes created within the last 7 days whose decrypted
+     * text is non-empty (the PWA's `notesThisWeek`). `now_ms` is the host's `Date.now()` (epoch ms).
+     */
+    fun `notesThisWeek`(`nowMs`: kotlin.Long): kotlin.UInt
+    
+    /**
      * Pull incrementally from Supabase for **all eight synced tables** (SUR-726 —
      * [`synced_table_names`] is the one source of the pull scope). Merges last-write-wins by
      * `updated_at`, applies tombstones without resurrecting soft-deleted rows, **rebases the outbox**
@@ -1697,6 +1745,14 @@ public interface SyncEngineInterface {
      * flush destroying a newer SERVER row before a pull can see it is the server's job, PR-3.)
      */
     fun `pull`(): PullSummary
+    
+    /**
+     * Home "Recently surfaced" card (SUR-806) — a pseudo-random note from that same "this week"
+     * set, decrypted in core, or `None` when nothing is fresh. `seed` is the host's random draw
+     * (the pick is deterministic in it, and the host re-rolls it to re-surface); `now_ms` is the
+     * host's `Date.now()`.
+     */
+    fun `recentNote`(`nowMs`: kotlin.Long, `seed`: kotlin.ULong): NoteRecord?
     
     /**
      * Lexical search over decrypted note text + custom-idea name/description (SUR-527 parity).
@@ -1823,7 +1879,8 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
 
     
     /**
-     * Live (non-deleted) row totals for books / notes / custom ideas.
+     * Live (non-deleted) row totals for books / notes / custom ideas, plus `active_ideas` — the
+     * count of distinct idea tags on live notes (the Home stat row, SUR-806).
      */
     @Throws(SyncException::class)override fun `counts`(): StoreCounts {
             return FfiConverterTypeStoreCounts.lift(
@@ -2114,6 +2171,23 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
 
     
     /**
+     * Home "this week" count (SUR-806) — live notes created within the last 7 days whose decrypted
+     * text is non-empty (the PWA's `notesThisWeek`). `now_ms` is the host's `Date.now()` (epoch ms).
+     */
+    @Throws(SyncException::class)override fun `notesThisWeek`(`nowMs`: kotlin.Long): kotlin.UInt {
+            return FfiConverterUInt.lift(
+    callWithPointer {
+    uniffiRustCallWithError(SyncException) { _status ->
+    UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_notes_this_week(
+        it, FfiConverterLong.lower(`nowMs`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
      * Pull incrementally from Supabase for **all eight synced tables** (SUR-726 —
      * [`synced_table_names`] is the one source of the pull scope). Merges last-write-wins by
      * `updated_at`, applies tombstones without resurrecting soft-deleted rows, **rebases the outbox**
@@ -2136,6 +2210,25 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
     uniffiRustCallWithError(SyncException) { _status ->
     UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_pull(
         it, _status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * Home "Recently surfaced" card (SUR-806) — a pseudo-random note from that same "this week"
+     * set, decrypted in core, or `None` when nothing is fresh. `seed` is the host's random draw
+     * (the pick is deterministic in it, and the host re-rolls it to re-surface); `now_ms` is the
+     * host's `Date.now()`.
+     */
+    @Throws(SyncException::class)override fun `recentNote`(`nowMs`: kotlin.Long, `seed`: kotlin.ULong): NoteRecord? {
+            return FfiConverterOptionalTypeNoteRecord.lift(
+    callWithPointer {
+    uniffiRustCallWithError(SyncException) { _status ->
+    UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_recent_note(
+        it, FfiConverterLong.lower(`nowMs`),FfiConverterULong.lower(`seed`),_status)
 }
     }
     )
@@ -3039,7 +3132,13 @@ public object FfiConverterTypeSearchHit: FfiConverterRustBuffer<SearchHit> {
 data class StoreCounts (
     var `books`: kotlin.UInt, 
     var `notes`: kotlin.UInt, 
-    var `customIdeas`: kotlin.UInt
+    var `customIdeas`: kotlin.UInt, 
+    /**
+     * Distinct idea **tags** present on ≥1 live note — the PWA Home's `activeIdeasCount`
+     * (SUR-806). Deliberately **not** `custom_ideas` (raw idea rows): canon and custom tags both
+     * count, and a tag on no live note doesn't count. Tags are plaintext, so this never decrypts.
+     */
+    var `activeIdeas`: kotlin.UInt
 ) {
     
     companion object
@@ -3054,19 +3153,22 @@ public object FfiConverterTypeStoreCounts: FfiConverterRustBuffer<StoreCounts> {
             FfiConverterUInt.read(buf),
             FfiConverterUInt.read(buf),
             FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
         )
     }
 
     override fun allocationSize(value: StoreCounts) = (
             FfiConverterUInt.allocationSize(value.`books`) +
             FfiConverterUInt.allocationSize(value.`notes`) +
-            FfiConverterUInt.allocationSize(value.`customIdeas`)
+            FfiConverterUInt.allocationSize(value.`customIdeas`) +
+            FfiConverterUInt.allocationSize(value.`activeIdeas`)
     )
 
     override fun write(value: StoreCounts, buf: ByteBuffer) {
             FfiConverterUInt.write(value.`books`, buf)
             FfiConverterUInt.write(value.`notes`, buf)
             FfiConverterUInt.write(value.`customIdeas`, buf)
+            FfiConverterUInt.write(value.`activeIdeas`, buf)
     }
 }
 

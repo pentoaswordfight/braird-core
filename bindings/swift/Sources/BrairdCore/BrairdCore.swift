@@ -415,6 +415,22 @@ fileprivate struct FfiConverterUInt32: FfiConverterPrimitive {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterUInt64: FfiConverterPrimitive {
+    typealias FfiType = UInt64
+    typealias SwiftType = UInt64
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UInt64 {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterInt64: FfiConverterPrimitive {
     typealias FfiType = Int64
     typealias SwiftType = Int64
@@ -539,7 +555,8 @@ fileprivate struct FfiConverterData: FfiConverterRustBuffer {
 public protocol SyncEngineProtocol : AnyObject {
     
     /**
-     * Live (non-deleted) row totals for books / notes / custom ideas.
+     * Live (non-deleted) row totals for books / notes / custom ideas, plus `active_ideas` — the
+     * count of distinct idea tags on live notes (the Home stat row, SUR-806).
      */
     func counts() throws  -> StoreCounts
     
@@ -673,6 +690,12 @@ public protocol SyncEngineProtocol : AnyObject {
     func listNotes(bookId: String?, limit: UInt32, offset: UInt32) throws  -> [NoteRecord]
     
     /**
+     * Home "this week" count (SUR-806) — live notes created within the last 7 days whose decrypted
+     * text is non-empty (the PWA's `notesThisWeek`). `now_ms` is the host's `Date.now()` (epoch ms).
+     */
+    func notesThisWeek(nowMs: Int64) throws  -> UInt32
+    
+    /**
      * Pull incrementally from Supabase for **all eight synced tables** (SUR-726 —
      * [`synced_table_names`] is the one source of the pull scope). Merges last-write-wins by
      * `updated_at`, applies tombstones without resurrecting soft-deleted rows, **rebases the outbox**
@@ -690,6 +713,14 @@ public protocol SyncEngineProtocol : AnyObject {
      * flush destroying a newer SERVER row before a pull can see it is the server's job, PR-3.)
      */
     func pull() throws  -> PullSummary
+    
+    /**
+     * Home "Recently surfaced" card (SUR-806) — a pseudo-random note from that same "this week"
+     * set, decrypted in core, or `None` when nothing is fresh. `seed` is the host's random draw
+     * (the pick is deterministic in it, and the host re-rolls it to re-surface); `now_ms` is the
+     * host's `Date.now()`.
+     */
+    func recentNote(nowMs: Int64, seed: UInt64) throws  -> NoteRecord?
     
     /**
      * Lexical search over decrypted note text + custom-idea name/description (SUR-527 parity).
@@ -800,7 +831,8 @@ public static func `open`(dbPath: String, supabaseUrl: String, anonKey: String, 
 
     
     /**
-     * Live (non-deleted) row totals for books / notes / custom ideas.
+     * Live (non-deleted) row totals for books / notes / custom ideas, plus `active_ideas` — the
+     * count of distinct idea tags on live notes (the Home stat row, SUR-806).
      */
 open func counts()throws  -> StoreCounts {
     return try  FfiConverterTypeStoreCounts.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
@@ -1070,6 +1102,18 @@ open func listNotes(bookId: String?, limit: UInt32, offset: UInt32)throws  -> [N
 }
     
     /**
+     * Home "this week" count (SUR-806) — live notes created within the last 7 days whose decrypted
+     * text is non-empty (the PWA's `notesThisWeek`). `now_ms` is the host's `Date.now()` (epoch ms).
+     */
+open func notesThisWeek(nowMs: Int64)throws  -> UInt32 {
+    return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_braird_core_fn_method_syncengine_notes_this_week(self.uniffiClonePointer(),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+    
+    /**
      * Pull incrementally from Supabase for **all eight synced tables** (SUR-726 —
      * [`synced_table_names`] is the one source of the pull scope). Merges last-write-wins by
      * `updated_at`, applies tombstones without resurrecting soft-deleted rows, **rebases the outbox**
@@ -1089,6 +1133,21 @@ open func listNotes(bookId: String?, limit: UInt32, offset: UInt32)throws  -> [N
 open func pull()throws  -> PullSummary {
     return try  FfiConverterTypePullSummary.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
     uniffi_braird_core_fn_method_syncengine_pull(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * Home "Recently surfaced" card (SUR-806) — a pseudo-random note from that same "this week"
+     * set, decrypted in core, or `None` when nothing is fresh. `seed` is the host's random draw
+     * (the pick is deterministic in it, and the host re-rolls it to re-surface); `now_ms` is the
+     * host's `Date.now()`.
+     */
+open func recentNote(nowMs: Int64, seed: UInt64)throws  -> NoteRecord? {
+    return try  FfiConverterOptionTypeNoteRecord.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_braird_core_fn_method_syncengine_recent_note(self.uniffiClonePointer(),
+        FfiConverterInt64.lower(nowMs),
+        FfiConverterUInt64.lower(seed),$0
     )
 })
 }
@@ -2149,13 +2208,25 @@ public struct StoreCounts {
     public var books: UInt32
     public var notes: UInt32
     public var customIdeas: UInt32
+    /**
+     * Distinct idea **tags** present on ≥1 live note — the PWA Home's `activeIdeasCount`
+     * (SUR-806). Deliberately **not** `custom_ideas` (raw idea rows): canon and custom tags both
+     * count, and a tag on no live note doesn't count. Tags are plaintext, so this never decrypts.
+     */
+    public var activeIdeas: UInt32
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(books: UInt32, notes: UInt32, customIdeas: UInt32) {
+    public init(books: UInt32, notes: UInt32, customIdeas: UInt32, 
+        /**
+         * Distinct idea **tags** present on ≥1 live note — the PWA Home's `activeIdeasCount`
+         * (SUR-806). Deliberately **not** `custom_ideas` (raw idea rows): canon and custom tags both
+         * count, and a tag on no live note doesn't count. Tags are plaintext, so this never decrypts.
+         */activeIdeas: UInt32) {
         self.books = books
         self.notes = notes
         self.customIdeas = customIdeas
+        self.activeIdeas = activeIdeas
     }
 }
 
@@ -2172,6 +2243,9 @@ extension StoreCounts: Equatable, Hashable {
         if lhs.customIdeas != rhs.customIdeas {
             return false
         }
+        if lhs.activeIdeas != rhs.activeIdeas {
+            return false
+        }
         return true
     }
 
@@ -2179,6 +2253,7 @@ extension StoreCounts: Equatable, Hashable {
         hasher.combine(books)
         hasher.combine(notes)
         hasher.combine(customIdeas)
+        hasher.combine(activeIdeas)
     }
 }
 
@@ -2192,7 +2267,8 @@ public struct FfiConverterTypeStoreCounts: FfiConverterRustBuffer {
             try StoreCounts(
                 books: FfiConverterUInt32.read(from: &buf), 
                 notes: FfiConverterUInt32.read(from: &buf), 
-                customIdeas: FfiConverterUInt32.read(from: &buf)
+                customIdeas: FfiConverterUInt32.read(from: &buf), 
+                activeIdeas: FfiConverterUInt32.read(from: &buf)
         )
     }
 
@@ -2200,6 +2276,7 @@ public struct FfiConverterTypeStoreCounts: FfiConverterRustBuffer {
         FfiConverterUInt32.write(value.books, into: &buf)
         FfiConverterUInt32.write(value.notes, into: &buf)
         FfiConverterUInt32.write(value.customIdeas, into: &buf)
+        FfiConverterUInt32.write(value.activeIdeas, into: &buf)
     }
 }
 
@@ -2937,7 +3014,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_braird_core_checksum_func_membership_id() != 9610) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_braird_core_checksum_method_syncengine_counts() != 56423) {
+    if (uniffi_braird_core_checksum_method_syncengine_counts() != 34830) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_enqueue_book() != 57249) {
@@ -2982,7 +3059,13 @@ private var initializationResult: InitializationResult = {
     if (uniffi_braird_core_checksum_method_syncengine_list_notes() != 26133) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_braird_core_checksum_method_syncengine_notes_this_week() != 50990) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_braird_core_checksum_method_syncengine_pull() != 8960) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_braird_core_checksum_method_syncengine_recent_note() != 17557) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_search() != 14411) {

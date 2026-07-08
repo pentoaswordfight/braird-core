@@ -166,6 +166,7 @@ class RoundTripTest {
         assertEquals(1u, counts.books)
         assertEquals(2u, counts.notes)
         assertEquals(1u, counts.customIdeas)
+        assertEquals(1u, counts.activeIdeas) // n1 tagged "philosophy"; n2 untagged → 1 distinct
 
         // Library grid: the book carries its live note count.
         val books = engine.listBooks(50u, 0u)
@@ -193,5 +194,39 @@ class RoundTripTest {
         assertEquals(true, engine.search("run", 10u).any { it.refId == "n2" && it.kind == SearchDocKind.NOTE })
         assertEquals(true, engine.search("antifragility", 10u).any { it.refId == "i1" && it.kind == SearchDocKind.IDEA })
         assertEquals(true, engine.search("zzznomatch", 10u).isEmpty())
+    }
+
+    /** SUR-806: the Home-surface reads — the rolling-7-day notesThisWeek, the random "Recently
+     * surfaced" pick, and the activeIdeas tag count — each decrypting in core and crossing the
+     * binding as plaintext (never an `enc:` sentinel), as an Android host consumes them. */
+    @Test
+    fun homeSurfaceQueriesOverFfi() {
+        val db = File.createTempFile("braird-home", ".sqlite").apply { deleteOnExit() }
+        val engine = SyncEngine.open(db.absolutePath, "https://x.supabase.co", "anon", Vault.generate())
+
+        val now = 1_700_000_000_000L
+        val weekMs = 7L * 24 * 60 * 60 * 1000
+        engine.enqueueNote(
+            id = "fresh", bookId = null, plaintext = "surfaced this week", page = null,
+            tags = listOf("philosophy"), source = null, sourceId = null, sourceMetaJson = null,
+            chapter = null, imagePath = null, inkCropPath = null, createdAt = now - 1000L,
+            deleted = false, clearNullableFields = emptyList(),
+        )
+        engine.enqueueNote(
+            id = "old", bookId = null, plaintext = "last month", page = null,
+            tags = listOf("ethics"), source = null, sourceId = null, sourceMetaJson = null,
+            chapter = null, imagePath = null, inkCropPath = null, createdAt = now - weekMs - 1000L,
+            deleted = false, clearNullableFields = emptyList(),
+        )
+
+        // Only the in-window note counts; the pick is it, decrypted to plaintext across the FFI.
+        assertEquals(1u, engine.notesThisWeek(now))
+        val recent = engine.recentNote(now, 0uL)
+        assertEquals("fresh", recent?.id)
+        assertEquals("surfaced this week", recent?.text)
+        assertEquals(false, recent?.text?.startsWith("enc:v") ?: false)
+
+        // active_ideas = distinct tags over ALL live notes (window-independent): philosophy, ethics.
+        assertEquals(2u, engine.counts().activeIdeas)
     }
 }
