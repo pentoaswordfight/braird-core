@@ -6,6 +6,24 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+### Added
+- **`Vault::unlock_from_blobs(prf, blobs)` — trial-decrypt wrapper selection (SUR-812).** A shared-core
+  primitive so the native iOS/Android hosts and the PWA-WASM host share one correct wrapper-selection
+  rule instead of each reinventing a fragile one. It tries each candidate `prf-v1` wrapped blob with the
+  asserted PRF and returns the `Vault` for the one that decrypts (`DecryptFailed` iff none do); a
+  malformed candidate is skipped, not fatal. This fixes the multi-wrapper `OperationError`: the old
+  host-side "first active `prf-v1` blob" pick throws whenever an account has ≥2 wrappers (linked devices
+  / synced passkeys) and the first row isn't the asserted credential's — a `prf-v1` blob only decrypts
+  under its own credential's PRF, so correctness must be the trial decrypt, never a positional or
+  equality-only pick. Device-transfer create is `unlock_from_blobs(prf, active_prf_v1_blobs)` → `pin_wrap(pin)`;
+  the single-blob `unlock` and the `redeem_pin_transfer` redeem path are **unchanged**. The core stays
+  credential-agnostic — `WrappedBlob` is unchanged and any `credential_id` ordering is a host-side
+  fast-path hint, never a filter. **Additive `#[uniffi::export]` constructor** → Swift + Kotlin bindings
+  regenerated via `scripts/gen-bindings.sh` (the `bindings-drift` guard verifies); a Rust parity test +
+  Swift/Kotlin round-trips exercise multi-wrapper recovery, order-independence, non-match, malformed-skip,
+  and PWA↔native coexistence (a PWA-produced wrapper decrypts via `unlock_from_blobs`). No wire-format change,
+  frozen constants untouched. Gate: `crypto-reviewer` + `naming-reviewer`.
+
 ## [0.3.0] - 2026-07-08
 
 Third tagged release. Adds the **Home-surface read queries** (SUR-806) so the reinstated iOS

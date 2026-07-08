@@ -784,6 +784,8 @@ internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
 
 
 
+
+
 // A JNA Library to expose the extern-C FFI definitions.
 // This is an implementation detail which will be called internally by the public API.
 
@@ -860,6 +862,8 @@ internal interface UniffiLib : Library {
     fun uniffi_braird_core_fn_constructor_vault_redeem_pin_transfer(`transferBlob`: RustBuffer.ByValue,`pin`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Pointer
     fun uniffi_braird_core_fn_constructor_vault_unlock(`prf`: RustBuffer.ByValue,`blob`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Pointer
+    fun uniffi_braird_core_fn_constructor_vault_unlock_from_blobs(`prf`: RustBuffer.ByValue,`blobs`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Pointer
     fun uniffi_braird_core_fn_method_vault_content_tag(`ptr`: Pointer,`text`: RustBuffer.ByValue,`bookId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
@@ -1059,6 +1063,8 @@ internal interface UniffiLib : Library {
     ): Short
     fun uniffi_braird_core_checksum_constructor_vault_unlock(
     ): Short
+    fun uniffi_braird_core_checksum_constructor_vault_unlock_from_blobs(
+    ): Short
     fun ffi_braird_core_uniffi_contract_version(
     ): Int
     
@@ -1176,6 +1182,9 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_constructor_vault_unlock() != 13169.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_braird_core_checksum_constructor_vault_unlock_from_blobs() != 62598.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
 }
@@ -2756,6 +2765,31 @@ open class Vault: Disposable, AutoCloseable, VaultInterface {
     
 
         
+    /**
+     * Unlock by trying each active prf-v1 blob with the asserted PRF and keeping the one
+     * that decrypts. Hosts pass ALL active prf-v1 blobs for the account: a blob is bound
+     * to exactly one credential's PRF, so a positional "first" pick fails whenever the
+     * account has more than one wrapper (linked devices / synced passkeys). Correctness is
+     * the trial decrypt — exactly one candidate's PRF derives the right AES key; the rest
+     * fail their GCM tag. Ordering the list by a known `credential_id` match is a valid
+     * host-side fast path, never a filter. A malformed candidate is skipped, not fatal;
+     * `DecryptFailed` iff none decrypt.
+     *
+     * Device-transfer create is this plus a PIN-wrap: `Vault::unlock_from_blobs(prf, blobs)` then
+     * [`Vault::pin_wrap`]. The single-blob [`Vault::unlock`] and the
+     * [`Vault::redeem_pin_transfer`] redeem path are unchanged.
+     */
+    @Throws(CryptoException::class) fun `unlockFromBlobs`(`prf`: kotlin.ByteArray, `blobs`: List<WrappedBlob>): Vault {
+            return FfiConverterTypeVault.lift(
+    uniffiRustCallWithError(CryptoException) { _status ->
+    UniffiLib.INSTANCE.uniffi_braird_core_fn_constructor_vault_unlock_from_blobs(
+        FfiConverterByteArray.lower(`prf`),FfiConverterSequenceTypeWrappedBlob.lower(`blobs`),_status)
+}
+    )
+    }
+    
+
+        
     }
     
 }
@@ -3785,6 +3819,34 @@ public object FfiConverterSequenceTypeSupersededEdit: FfiConverterRustBuffer<Lis
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterTypeSupersededEdit.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeWrappedBlob: FfiConverterRustBuffer<List<WrappedBlob>> {
+    override fun read(buf: ByteBuffer): List<WrappedBlob> {
+        val len = buf.getInt()
+        return List<WrappedBlob>(len) {
+            FfiConverterTypeWrappedBlob.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<WrappedBlob>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeWrappedBlob.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<WrappedBlob>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeWrappedBlob.write(it, buf)
         }
     }
 }

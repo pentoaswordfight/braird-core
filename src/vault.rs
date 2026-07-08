@@ -47,6 +47,31 @@ impl Vault {
         Ok(new_vault(key_manager::unwrap_with_prf(&blob, &prf)?))
     }
 
+    /// Unlock by trying each active prf-v1 blob with the asserted PRF and keeping the one
+    /// that decrypts. Hosts pass ALL active prf-v1 blobs for the account: a blob is bound
+    /// to exactly one credential's PRF, so a positional "first" pick fails whenever the
+    /// account has more than one wrapper (linked devices / synced passkeys). Correctness is
+    /// the trial decrypt — exactly one candidate's PRF derives the right AES key; the rest
+    /// fail their GCM tag. Ordering the list by a known `credential_id` match is a valid
+    /// host-side fast path, never a filter. A malformed candidate is skipped, not fatal;
+    /// `DecryptFailed` iff none decrypt.
+    ///
+    /// Device-transfer create is this plus a PIN-wrap: `Vault::unlock_from_blobs(prf, blobs)` then
+    /// [`Vault::pin_wrap`]. The single-blob [`Vault::unlock`] and the
+    /// [`Vault::redeem_pin_transfer`] redeem path are unchanged.
+    #[uniffi::constructor]
+    pub fn unlock_from_blobs(
+        prf: Vec<u8>,
+        blobs: Vec<WrappedBlob>,
+    ) -> Result<Arc<Vault>, CryptoError> {
+        for blob in &blobs {
+            if let Ok(mk) = key_manager::unwrap_with_prf(blob, &prf) {
+                return Ok(new_vault(mk));
+            }
+        }
+        Err(CryptoError::DecryptFailed)
+    }
+
     /// Redeem a PIN-encrypted device-transfer blob on a new device (PBKDF2 @ 600k).
     #[uniffi::constructor]
     pub fn redeem_pin_transfer(
