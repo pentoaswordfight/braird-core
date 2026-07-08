@@ -143,6 +143,7 @@ final class RoundTripTests: XCTestCase {
         XCTAssertEqual(counts.books, 1)
         XCTAssertEqual(counts.notes, 2)
         XCTAssertEqual(counts.customIdeas, 1)
+        XCTAssertEqual(counts.activeIdeas, 1)  // n1 tagged "philosophy"; n2 untagged → 1 distinct
 
         // Library grid: the book carries its live note count.
         let books = try engine.listBooks(limit: 50, offset: 0)
@@ -172,5 +173,39 @@ final class RoundTripTests: XCTestCase {
         let ideaHits = try engine.search(query: "antifragility", limit: 10)
         XCTAssertTrue(ideaHits.contains { $0.refId == "i1" && $0.kind == .idea })
         XCTAssertTrue(try engine.search(query: "zzznomatch", limit: 10).isEmpty)
+    }
+
+    /// SUR-806: the Home-surface reads — the rolling-7-day `notesThisWeek`, the random "Recently
+    /// surfaced" pick, and the `activeIdeas` tag count — each decrypting in core and crossing the
+    /// binding as plaintext (never an `enc:` sentinel), exactly as an iOS host consumes them.
+    func testHomeSurfaceQueriesOverFfi() throws {
+        let db = FileManager.default.temporaryDirectory
+            .appendingPathComponent("braird-home-\(UUID().uuidString).sqlite")
+        let engine = try SyncEngine.open(
+            dbPath: db.path, supabaseUrl: "https://x.supabase.co", anonKey: "anon",
+            vault: Vault.generate())
+
+        let now: Int64 = 1_700_000_000_000
+        let weekMs: Int64 = 7 * 24 * 60 * 60 * 1000
+        try engine.enqueueNote(
+            id: "fresh", bookId: nil, plaintext: "surfaced this week", page: nil,
+            tags: ["philosophy"], source: nil, sourceId: nil, sourceMetaJson: nil, chapter: nil,
+            imagePath: nil, inkCropPath: nil, createdAt: now - 1000, deleted: false,
+            clearNullableFields: [])
+        try engine.enqueueNote(
+            id: "old", bookId: nil, plaintext: "last month", page: nil, tags: ["ethics"],
+            source: nil, sourceId: nil, sourceMetaJson: nil, chapter: nil, imagePath: nil,
+            inkCropPath: nil, createdAt: now - weekMs - 1000, deleted: false,
+            clearNullableFields: [])
+
+        // Only the in-window note counts; the pick is it, decrypted to plaintext across the FFI.
+        XCTAssertEqual(try engine.notesThisWeek(nowMs: now), 1)
+        let recent = try engine.recentNote(nowMs: now, seed: 0)
+        XCTAssertEqual(recent?.id, "fresh")
+        XCTAssertEqual(recent?.text, "surfaced this week")
+        XCTAssertFalse((recent?.text ?? "").hasPrefix("enc:v"))
+
+        // active_ideas = distinct tags over ALL live notes (window-independent): philosophy, ethics.
+        XCTAssertEqual(try engine.counts().activeIdeas, 2)
     }
 }

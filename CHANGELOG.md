@@ -6,6 +6,41 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-08
+
+Third tagged release. Adds the **Home-surface read queries** (SUR-806) so the reinstated iOS
+(SUR-807) / Android (SUR-808) Home screens can pin a core that serves their data. Additive,
+read-only, decrypt-in-core — no protocol constants or wire format touched.
+
+### Added
+- **Home-surface read queries over the FFI (SUR-806).** Three additive reads on `SyncEngine`, so a
+  native Home screen gets its stat row + "Recently surfaced" card from the core (never its SQLite),
+  decrypting in core exactly like the SUR-744 M6 subset. Additive only — no existing read changed.
+  - **`counts()` gains `active_ideas`** — the count of distinct idea **tags** on ≥1 live note (the
+    PWA Home's `activeIdeasCount`). Distinct from the existing `custom_ideas` (raw idea-row count,
+    for Profile): canon **and** custom tags both count, a tag on no live note doesn't. Tags are a
+    plaintext `Json` column, so this never decrypts — a `HashSet` union over `notes.tags` mirroring
+    surfc's `ideaCountsFor` (the oracle's `count > 0` filter is a no-op — a key exists only by an
+    increment). `StoreCounts` widened in place (additive field; no shipped native consumer yet).
+  - **`notes_this_week(now_ms)`** — count of live notes created within the last 7 days whose
+    **decrypted** text is non-empty, **byte-matching** the PWA's `notesThisWeek`: a rolling 168h
+    window on `created_at` (`now_ms - 7*24*60*60*1000`, inclusive lower bound — pure epoch-ms math,
+    no calendar), with empty/whitespace text and decrypt failures excluded. `now_ms` is the host's
+    `Date.now()` (this core has no read-side clock), so the count is a pure function — deterministic
+    at the window boundary. It window-filters on `created_at` **before** decrypting, so a weekly
+    count never pays to decrypt the whole archive.
+  - **`recent_note(now_ms, seed)`** — a pseudo-random note from that same "this week" set (the
+    "Recently surfaced" card), or `None` when nothing is fresh — reproducing the PWA's
+    `fresh[floor(random()*len)]` pick, coupled to the same set (card hidden when empty). `seed` is
+    the host's random draw so the pick is deterministic (testable; the host re-rolls to re-surface,
+    as the PWA re-runs its memo on a `notes` change). Decrypts in core → `NoteRecord.text` is
+    plaintext; no `enc:` ciphertext or key bytes cross the FFI (AC #2/#3, reusing the SUR-744 seam).
+  - **FFI:** new binding surface → Swift + Kotlin bindings regenerated via `scripts/gen-bindings.sh`
+    (the `bindings-drift` guard verifies). Swift + Kotlin round-trips and the desktop-jar
+    consumer-smoke exercise all three (incl. the no-`enc:`-sentinel guard). Rust fixtures pin the
+    window boundary, the text/decrypt-failure exclusions, distinct-tag counting, and the
+    deterministic `seed` pick. New surface + decrypt path → `naming-reviewer` + `crypto-reviewer`.
+
 ## [0.2.0] - 2026-07-04
 
 Second tagged release. Cuts the `[Unreleased]` history accumulated since `v0.1.0` into `v0.2.0`:

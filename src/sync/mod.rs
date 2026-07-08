@@ -602,10 +602,27 @@ impl SyncEngine {
         read::list_custom_ideas(&store, limit as i64, offset as i64).map_err(store_err)
     }
 
-    /// Live (non-deleted) row totals for books / notes / custom ideas.
+    /// Live (non-deleted) row totals for books / notes / custom ideas, plus `active_ideas` — the
+    /// count of distinct idea tags on live notes (the Home stat row, SUR-806).
     pub fn counts(&self) -> Result<StoreCounts, SyncError> {
         let store = lock!(self.store);
         read::counts(&store).map_err(store_err)
+    }
+
+    /// Home "this week" count (SUR-806) — live notes created within the last 7 days whose decrypted
+    /// text is non-empty (the PWA's `notesThisWeek`). `now_ms` is the host's `Date.now()` (epoch ms).
+    pub fn notes_this_week(&self, now_ms: i64) -> Result<u32, SyncError> {
+        let store = lock!(self.store);
+        read::notes_this_week(&store, &self.vault, now_ms).map_err(store_err)
+    }
+
+    /// Home "Recently surfaced" card (SUR-806) — a pseudo-random note from that same "this week"
+    /// set, decrypted in core, or `None` when nothing is fresh. `seed` is the host's random draw
+    /// (the pick is deterministic in it, and the host re-rolls it to re-surface); `now_ms` is the
+    /// host's `Date.now()`.
+    pub fn recent_note(&self, now_ms: i64, seed: u64) -> Result<Option<NoteRecord>, SyncError> {
+        let store = lock!(self.store);
+        read::recent_note(&store, &self.vault, now_ms, seed).map_err(store_err)
     }
 
     /// Lexical search over decrypted note text + custom-idea name/description (SUR-527 parity).

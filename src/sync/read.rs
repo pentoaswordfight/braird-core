@@ -13,12 +13,18 @@
 //! 2. **Plaintext never reaches disk.** Decryption happens per-read into the returned DTO / the
 //!    in-memory `SearchDoc`; nothing is written back to the store (ADR 0003 preserved).
 
+use std::collections::HashSet;
+
 use serde_json::{Map, Value};
 
 use crate::note_encryption::is_encrypted;
 use crate::search::{SearchDoc, SearchDocKind};
 use crate::store::Store;
 use crate::vault::Vault;
+
+/// The PWA Home's rolling "this week" window, verbatim (`App.jsx`: `Date.now() - 7*24*60*60*1000`).
+/// Epoch milliseconds — the unit `created_at` is stored in.
+const WEEK_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 
 /// A book for the Library / Sources grid: the descriptor column set (minus `deleted`, which is
 /// always `0` for a returned row) plus `note_count` — live notes filed under this book, for the
@@ -76,6 +82,10 @@ pub struct StoreCounts {
     pub books: u32,
     pub notes: u32,
     pub custom_ideas: u32,
+    /// Distinct idea **tags** present on ≥1 live note — the PWA Home's `activeIdeasCount`
+    /// (SUR-806). Deliberately **not** `custom_ideas` (raw idea rows): canon and custom tags both
+    /// count, and a tag on no live note doesn't count. Tags are plaintext, so this never decrypts.
+    pub active_ideas: u32,
 }
 
 // ── store reads → DTOs ───────────────────────────────────────────────────────
@@ -139,7 +149,71 @@ pub fn counts(store: &Store) -> rusqlite::Result<StoreCounts> {
         books: store.count_live("books", None)? as u32,
         notes: store.count_live("notes", None)? as u32,
         custom_ideas: store.count_live("custom_ideas", None)? as u32,
+        active_ideas: active_ideas(store)?,
     })
+}
+
+/// Distinct idea tags across all live notes — the PWA Home's `activeIdeasCount`. The oracle is
+/// `ideaCountsFor(notes)` (a `{tag: count}` tally) filtered to `count > 0`; since a key is only
+/// ever created by an increment, that filter is a no-op, so the result is exactly the count of
+/// distinct tag names appearing on ≥1 live note. Tags are a plaintext `Json` column, so this scans
+/// without touching the `Vault`. ponytail: full `tags` scan; a tag index only if note counts ever
+/// make it matter.
+fn active_ideas(store: &Store) -> rusqlite::Result<u32> {
+    let mut seen: HashSet<String> = HashSet::new();
+    for row in store.list_live("notes", None, -1, 0)? {
+        seen.extend(string_array_field(&row, "tags"));
+    }
+    Ok(seen.len() as u32)
+}
+
+/// The PWA Home "this week" set (`App.jsx` `useMemo`): live notes created within the last
+/// [`WEEK_MS`] whose **decrypted** text is non-empty, newest-first. Both `notes_this_week` (its
+/// size) and `recent_note` (a pick from it) derive from this one set — exactly as the PWA computes
+/// both in a single memo. `now_ms` is the host's `Date.now()` (this core has no read-side clock),
+/// so the window is a pure function of its inputs and the store — deterministic at the boundary.
+///
+/// ponytail: window-filter on `created_at` BEFORE decrypting, so a 7-day count never pays to
+/// decrypt the whole archive — only the notes actually in the window.
+fn fresh_notes(store: &Store, vault: &Vault, now_ms: i64) -> rusqlite::Result<Vec<NoteRecord>> {
+    let cutoff = now_ms - WEEK_MS;
+    let mut out = Vec::new();
+    for row in store.list_live("notes", None, -1, 0)? {
+        if int_field(&row, "created_at") < cutoff {
+            continue; // outside the rolling window — skip before paying the decrypt cost
+        }
+        let rec = note_record(&row, vault);
+        // Mirror the oracle's filter: `!decryptError && (text || '').trim()`.
+        if rec.decrypt_failed || rec.text.as_deref().unwrap_or("").trim().is_empty() {
+            continue;
+        }
+        out.push(rec);
+    }
+    Ok(out)
+}
+
+/// Count of the [`fresh_notes`] set — the PWA Home's `notesThisWeek` (`fresh.length`), byte-matched
+/// (SUR-806 AC): a rolling 168h window on `created_at` (inclusive lower bound), decrypt-in-core,
+/// with empty/whitespace text and decrypt failures excluded.
+pub fn notes_this_week(store: &Store, vault: &Vault, now_ms: i64) -> rusqlite::Result<u32> {
+    Ok(fresh_notes(store, vault, now_ms)?.len() as u32)
+}
+
+/// A pseudo-random note from the same [`fresh_notes`] set — the Home "Recently surfaced" card
+/// (`fresh[floor(random()*len)]`) — or `None` when nothing is fresh. `seed` is the host's random
+/// draw: the core has no read-path RNG and stays deterministic for a fixture, and the host re-rolls
+/// `seed` to re-surface a note, exactly as the PWA re-runs the memo on a `notes` change.
+pub fn recent_note(
+    store: &Store,
+    vault: &Vault,
+    now_ms: i64,
+    seed: u64,
+) -> rusqlite::Result<Option<NoteRecord>> {
+    let fresh = fresh_notes(store, vault, now_ms)?;
+    if fresh.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(fresh[(seed % fresh.len() as u64) as usize].clone()))
 }
 
 /// Build the search corpus: every live note (decrypted) + every live custom idea, mirroring the
@@ -334,6 +408,13 @@ mod tests {
         r
     }
 
+    // Same row, with the `tags` array overridden (the SUR-806 active-ideas / fresh-set cases).
+    fn note_row_tagged(id: &str, text: &str, created_at: i64, tags: &[&str]) -> Map<String, Value> {
+        let mut r = note_row(id, None, text, created_at);
+        r.insert("tags".into(), json!(tags));
+        r
+    }
+
     #[test]
     fn note_text_round_trips_to_plaintext_never_ciphertext() {
         // AC #2: a stored enc:v2 ciphertext comes back as plaintext, never the enc: sentinel.
@@ -462,6 +543,9 @@ mod tests {
 
         let c = counts(&store).unwrap();
         assert_eq!((c.notes, c.custom_ideas, c.books), (2, 1, 0));
+        // active_ideas counts tags over live notes regardless of decrypt state (tags are plaintext):
+        // both n1 and the decrypt-failed n2 carry the default ["philosophy", "ethics"] → 2 distinct.
+        assert_eq!(c.active_ideas, 2);
 
         // build_search_docs drops the decrypt-failed note but keeps the readable one + the idea.
         let docs = build_search_docs(&store, &vault).unwrap();
@@ -476,5 +560,121 @@ mod tests {
             !docs.iter().any(|d| d.ref_id == "n2"),
             "decrypt failure excluded from index"
         );
+    }
+
+    #[test]
+    fn active_ideas_counts_distinct_tags_over_live_notes() {
+        // The PWA's activeIdeasCount: distinct tag names on ≥1 live note. Overlap collapses,
+        // within-note duplicates collapse, untagged notes contribute nothing, deleted notes drop.
+        let store = Store::open_in_memory().unwrap();
+        let vault = Vault::generate();
+        let seal = |id: &str| seal(&vault, id, "t");
+        store
+            .apply_row(
+                "notes",
+                &note_row_tagged("n1", &seal("n1"), 1, &["philosophy", "ethics"]),
+            )
+            .unwrap();
+        store
+            .apply_row(
+                "notes",
+                &note_row_tagged("n2", &seal("n2"), 2, &["ethics", "stoicism"]),
+            )
+            .unwrap(); // "ethics" overlaps n1
+        store
+            .apply_row("notes", &note_row_tagged("n3", &seal("n3"), 3, &[]))
+            .unwrap(); // untagged → contributes nothing
+        store
+            .apply_row(
+                "notes",
+                &note_row_tagged("n4", &seal("n4"), 4, &["logic", "logic"]),
+            )
+            .unwrap(); // duplicate within one note → counted once
+        let mut del = note_row_tagged("n5", &seal("n5"), 5, &["ghost"]);
+        del.insert("deleted".into(), json!(true));
+        store.apply_row("notes", &del).unwrap(); // deleted → its tag doesn't count
+
+        // distinct live tags: philosophy, ethics, stoicism, logic = 4 ("ghost" excluded).
+        assert_eq!(counts(&store).unwrap().active_ideas, 4);
+    }
+
+    #[test]
+    fn notes_this_week_matches_the_pwa_window_and_text_filter() {
+        // AC: byte-match the oracle — rolling 168h on created_at (inclusive lower bound),
+        // decrypt-in-core, empty/whitespace text and decrypt failures excluded.
+        let store = Store::open_in_memory().unwrap();
+        let vault = Vault::generate();
+        let foreign = Vault::generate();
+        let now = 1_700_000_000_000i64;
+        let seed = |id: &str, txt: &str, ts: i64| {
+            store
+                .apply_row("notes", &note_row(id, None, &seal(&vault, id, txt), ts))
+                .unwrap();
+        };
+
+        seed("in", "fresh", now - 1); // inside the window, has text → counts
+        seed("edge", "boundary", now - WEEK_MS); // exactly at the inclusive lower bound → counts
+        seed("future", "ahead", now + 5_000); // future-dated → still >= cutoff → counts (no upper bound)
+        seed("old", "stale", now - WEEK_MS - 1); // one ms too old → excluded
+        seed("blank", "   \n\t ", now - 2); // whitespace-only decrypted text → excluded
+        store
+            .apply_row("notes", &note_row("empty", None, "", now - 3))
+            .unwrap(); // stored empty text → excluded
+        store
+            .apply_row(
+                "notes",
+                &note_row("foreign", None, &seal(&foreign, "foreign", "nope"), now - 4),
+            )
+            .unwrap(); // in-window but decrypt-fails → excluded
+
+        assert_eq!(notes_this_week(&store, &vault, now).unwrap(), 3); // in, edge, future
+    }
+
+    #[test]
+    fn recent_note_picks_deterministically_from_the_fresh_set() {
+        let store = Store::open_in_memory().unwrap();
+        let vault = Vault::generate();
+        let now = 1_700_000_000_000i64;
+
+        // empty store → None (the PWA hides the card when nothing is fresh).
+        assert!(recent_note(&store, &vault, now, 0).unwrap().is_none());
+
+        // A NEWER text-less note must never be the pick (the set is has-text only).
+        store
+            .apply_row("notes", &note_row("blank", None, "", now - 1))
+            .unwrap();
+        store
+            .apply_row(
+                "notes",
+                &note_row("a", None, &seal(&vault, "a", "alpha"), now - 10),
+            )
+            .unwrap();
+        store
+            .apply_row(
+                "notes",
+                &note_row("b", None, &seal(&vault, "b", "beta"), now - 20),
+            )
+            .unwrap();
+
+        // fresh = [a, b] (created_at DESC, "blank" filtered out). seed indexes deterministically.
+        let pick0 = recent_note(&store, &vault, now, 0).unwrap().unwrap();
+        assert_eq!(pick0.id, "a"); // 0 % 2 = 0
+        assert_eq!(
+            recent_note(&store, &vault, now, 1).unwrap().unwrap().id,
+            "b"
+        ); // 1 % 2 = 1
+        assert_eq!(
+            recent_note(&store, &vault, now, 2).unwrap().unwrap().id,
+            "a"
+        ); // wraps
+           // decrypt-in-core: the pick's text is plaintext, never a ciphertext sentinel.
+        assert_eq!(pick0.text.as_deref(), Some("alpha"));
+        assert!(!pick0.text.unwrap().starts_with("enc:v"));
+        for s in 0..6 {
+            assert_ne!(
+                recent_note(&store, &vault, now, s).unwrap().unwrap().id,
+                "blank"
+            );
+        }
     }
 }
