@@ -2045,21 +2045,24 @@ public func FfiConverterTypeNoteRecord_lower(_ value: NoteRecord) -> RustBuffer 
  * The result of a pull across the FFI: rows seen, rows merged (last-write-wins winners +
  * applied tombstones), incoming deletes skipped as "don't-resurrect" (a delete for a row this
  * device never had), and the local edits dropped as stale by the outbox rebase (SUR-736/738 —
- * hosts read `superseded.len()` for the count).
+ * hosts read `superseded.len()` for the count). `reconcile` is the post-pull reconciliation
+ * pass (SUR-820) that runs automatically after every pull.
  */
 public struct PullSummary {
     public var pulled: UInt32
     public var merged: UInt32
     public var skippedTombstones: UInt32
     public var superseded: [SupersededEdit]
+    public var reconcile: ReconcileSummary
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(pulled: UInt32, merged: UInt32, skippedTombstones: UInt32, superseded: [SupersededEdit]) {
+    public init(pulled: UInt32, merged: UInt32, skippedTombstones: UInt32, superseded: [SupersededEdit], reconcile: ReconcileSummary) {
         self.pulled = pulled
         self.merged = merged
         self.skippedTombstones = skippedTombstones
         self.superseded = superseded
+        self.reconcile = reconcile
     }
 }
 
@@ -2079,6 +2082,9 @@ extension PullSummary: Equatable, Hashable {
         if lhs.superseded != rhs.superseded {
             return false
         }
+        if lhs.reconcile != rhs.reconcile {
+            return false
+        }
         return true
     }
 
@@ -2087,6 +2093,7 @@ extension PullSummary: Equatable, Hashable {
         hasher.combine(merged)
         hasher.combine(skippedTombstones)
         hasher.combine(superseded)
+        hasher.combine(reconcile)
     }
 }
 
@@ -2101,7 +2108,8 @@ public struct FfiConverterTypePullSummary: FfiConverterRustBuffer {
                 pulled: FfiConverterUInt32.read(from: &buf), 
                 merged: FfiConverterUInt32.read(from: &buf), 
                 skippedTombstones: FfiConverterUInt32.read(from: &buf), 
-                superseded: FfiConverterSequenceTypeSupersededEdit.read(from: &buf)
+                superseded: FfiConverterSequenceTypeSupersededEdit.read(from: &buf), 
+                reconcile: FfiConverterTypeReconcileSummary.read(from: &buf)
         )
     }
 
@@ -2110,6 +2118,7 @@ public struct FfiConverterTypePullSummary: FfiConverterRustBuffer {
         FfiConverterUInt32.write(value.merged, into: &buf)
         FfiConverterUInt32.write(value.skippedTombstones, into: &buf)
         FfiConverterSequenceTypeSupersededEdit.write(value.superseded, into: &buf)
+        FfiConverterTypeReconcileSummary.write(value.reconcile, into: &buf)
     }
 }
 
@@ -2126,6 +2135,97 @@ public func FfiConverterTypePullSummary_lift(_ buf: RustBuffer) throws -> PullSu
 #endif
 public func FfiConverterTypePullSummary_lower(_ value: PullSummary) -> RustBuffer {
     return FfiConverterTypePullSummary.lower(value)
+}
+
+
+/**
+ * The result of the post-pull reconciliation pass across the FFI (SUR-820): books backfilled by
+ * id (a note's `book_id` referenced a book absent locally), notes rehomed to a known
+ * offline-merge survivor vs. detached locally-only when no survivor is known, and custom ideas
+ * created for a note tag orphaned from the current canon. Nested onto [`PullSummary`] (not
+ * flattened) — a pull-mechanics count (`pulled`/`merged`) and a reconciliation-outcome count are
+ * different concerns. A reconciliation failure never fails the `pull`/`sync` it's attached to
+ * (best-effort — see [`reconcile`]); this summary is all-zero in that case.
+ */
+public struct ReconcileSummary {
+    public var booksBackfilled: UInt32
+    public var notesRehomed: UInt32
+    public var notesDetached: UInt32
+    public var ideasCreated: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(booksBackfilled: UInt32, notesRehomed: UInt32, notesDetached: UInt32, ideasCreated: UInt32) {
+        self.booksBackfilled = booksBackfilled
+        self.notesRehomed = notesRehomed
+        self.notesDetached = notesDetached
+        self.ideasCreated = ideasCreated
+    }
+}
+
+
+
+extension ReconcileSummary: Equatable, Hashable {
+    public static func ==(lhs: ReconcileSummary, rhs: ReconcileSummary) -> Bool {
+        if lhs.booksBackfilled != rhs.booksBackfilled {
+            return false
+        }
+        if lhs.notesRehomed != rhs.notesRehomed {
+            return false
+        }
+        if lhs.notesDetached != rhs.notesDetached {
+            return false
+        }
+        if lhs.ideasCreated != rhs.ideasCreated {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(booksBackfilled)
+        hasher.combine(notesRehomed)
+        hasher.combine(notesDetached)
+        hasher.combine(ideasCreated)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeReconcileSummary: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ReconcileSummary {
+        return
+            try ReconcileSummary(
+                booksBackfilled: FfiConverterUInt32.read(from: &buf), 
+                notesRehomed: FfiConverterUInt32.read(from: &buf), 
+                notesDetached: FfiConverterUInt32.read(from: &buf), 
+                ideasCreated: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ReconcileSummary, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.booksBackfilled, into: &buf)
+        FfiConverterUInt32.write(value.notesRehomed, into: &buf)
+        FfiConverterUInt32.write(value.notesDetached, into: &buf)
+        FfiConverterUInt32.write(value.ideasCreated, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeReconcileSummary_lift(_ buf: RustBuffer) throws -> ReconcileSummary {
+    return try FfiConverterTypeReconcileSummary.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeReconcileSummary_lower(_ value: ReconcileSummary) -> RustBuffer {
+    return FfiConverterTypeReconcileSummary.lower(value)
 }
 
 

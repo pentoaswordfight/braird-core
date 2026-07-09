@@ -63,7 +63,7 @@ repo by name (`shared/personas/<name>.md`).
 
 | Path | Pattern | Primary gate | Fallback gate (until primary exists) |
 |---|---|---|---|
-| The **sync engine + local store** (Phase 2, SUR-659) — `src/store.rs`, `src/sync/**`, `src/outbox.rs`, `src/http.rs`, `vendored/schema/**`, `scripts/extract-sync-schema.mjs` | **GCE only** | Schema-drift guard green — `vendored/schema/**` reconciles against `surfc/main`'s synced schema (`tests/schema_parity.rs` + `.github/workflows/schema-drift.yml`) — + founder sign-off | Founder sign-off after `sync-reviewer` (engine, PWA↔native coexistence, schema drift) **+** `crypto-reviewer` (the seal-at-flush boundary — note text must never leave unencrypted, SUR-724) pass |
+| The **sync engine + local store** (Phase 2, SUR-659; post-pull reconciliation SUR-820) — `src/store.rs`, `src/sync/**`, `src/outbox.rs`, `src/http.rs`, `vendored/schema/**`, `scripts/extract-sync-schema.mjs`, `vendored/canon/**`, `scripts/extract-great-ideas.mjs`, `.github/workflows/canon-drift.yml` | **GCE only** | Schema-drift **and** canon-drift guards green — `vendored/schema/**` reconciles against `surfc/main`'s synced schema (`tests/schema_parity.rs` + `.github/workflows/schema-drift.yml`), `vendored/canon/**` reconciles against `surfc/main`'s `GREAT_IDEAS` (`.github/workflows/canon-drift.yml`) — + founder sign-off | Founder sign-off after `sync-reviewer` (engine, PWA↔native coexistence, schema/canon drift) **+** `crypto-reviewer` (the seal-at-flush boundary — note text must never leave unencrypted, SUR-724) pass |
 | The **release / packaging boundary** (SUR-760; row pre-wired by SUR-778) — `bindings/android/**`, `bindings/consumer-smoke/**`, `scripts/build-aar.sh`, `scripts/build-xcframework.sh`, `.github/workflows/release.yml`, `.github/workflows/android-artifacts.yml`, `docs/pinning.md` | **GCE only** | Release CI green — every shipped `.so` 16 KB-aligned (bundled deps included), SHA-256 per artifact published with the release, tag / `Cargo.toml` version / CHANGELOG agree — + founder sign-off | Founder sign-off after a `release-integrity-reviewer` (binding↔native atomicity, tag + SHA-256 pin, fail-closed fetch, alignment gates) pass |
 | `bindings/**`, `src/bin/uniffi-bindgen.rs` — the generated Swift/Kotlin surface + its round-trip tests (the public API devs consume) | **GCE only** | Swift **and** Kotlin round-trip parity green + founder sign-off | Founder sign-off after `naming-reviewer` (the API *word*) **+** `crypto-reviewer` (the seam) pass |
 | `vendored/crypto-parity/**` — the crypto parity vectors vendored from `surfc/main` | **GCE only** | Vendored-drift guard green — byte-identical to `surfc/main` (§4) — + founder sign-off | `crypto-reviewer` confirms the vectors against `surfc/main` |
@@ -132,8 +132,9 @@ A change is **gateable** when all of the following are true:
    vectors **bit-identical**, foreign-ciphertext decrypt passes, and (for binding changes)
    the Swift + Kotlin round-trips pass. CI enforces this on every core change.
 5. **The drift guards are green** — `vendored/crypto-parity/**` is byte-identical to
-   `surfc/main`, and (for store/schema changes) `vendored/schema/**` reconciles against
-   `surfc/main`'s synced schema. See `.github/workflows/`.
+   `surfc/main`, and (for store/schema/canon changes) `vendored/schema/**` and
+   `vendored/canon/**` each reconcile against `surfc/main`'s synced schema / `GREAT_IDEAS`.
+   See `.github/workflows/`.
 6. `crypto-reviewer` (+ `naming-reviewer` for binding changes, + `sync-reviewer` for
    store/schema changes) has passed, or its findings are explicitly accepted with rationale.
 7. Founder has signed off in writing (PR comment is fine).
@@ -165,6 +166,8 @@ yet built for a new surface:
   surfc#331) established this repo; ADR 0002 records the crypto-backend choice (RustCrypto).
 - `vendored/crypto-parity/` — crypto parity vectors vendored from `surfc/main`, drift-guarded.
 - `vendored/schema/` — the synced-schema fixture, drift-guarded against `surfc/main` (SUR-723).
+- `vendored/canon/` — the `GREAT_IDEAS` canon-list fixture, drift-guarded against `surfc/main`
+  (SUR-820 Canon-102 awareness — the post-pull reconciliation's dropped-tag pass).
 - `bindings/{swift,kotlin}/` — the generated UniFFI surface + round-trip tests (produced
   from the `#[uniffi::export]` items via `src/bin/uniffi-bindgen.rs`).
 - Persona prompts — in the sibling `gce/` repo (`shared/personas/`), referenced by name

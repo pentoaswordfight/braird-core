@@ -6,6 +6,31 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+### Added
+- **Post-pull reconciliation pass (SUR-820).** After every `pull()`/`sync()`, the core now
+  automatically runs three referential/taxonomy repairs the PWA previously ran alone in
+  `fetchAllCloud` (SUR-659 explicitly excluded these from the core; briefly re-homed to Android
+  at SUR-768): (1) backfill a book referenced by a live note but absent locally, by fetching it
+  from the server; (2) repoint a live note stranded on a soft-deleted (offline-merged) book to
+  the known survivor, or detach it locally-only when no survivor is known (never pushed — mirrors
+  the PWA's LWW-safety rule exactly); (3) convert a live note tag that matches neither the
+  vendored canon (`vendored/canon/great-ideas.json`, drift-guarded against `surfc/main`) nor an
+  existing custom idea into a new custom idea, using the oracle's exact deterministic id format
+  (`cidea_sur597_{userId}_{slug}`) for full coexistence with rows the PWA already created — this
+  is a deliberate generalization past the PWA's static 26-name `DROPPED_LEAVES` check, so a
+  future canon revision can't orphan tags the way the historical v14 swap did. Reconciliation is
+  best-effort: a failure never fails the `pull()`/`sync()` it's attached to (a strengthening past
+  the oracle's stricter, non-try-caught 2b/2c behavior — flagged for `sync-reviewer`), and is
+  **skipped entirely on a partial pull failure** (mirroring `pull_then_flush`'s existing SUR-736
+  guard) — a table that failed to pull this round is stale, and reconciling against stale data
+  (e.g. `reconcile_dropped_tags` reading a `custom_ideas` mirror that just missed this round's
+  pull) risks recreating or overwriting a row another device already converged. New
+  `PullSummary.reconcile: ReconcileSummary` field (additive `#[uniffi::export]` surface) →
+  Swift + Kotlin bindings regenerated. New `vendored/canon/**` + `scripts/extract-great-ideas.mjs`
+  + `.github/workflows/canon-drift.yml`, added to `GATING.md`'s sync-engine row. No crypto
+  constants touched; note text/ciphertext unchanged. Gate: `sync-reviewer` + `crypto-reviewer` +
+  `naming-reviewer`.
+
 ## [0.4.0] - 2026-07-08
 
 Fourth tagged release. Ships **`Vault::unlock_from_blobs`** (SUR-812) — the trial-decrypt

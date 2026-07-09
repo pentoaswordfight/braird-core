@@ -23,6 +23,7 @@ pub mod outbox;
 pub mod pull;
 pub mod push;
 mod read;
+mod reconcile;
 
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -66,16 +67,44 @@ pub struct SupersededEdit {
     pub winning_updated_at: i64,
 }
 
+/// The result of the post-pull reconciliation pass across the FFI (SUR-820): books backfilled by
+/// id (a note's `book_id` referenced a book absent locally), notes rehomed to a known
+/// offline-merge survivor vs. detached locally-only when no survivor is known, and custom ideas
+/// created for a note tag orphaned from the current canon. Nested onto [`PullSummary`] (not
+/// flattened) — a pull-mechanics count (`pulled`/`merged`) and a reconciliation-outcome count are
+/// different concerns. A reconciliation failure never fails the `pull`/`sync` it's attached to
+/// (best-effort — see [`reconcile`]); this summary is all-zero in that case.
+#[derive(Debug, Default, uniffi::Record)]
+pub struct ReconcileSummary {
+    pub books_backfilled: u32,
+    pub notes_rehomed: u32,
+    pub notes_detached: u32,
+    pub ideas_created: u32,
+}
+
+impl From<reconcile::ReconcileResult> for ReconcileSummary {
+    fn from(r: reconcile::ReconcileResult) -> Self {
+        ReconcileSummary {
+            books_backfilled: r.books_backfilled as u32,
+            notes_rehomed: r.notes_rehomed as u32,
+            notes_detached: r.notes_detached as u32,
+            ideas_created: r.ideas_created as u32,
+        }
+    }
+}
+
 /// The result of a pull across the FFI: rows seen, rows merged (last-write-wins winners +
 /// applied tombstones), incoming deletes skipped as "don't-resurrect" (a delete for a row this
 /// device never had), and the local edits dropped as stale by the outbox rebase (SUR-736/738 —
-/// hosts read `superseded.len()` for the count).
+/// hosts read `superseded.len()` for the count). `reconcile` is the post-pull reconciliation
+/// pass (SUR-820) that runs automatically after every pull.
 #[derive(Debug, uniffi::Record)]
 pub struct PullSummary {
     pub pulled: u32,
     pub merged: u32,
     pub skipped_tombstones: u32,
     pub superseded: Vec<SupersededEdit>,
+    pub reconcile: ReconcileSummary,
 }
 
 /// The result of [`SyncEngine::sync`] — one pull then one flush, reported together.
@@ -480,18 +509,22 @@ impl SyncEngine {
         let tables = synced_table_names();
         let store = lock!(self.store);
         let client = lock!(self.client);
-        if client.access_token().is_none() {
-            return Err(SyncError::Flush(
-                "no access token set — call set_access_token before pull".into(),
-            ));
-        }
-        let result = self
+        let token = match client.access_token() {
+            Some(t) => t,
+            None => {
+                return Err(SyncError::Flush(
+                    "no access token set — call set_access_token before pull".into(),
+                ))
+            }
+        };
+        let (result, reconciled) = self
             .runtime
-            .block_on(pull::pull(&store, &*client, &tables))
+            .block_on(pull_and_reconcile(&store, &*client, token, &tables))
             .map_err(SyncError::Flush)?;
         // Every requested table failing (e.g. offline / bad token) is a real error — surface it
         // rather than a misleading "pulled 0". A PARTIAL failure stays Ok (per-table isolation:
-        // the failed table's cursor is untouched and re-pulls next call).
+        // the failed table's cursor is untouched and re-pulls next call) — reconciliation was
+        // already skipped for a partial failure inside `pull_and_reconcile`.
         if result.failed_tables.len() == tables.len() {
             return Err(SyncError::Flush(format!(
                 "pull failed for all tables: {}",
@@ -503,6 +536,7 @@ impl SyncEngine {
             merged: result.merged as u32,
             skipped_tombstones: result.skipped_tombstones as u32,
             superseded: result.superseded,
+            reconcile: reconciled.into(),
         })
     }
 
@@ -531,7 +565,7 @@ impl SyncEngine {
         })?;
         let user_id = user_id_from_jwt(token)
             .map_err(|e| SyncError::Flush(format!("bad access token: {e}")))?;
-        let (pull, flush) = self
+        let (pull, reconcile, flush) = self
             .runtime
             .block_on(pull_then_flush(&store, &*client, &user_id, &tables))
             .map_err(SyncError::Flush)?;
@@ -541,6 +575,7 @@ impl SyncEngine {
                 merged: pull.merged as u32,
                 skipped_tombstones: pull.skipped_tombstones as u32,
                 superseded: pull.superseded,
+                reconcile: reconcile.into(),
             },
             flush: FlushSummary {
                 pushed: flush.ok.len() as u32,
@@ -671,7 +706,14 @@ pub async fn pull_then_flush<S: http::PostgrestSink>(
     sink: &S,
     user_id: &str,
     tables: &[&str],
-) -> Result<(pull::PullResult, push::FlushResult), String> {
+) -> Result<
+    (
+        pull::PullResult,
+        reconcile::ReconcileResult,
+        push::FlushResult,
+    ),
+    String,
+> {
     let pulled = pull::pull(store, sink, tables).await?;
     if !pulled.failed_tables.is_empty() {
         return Err(format!(
@@ -680,8 +722,66 @@ pub async fn pull_then_flush<S: http::PostgrestSink>(
             pulled.failed_tables.join(", ")
         ));
     }
+    // Best-effort (SUR-820): a reconciliation hiccup must never abort an otherwise-clean
+    // pull+flush — logged and zeroed here, retried silently on the next sync.
+    let reconciled = reconcile::reconcile(store, sink, user_id)
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("sync: post-pull reconciliation failed (non-fatal, retries next pull): {e}");
+            reconcile::ReconcileResult::default()
+        });
     let flushed = push::flush(store, sink, user_id).await?;
-    Ok((pulled, flushed))
+    Ok((pulled, reconciled, flushed))
+}
+
+/// Run the post-pull reconciliation pass for [`SyncEngine::pull`], never failing the pull it
+/// follows — the same best-effort guarantee [`pull_then_flush`] gives `sync()`. `pull()` has no
+/// independent need for `user_id` (unlike `flush`/`sync`, which stamp it on pushed rows); it's
+/// derived here purely for reconciliation's dropped-tag pass, so a bad/unparseable token
+/// degrades reconciliation only, not the pull itself.
+/// Pull, then reconcile — but ONLY if the pull was fully clean, mirroring [`pull_then_flush`]'s
+/// SUR-736 guard for the same reason: a table that failed to pull this round is stale (its
+/// cursor didn't advance), and reconciling against stale data is unsafe. Concretely,
+/// `reconcile_dropped_tags` reads the local `custom_ideas` mirror to decide whether a note tag
+/// is already a known custom idea — if `custom_ideas` failed to pull while `notes` succeeded,
+/// that mirror is stale, and the pass could recreate/overwrite a custom idea another device
+/// already pushed under the same deterministic id, because this device just doesn't know about
+/// it yet. `pull_then_flush` already has this exact guard (it aborts the whole call on ANY
+/// failed table, for the pre-existing SUR-736 flush reason); this gives `SyncEngine::pull`'s
+/// standalone path the matching guard, without forcing it to also abort the pull-result
+/// reporting itself — a partial pull failure still returns `Ok` with real counts (per-table
+/// isolation, unchanged), only reconciliation is skipped and zeroed.
+///
+/// `pull()` has no independent need for `user_id` (unlike `flush`/`sync`, which stamp it on
+/// pushed rows); it's derived here purely for reconciliation's dropped-tag pass, so a
+/// bad/unparseable token degrades reconciliation only, not the pull itself. Shared by
+/// [`SyncEngine::pull`] and covered directly by a stub-sink test (mirrors [`pull_then_flush`]'s
+/// own testability shape — the concrete `PostgrestClient` inside `SyncEngine` can't be made to
+/// fail one table but not another).
+pub async fn pull_and_reconcile<S: http::PostgrestSink>(
+    store: &Store,
+    sink: &S,
+    token: &str,
+    tables: &[&str],
+) -> Result<(pull::PullResult, reconcile::ReconcileResult), String> {
+    let pulled = pull::pull(store, sink, tables).await?;
+    if !pulled.failed_tables.is_empty() {
+        eprintln!(
+            "pull: skipping reconciliation — {} failed to pull this round (stale-data risk); \
+             retries next pull",
+            pulled.failed_tables.join(", ")
+        );
+        return Ok((pulled, reconcile::ReconcileResult::default()));
+    }
+    let outcome = match http::user_id_from_jwt(token) {
+        Ok(user_id) => reconcile::reconcile(store, sink, &user_id).await,
+        Err(e) => Err(format!("bad access token: {e}")),
+    };
+    let reconciled = outcome.unwrap_or_else(|e| {
+        eprintln!("pull: post-pull reconciliation failed (non-fatal, retries next pull): {e}");
+        reconcile::ReconcileResult::default()
+    });
+    Ok((pulled, reconciled))
 }
 
 /// Derive a `collection_memberships` primary key from its `(collection_id, note_id)` pair — the
@@ -764,7 +864,10 @@ fn apply_clears(
 
 /// Epoch milliseconds — the PWA `Date.now()` unit the cloud data is stamped in. `SystemTime`
 /// before the epoch is impossible on a sane clock; clamp to 0 rather than panic.
-fn epoch_ms() -> i64 {
+///
+/// `pub(crate)`: also used by [`reconcile`], whose local-only mutations (rehome, dropped-tag
+/// custom ideas) stamp `updated_at`/`created_at` the same way every other write path does.
+pub(crate) fn epoch_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)

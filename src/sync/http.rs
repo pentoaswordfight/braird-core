@@ -168,6 +168,48 @@ impl PostgrestClient {
         }
         Ok(resp.json::<Vec<Value>>().await?)
     }
+
+    /// Batch-fetch rows from `table` by primary key, via PostgREST's `in.()` filter — the
+    /// missing-book backfill read ([`super::reconcile`], SUR-820). `ids` must be non-empty (an
+    /// empty `in.()` filter is invalid PostgREST syntax); callers guard this before calling.
+    pub async fn get_by_ids(
+        &self,
+        table: &str,
+        ids: &[String],
+    ) -> Result<Vec<Value>, Box<dyn std::error::Error + Send + Sync>> {
+        let token = self
+            .access_token
+            .as_deref()
+            .ok_or("no access token set — call set_access_token before pull")?;
+
+        let url = by_ids_url(&self.base_url, table, ids);
+
+        let mut headers = HeaderMap::new();
+        headers.insert("apikey", HeaderValue::from_str(&self.anon_key)?);
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}"))?,
+        );
+
+        let resp = self.http.get(&url).headers(headers).send().await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(Box::new(PostgrestError {
+                status: status.as_u16(),
+                body,
+            }));
+        }
+        Ok(resp.json::<Vec<Value>>().await?)
+    }
+}
+
+/// The PostgREST `in.()` filter URL for a batch-by-id fetch — split out from
+/// [`PostgrestClient::get_by_ids`] so the wire-format shape is unit-testable without a live
+/// server (SUR-820: no integration test for this new read path, per the fast-gate-only scope).
+fn by_ids_url(base_url: &str, table: &str, ids: &[String]) -> String {
+    format!("{base_url}/rest/v1/{table}?id=in.({})", ids.join(","))
 }
 
 /// The PostgREST seam [`push::flush`](super::push::flush) and [`pull`](super::pull) drive.
@@ -189,6 +231,14 @@ pub trait PostgrestSink {
         after_seq: i64,
         limit: i64,
     ) -> Result<Vec<Value>, String>;
+
+    /// Batch-fetch rows by primary key (`id=in.(...)`) — the post-pull reconciliation's
+    /// missing-book backfill ([`super::reconcile`], SUR-820). Defaulted to empty so the existing
+    /// sinks that never fetch by id (`MapSink`, `PagingSink`, `VecSink`, `RecordingSink`) don't
+    /// need a stub they'd never exercise.
+    async fn fetch_by_ids(&self, _table: &str, _ids: &[String]) -> Result<Vec<Value>, String> {
+        Ok(Vec::new())
+    }
 }
 
 impl PostgrestSink for PostgrestClient {
@@ -207,6 +257,13 @@ impl PostgrestSink for PostgrestClient {
         self.get_page(table, after_seq, limit)
             .await
             .map_err(|e| e.to_string())
+    }
+
+    async fn fetch_by_ids(&self, table: &str, ids: &[String]) -> Result<Vec<Value>, String> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.get_by_ids(table, ids).await.map_err(|e| e.to_string())
     }
 }
 
@@ -289,5 +346,21 @@ mod tests {
         assert!(PostgrestClient::new("https://proj.supabase.co".into(), "anon".into()).is_ok());
         assert!(PostgrestClient::new("http://127.0.0.1:54321".into(), "anon".into()).is_ok());
         assert!(PostgrestClient::new("http://localhost:54321".into(), "anon".into()).is_ok());
+    }
+
+    #[test]
+    fn by_ids_url_uses_the_postgrest_in_filter() {
+        assert_eq!(
+            by_ids_url(
+                "https://proj.supabase.co",
+                "books",
+                &["b1".into(), "b2".into()]
+            ),
+            "https://proj.supabase.co/rest/v1/books?id=in.(b1,b2)"
+        );
+        assert_eq!(
+            by_ids_url("https://proj.supabase.co", "books", &["only-one".into()]),
+            "https://proj.supabase.co/rest/v1/books?id=in.(only-one)"
+        );
     }
 }
