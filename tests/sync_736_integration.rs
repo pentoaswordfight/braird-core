@@ -9,10 +9,19 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
+use base64::Engine;
 use braird_core::store::Store;
 use braird_core::sync::http::PostgrestSink;
-use braird_core::sync::{pull, pull_then_flush, push};
+use braird_core::sync::{pull, pull_and_reconcile, pull_then_flush, push};
 use serde_json::{json, Value};
+
+/// An unverified test JWT carrying `sub: <user_id>` — `pull_and_reconcile`/`user_id_from_jwt`
+/// only read the claim, never verify the signature (PostgREST does that server-side).
+fn test_jwt(user_id: &str) -> String {
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(format!(r#"{{"sub":"{user_id}"}}"#));
+    format!("h.{payload}.sig")
+}
 
 fn block<F: std::future::Future>(f: F) -> F::Output {
     tokio::runtime::Builder::new_current_thread()
@@ -297,4 +306,93 @@ fn reconciliation_failure_does_not_abort_an_otherwise_clean_pull_then_flush() {
         (0, 0, 0, 0),
         "reconcile's failure is logged and zeroed, not propagated"
     );
+}
+
+#[test]
+fn pull_and_reconcile_skips_reconciliation_on_a_partial_pull_failure() {
+    // The bug this pins: `custom_ideas` fails to pull while `notes` succeeds. Reconciling
+    // against a STALE local `custom_ideas` mirror could recreate/overwrite a custom idea another
+    // device already pushed under the same deterministic id, because this device just doesn't
+    // know about it yet. `pull_and_reconcile` must skip reconciliation entirely whenever ANY
+    // table failed — mirroring `pull_then_flush`'s existing SUR-736 guard — while still
+    // returning the real (partial) pull result, not aborting the whole call.
+    let store = Store::open_in_memory().unwrap();
+    // A note tagged with something that is neither canon nor (locally) a known custom idea —
+    // exactly the condition that would make reconcile_dropped_tags act, if it ran.
+    store
+        .apply_row(
+            "notes",
+            json!({
+                "id": "n1", "book_id": null, "text": "enc:v2:x", "tags": ["Angel"],
+                "created_at": 1, "updated_at": 1, "deleted": false
+            })
+            .as_object()
+            .unwrap(),
+        )
+        .unwrap();
+    let sink = RecordingSink::new(one("notes", vec![])).failing("custom_ideas");
+
+    let (pulled, reconciled) = block(pull_and_reconcile(
+        &store,
+        &sink,
+        &test_jwt("user-1"),
+        &["notes", "custom_ideas"],
+    ))
+    .expect("a partial failure must not error the whole call");
+
+    assert!(
+        pulled.failed_tables.contains(&"custom_ideas".to_string()),
+        "the partial pull failure is still reported"
+    );
+    assert_eq!(
+        (
+            reconciled.books_backfilled,
+            reconciled.notes_rehomed,
+            reconciled.notes_detached,
+            reconciled.ideas_created
+        ),
+        (0, 0, 0, 0),
+        "reconciliation must be skipped entirely on a partial pull failure, not just degraded"
+    );
+    assert!(
+        store
+            .get_row("custom_ideas", "cidea_sur597_user-1_angel")
+            .unwrap()
+            .is_none(),
+        "no custom idea was created — reconciliation never ran against the stale mirror"
+    );
+}
+
+#[test]
+fn pull_and_reconcile_runs_normally_on_a_fully_clean_pull() {
+    // Guard against over-aggressive skipping: a clean pull (no failed tables) must still
+    // reconcile normally.
+    let store = Store::open_in_memory().unwrap();
+    store
+        .apply_row(
+            "notes",
+            json!({
+                "id": "n1", "book_id": null, "text": "enc:v2:x", "tags": ["Angel"],
+                "created_at": 1, "updated_at": 1, "deleted": false
+            })
+            .as_object()
+            .unwrap(),
+        )
+        .unwrap();
+    let sink = RecordingSink::new(one("notes", vec![]));
+
+    let (pulled, reconciled) = block(pull_and_reconcile(
+        &store,
+        &sink,
+        &test_jwt("user-1"),
+        &["notes", "custom_ideas"],
+    ))
+    .unwrap();
+
+    assert!(pulled.failed_tables.is_empty());
+    assert_eq!(reconciled.ideas_created, 1, "reconciliation ran normally");
+    assert!(store
+        .get_row("custom_ideas", "cidea_sur597_user-1_angel")
+        .unwrap()
+        .is_some());
 }

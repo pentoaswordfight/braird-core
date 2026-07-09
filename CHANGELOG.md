@@ -20,7 +20,11 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   is a deliberate generalization past the PWA's static 26-name `DROPPED_LEAVES` check, so a
   future canon revision can't orphan tags the way the historical v14 swap did. Reconciliation is
   best-effort: a failure never fails the `pull()`/`sync()` it's attached to (a strengthening past
-  the oracle's stricter, non-try-caught 2b/2c behavior — flagged for `sync-reviewer`). New
+  the oracle's stricter, non-try-caught 2b/2c behavior — flagged for `sync-reviewer`), and is
+  **skipped entirely on a partial pull failure** (mirroring `pull_then_flush`'s existing SUR-736
+  guard) — a table that failed to pull this round is stale, and reconciling against stale data
+  (e.g. `reconcile_dropped_tags` reading a `custom_ideas` mirror that just missed this round's
+  pull) risks recreating or overwriting a row another device already converged. New
   `PullSummary.reconcile: ReconcileSummary` field (additive `#[uniffi::export]` surface) →
   Swift + Kotlin bindings regenerated. New `vendored/canon/**` + `scripts/extract-great-ideas.mjs`
   + `.github/workflows/canon-drift.yml`, added to `GATING.md`'s sync-engine row. No crypto

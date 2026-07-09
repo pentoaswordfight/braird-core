@@ -517,28 +517,26 @@ impl SyncEngine {
                 ))
             }
         };
-        let result = self
+        let (result, reconciled) = self
             .runtime
-            .block_on(pull::pull(&store, &*client, &tables))
+            .block_on(pull_and_reconcile(&store, &*client, token, &tables))
             .map_err(SyncError::Flush)?;
         // Every requested table failing (e.g. offline / bad token) is a real error — surface it
         // rather than a misleading "pulled 0". A PARTIAL failure stays Ok (per-table isolation:
-        // the failed table's cursor is untouched and re-pulls next call).
+        // the failed table's cursor is untouched and re-pulls next call) — reconciliation was
+        // already skipped for a partial failure inside `pull_and_reconcile`.
         if result.failed_tables.len() == tables.len() {
             return Err(SyncError::Flush(format!(
                 "pull failed for all tables: {}",
                 result.failed_tables.join(", ")
             )));
         }
-        let reconcile = self
-            .runtime
-            .block_on(reconcile_after_pull(&store, &*client, token));
         Ok(PullSummary {
             pulled: result.pulled as u32,
             merged: result.merged as u32,
             skipped_tombstones: result.skipped_tombstones as u32,
             superseded: result.superseded,
-            reconcile,
+            reconcile: reconciled.into(),
         })
     }
 
@@ -741,19 +739,49 @@ pub async fn pull_then_flush<S: http::PostgrestSink>(
 /// independent need for `user_id` (unlike `flush`/`sync`, which stamp it on pushed rows); it's
 /// derived here purely for reconciliation's dropped-tag pass, so a bad/unparseable token
 /// degrades reconciliation only, not the pull itself.
-async fn reconcile_after_pull<S: http::PostgrestSink>(
+/// Pull, then reconcile — but ONLY if the pull was fully clean, mirroring [`pull_then_flush`]'s
+/// SUR-736 guard for the same reason: a table that failed to pull this round is stale (its
+/// cursor didn't advance), and reconciling against stale data is unsafe. Concretely,
+/// `reconcile_dropped_tags` reads the local `custom_ideas` mirror to decide whether a note tag
+/// is already a known custom idea — if `custom_ideas` failed to pull while `notes` succeeded,
+/// that mirror is stale, and the pass could recreate/overwrite a custom idea another device
+/// already pushed under the same deterministic id, because this device just doesn't know about
+/// it yet. `pull_then_flush` already has this exact guard (it aborts the whole call on ANY
+/// failed table, for the pre-existing SUR-736 flush reason); this gives `SyncEngine::pull`'s
+/// standalone path the matching guard, without forcing it to also abort the pull-result
+/// reporting itself — a partial pull failure still returns `Ok` with real counts (per-table
+/// isolation, unchanged), only reconciliation is skipped and zeroed.
+///
+/// `pull()` has no independent need for `user_id` (unlike `flush`/`sync`, which stamp it on
+/// pushed rows); it's derived here purely for reconciliation's dropped-tag pass, so a
+/// bad/unparseable token degrades reconciliation only, not the pull itself. Shared by
+/// [`SyncEngine::pull`] and covered directly by a stub-sink test (mirrors [`pull_then_flush`]'s
+/// own testability shape — the concrete `PostgrestClient` inside `SyncEngine` can't be made to
+/// fail one table but not another).
+pub async fn pull_and_reconcile<S: http::PostgrestSink>(
     store: &Store,
     sink: &S,
     token: &str,
-) -> ReconcileSummary {
+    tables: &[&str],
+) -> Result<(pull::PullResult, reconcile::ReconcileResult), String> {
+    let pulled = pull::pull(store, sink, tables).await?;
+    if !pulled.failed_tables.is_empty() {
+        eprintln!(
+            "pull: skipping reconciliation — {} failed to pull this round (stale-data risk); \
+             retries next pull",
+            pulled.failed_tables.join(", ")
+        );
+        return Ok((pulled, reconcile::ReconcileResult::default()));
+    }
     let outcome = match http::user_id_from_jwt(token) {
         Ok(user_id) => reconcile::reconcile(store, sink, &user_id).await,
         Err(e) => Err(format!("bad access token: {e}")),
     };
-    outcome.map(ReconcileSummary::from).unwrap_or_else(|e| {
+    let reconciled = outcome.unwrap_or_else(|e| {
         eprintln!("pull: post-pull reconciliation failed (non-fatal, retries next pull): {e}");
-        ReconcileSummary::default()
-    })
+        reconcile::ReconcileResult::default()
+    });
+    Ok((pulled, reconciled))
 }
 
 /// Derive a `collection_memberships` primary key from its `(collection_id, note_id)` pair — the
