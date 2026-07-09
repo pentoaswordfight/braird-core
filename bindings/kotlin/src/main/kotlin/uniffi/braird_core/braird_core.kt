@@ -3069,13 +3069,15 @@ public object FfiConverterTypeNoteRecord: FfiConverterRustBuffer<NoteRecord> {
  * The result of a pull across the FFI: rows seen, rows merged (last-write-wins winners +
  * applied tombstones), incoming deletes skipped as "don't-resurrect" (a delete for a row this
  * device never had), and the local edits dropped as stale by the outbox rebase (SUR-736/738 —
- * hosts read `superseded.len()` for the count).
+ * hosts read `superseded.len()` for the count). `reconcile` is the post-pull reconciliation
+ * pass (SUR-820) that runs automatically after every pull.
  */
 data class PullSummary (
     var `pulled`: kotlin.UInt, 
     var `merged`: kotlin.UInt, 
     var `skippedTombstones`: kotlin.UInt, 
-    var `superseded`: List<SupersededEdit>
+    var `superseded`: List<SupersededEdit>, 
+    var `reconcile`: ReconcileSummary
 ) {
     
     companion object
@@ -3091,6 +3093,7 @@ public object FfiConverterTypePullSummary: FfiConverterRustBuffer<PullSummary> {
             FfiConverterUInt.read(buf),
             FfiConverterUInt.read(buf),
             FfiConverterSequenceTypeSupersededEdit.read(buf),
+            FfiConverterTypeReconcileSummary.read(buf),
         )
     }
 
@@ -3098,7 +3101,8 @@ public object FfiConverterTypePullSummary: FfiConverterRustBuffer<PullSummary> {
             FfiConverterUInt.allocationSize(value.`pulled`) +
             FfiConverterUInt.allocationSize(value.`merged`) +
             FfiConverterUInt.allocationSize(value.`skippedTombstones`) +
-            FfiConverterSequenceTypeSupersededEdit.allocationSize(value.`superseded`)
+            FfiConverterSequenceTypeSupersededEdit.allocationSize(value.`superseded`) +
+            FfiConverterTypeReconcileSummary.allocationSize(value.`reconcile`)
     )
 
     override fun write(value: PullSummary, buf: ByteBuffer) {
@@ -3106,6 +3110,56 @@ public object FfiConverterTypePullSummary: FfiConverterRustBuffer<PullSummary> {
             FfiConverterUInt.write(value.`merged`, buf)
             FfiConverterUInt.write(value.`skippedTombstones`, buf)
             FfiConverterSequenceTypeSupersededEdit.write(value.`superseded`, buf)
+            FfiConverterTypeReconcileSummary.write(value.`reconcile`, buf)
+    }
+}
+
+
+
+/**
+ * The result of the post-pull reconciliation pass across the FFI (SUR-820): books backfilled by
+ * id (a note's `book_id` referenced a book absent locally), notes rehomed to a known
+ * offline-merge survivor vs. detached locally-only when no survivor is known, and custom ideas
+ * created for a note tag orphaned from the current canon. Nested onto [`PullSummary`] (not
+ * flattened) — a pull-mechanics count (`pulled`/`merged`) and a reconciliation-outcome count are
+ * different concerns. A reconciliation failure never fails the `pull`/`sync` it's attached to
+ * (best-effort — see [`reconcile`]); this summary is all-zero in that case.
+ */
+data class ReconcileSummary (
+    var `booksBackfilled`: kotlin.UInt, 
+    var `notesRehomed`: kotlin.UInt, 
+    var `notesDetached`: kotlin.UInt, 
+    var `ideasCreated`: kotlin.UInt
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeReconcileSummary: FfiConverterRustBuffer<ReconcileSummary> {
+    override fun read(buf: ByteBuffer): ReconcileSummary {
+        return ReconcileSummary(
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: ReconcileSummary) = (
+            FfiConverterUInt.allocationSize(value.`booksBackfilled`) +
+            FfiConverterUInt.allocationSize(value.`notesRehomed`) +
+            FfiConverterUInt.allocationSize(value.`notesDetached`) +
+            FfiConverterUInt.allocationSize(value.`ideasCreated`)
+    )
+
+    override fun write(value: ReconcileSummary, buf: ByteBuffer) {
+            FfiConverterUInt.write(value.`booksBackfilled`, buf)
+            FfiConverterUInt.write(value.`notesRehomed`, buf)
+            FfiConverterUInt.write(value.`notesDetached`, buf)
+            FfiConverterUInt.write(value.`ideasCreated`, buf)
     }
 }
 

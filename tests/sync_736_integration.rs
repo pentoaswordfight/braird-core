@@ -246,7 +246,7 @@ fn pull_then_flush_pulls_then_flushes_on_a_clean_pull() {
         .unwrap();
     let sink = RecordingSink::new(one("books", vec![]));
 
-    let (pulled, flushed) =
+    let (pulled, _reconcile, flushed) =
         block(pull_then_flush(&store, &sink, "user-1", &["books"])).expect("clean sync");
 
     assert!(pulled.failed_tables.is_empty());
@@ -256,4 +256,45 @@ fn pull_then_flush_pulls_then_flushes_on_a_clean_pull() {
     let fetch_pos = log.iter().position(|o| matches!(o, Op::Fetch(_)));
     let upsert_pos = log.iter().position(|o| matches!(o, Op::Upsert(_)));
     assert!(fetch_pos < upsert_pos, "pull before flush: {log:?}");
+}
+
+#[test]
+fn reconciliation_failure_does_not_abort_an_otherwise_clean_pull_then_flush() {
+    // SUR-820: reconciliation is best-effort — a failure inside it (here, a corrupt
+    // `mergedBookIds` meta value forcing reconcile_stranded_notes to error) must never discard
+    // an otherwise-successful pull+flush. `pull_then_flush` must still return Ok, with a real
+    // pull/flush result and an all-zero reconcile summary, not propagate the reconcile error.
+    let store = Store::open_in_memory().unwrap();
+    store.meta_set("mergedBookIds", "not valid json").unwrap();
+    store
+        .stage_local_write(
+            "books",
+            "b1",
+            json!({ "id": "b1", "title": "local", "updated_at": 5000, "deleted": false })
+                .as_object()
+                .unwrap()
+                .clone(),
+            5000,
+        )
+        .unwrap();
+    let sink = RecordingSink::new(one("books", vec![]));
+
+    let (pulled, reconcile, flushed) = block(pull_then_flush(&store, &sink, "user-1", &["books"]))
+        .expect("reconciliation failure must not fail pull_then_flush");
+
+    assert!(
+        pulled.failed_tables.is_empty(),
+        "the pull itself is unaffected"
+    );
+    assert_eq!(flushed.ok.len(), 1, "the flush still runs normally");
+    assert_eq!(
+        (
+            reconcile.books_backfilled,
+            reconcile.notes_rehomed,
+            reconcile.notes_detached,
+            reconcile.ideas_created
+        ),
+        (0, 0, 0, 0),
+        "reconcile's failure is logged and zeroed, not propagated"
+    );
 }
