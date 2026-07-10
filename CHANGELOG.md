@@ -6,6 +6,13 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-07-10
+
+Fifth tagged release. Ships the **arm64 `enqueue_note` FFI fix** (SUR-770 — collapsed to a
+`NoteUpsert` record; BREAKING, hosts update their call-site when they pin this) and the
+**post-pull reconciliation pass** (SUR-820). No crypto constants touched; note text /
+ciphertext unchanged.
+
 ### Added
 - **Post-pull reconciliation pass (SUR-820).** After every `pull()`/`sync()`, the core now
   automatically runs three referential/taxonomy repairs the PWA previously ran alone in
