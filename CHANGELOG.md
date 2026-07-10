@@ -31,6 +31,26 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   constants touched; note text/ciphertext unchanged. Gate: `sync-reviewer` + `crypto-reviewer` +
   `naming-reviewer`.
 
+### Changed
+- **`SyncEngine::enqueue_note` now takes a single `NoteUpsert` record instead of 14 positional
+  arguments (SUR-770).** BREAKING for hosts (update the call-site). This is a **bug fix**, not just
+  ergonomics: a 14-argument UniFFI call lowers to ~16 FFI slots, and on **arm64 Android** the
+  arguments past the 8th spill onto the stack, where JNA's bundled libffi mis-marshals the by-value
+  `RustBuffer` args (the java-native-access/jna#1259 class of defect — NOT fixed by any released JNA;
+  tested 5.17.0 and 5.19.1, both fail identically). The first byte-validated stack argument
+  (`deleted`) then failed at runtime with `InternalException: Failed to convert arg 'deleted':
+  unexpected byte for Boolean` on the very first real call. x86-64 (SysV) lays the same arguments out
+  differently and PASSED, so the `:core-roundtrip` desktop jar and every CI leg were structurally
+  blind to it; iOS (UniFFI's Swift backend, no JNA) is unaffected. `NoteUpsert` (a `uniffi::Record`,
+  named to pair with the read model `NoteRecord`) lowers as a SINGLE `RustBuffer` → 3 FFI slots, all
+  in registers, so nothing spills. Field semantics are byte-for-byte the old positional signature;
+  Swift + Kotlin bindings regenerated; the `#[allow(clippy::too_many_arguments)]` is gone. No crypto
+  constants touched; note text/ciphertext unchanged. Proven on-device by braird-android's new
+  `EnqueueNoteOnDeviceTest` (the arm64 analogue of the x86-64 `PinnedCoreRoundTripTest`). NOTE: the
+  sibling wide-arg exports (`enqueue_note_signals`, `enqueue_lens`, `enqueue_note_link`, …) carry the
+  same latent arm64 defect and are NOT yet converted — tracked as follow-up. Gate: `crypto-reviewer`
+  + `naming-reviewer`.
+
 ## [0.4.0] - 2026-07-08
 
 Fourth tagged release. Ships **`Vault::unlock_from_blobs`** (SUR-812) — the trial-decrypt

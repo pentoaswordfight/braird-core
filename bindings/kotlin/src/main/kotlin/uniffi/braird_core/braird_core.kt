@@ -823,7 +823,7 @@ internal interface UniffiLib : Library {
     ): Unit
     fun uniffi_braird_core_fn_method_syncengine_enqueue_lens(`ptr`: Pointer,`id`: RustBuffer.ByValue,`name`: RustBuffer.ByValue,`leafIds`: RustBuffer.ByValue,`combinator`: RustBuffer.ByValue,`threshold`: RustBuffer.ByValue,`createdAt`: Long,`deleted`: Byte,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
-    fun uniffi_braird_core_fn_method_syncengine_enqueue_note(`ptr`: Pointer,`id`: RustBuffer.ByValue,`bookId`: RustBuffer.ByValue,`plaintext`: RustBuffer.ByValue,`page`: RustBuffer.ByValue,`tags`: RustBuffer.ByValue,`source`: RustBuffer.ByValue,`sourceId`: RustBuffer.ByValue,`sourceMetaJson`: RustBuffer.ByValue,`chapter`: RustBuffer.ByValue,`imagePath`: RustBuffer.ByValue,`inkCropPath`: RustBuffer.ByValue,`createdAt`: Long,`deleted`: Byte,`clearNullableFields`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    fun uniffi_braird_core_fn_method_syncengine_enqueue_note(`ptr`: Pointer,`draft`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     fun uniffi_braird_core_fn_method_syncengine_enqueue_note_link(`ptr`: Pointer,`id`: RustBuffer.ByValue,`fromNoteId`: RustBuffer.ByValue,`toNoteId`: RustBuffer.ByValue,`relationType`: RustBuffer.ByValue,`createdAt`: Long,`deleted`: Byte,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
@@ -1103,7 +1103,7 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_lens() != 60504.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_note() != 7740.toShort()) {
+    if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_note() != 35159.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_note_link() != 53465.toShort()) {
@@ -1675,7 +1675,7 @@ public interface SyncEngineInterface {
      * stale-tag-after-offline-merge self-heals on the note's next edit (which re-enqueues with a
      * freshly-computed tag). The tag is never NULL because it is computed pre-seal, from plaintext.
      */
-    fun `enqueueNote`(`id`: kotlin.String, `bookId`: kotlin.String?, `plaintext`: kotlin.String, `page`: kotlin.String?, `tags`: List<kotlin.String>, `source`: kotlin.String?, `sourceId`: kotlin.String?, `sourceMetaJson`: kotlin.String?, `chapter`: kotlin.String?, `imagePath`: kotlin.String?, `inkCropPath`: kotlin.String?, `createdAt`: kotlin.Long, `deleted`: kotlin.Boolean, `clearNullableFields`: List<kotlin.String>)
+    fun `enqueueNote`(`draft`: NoteUpsert)
     
     /**
      * Enqueue a note-link upsert (SUR-726) — a parent→child annotation edge. Plaintext only;
@@ -2028,12 +2028,12 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
      * stale-tag-after-offline-merge self-heals on the note's next edit (which re-enqueues with a
      * freshly-computed tag). The tag is never NULL because it is computed pre-seal, from plaintext.
      */
-    @Throws(SyncException::class)override fun `enqueueNote`(`id`: kotlin.String, `bookId`: kotlin.String?, `plaintext`: kotlin.String, `page`: kotlin.String?, `tags`: List<kotlin.String>, `source`: kotlin.String?, `sourceId`: kotlin.String?, `sourceMetaJson`: kotlin.String?, `chapter`: kotlin.String?, `imagePath`: kotlin.String?, `inkCropPath`: kotlin.String?, `createdAt`: kotlin.Long, `deleted`: kotlin.Boolean, `clearNullableFields`: List<kotlin.String>)
+    @Throws(SyncException::class)override fun `enqueueNote`(`draft`: NoteUpsert)
         = 
     callWithPointer {
     uniffiRustCallWithError(SyncException) { _status ->
     UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_enqueue_note(
-        it, FfiConverterString.lower(`id`),FfiConverterOptionalString.lower(`bookId`),FfiConverterString.lower(`plaintext`),FfiConverterOptionalString.lower(`page`),FfiConverterSequenceString.lower(`tags`),FfiConverterOptionalString.lower(`source`),FfiConverterOptionalString.lower(`sourceId`),FfiConverterOptionalString.lower(`sourceMetaJson`),FfiConverterOptionalString.lower(`chapter`),FfiConverterOptionalString.lower(`imagePath`),FfiConverterOptionalString.lower(`inkCropPath`),FfiConverterLong.lower(`createdAt`),FfiConverterBoolean.lower(`deleted`),FfiConverterSequenceString.lower(`clearNullableFields`),_status)
+        it, FfiConverterTypeNoteUpsert.lower(`draft`),_status)
 }
     }
     
@@ -3060,6 +3060,99 @@ public object FfiConverterTypeNoteRecord: FfiConverterRustBuffer<NoteRecord> {
             FfiConverterOptionalString.write(value.`contentTag`, buf)
             FfiConverterLong.write(value.`createdAt`, buf)
             FfiConverterLong.write(value.`updatedAt`, buf)
+    }
+}
+
+
+
+/**
+ * Every field a note upsert can carry, passed to [`SyncEngine::enqueue_note`] as ONE record.
+ *
+ * This is a bug fix, not just ergonomics (SUR-770): the old 14-positional-arg signature lowered to
+ * ~16 UniFFI FFI slots, and on arm64 (AAPCS64) the args past the 8th spill onto the stack, where
+ * JNA's bundled libffi mis-marshals the by-value `RustBuffer` args — the first byte-validated stack
+ * arg (`deleted`) then fails with "unexpected byte for Boolean" (java-native-access/jna#1259 is the
+ * same class of defect). A record lowers as a SINGLE `RustBuffer` (3 FFI slots, all in registers),
+ * so nothing spills. x86-64 (SysV) tolerated the wide call, so the `:core-roundtrip` desktop jar
+ * never caught it — the arm64 regression net is braird-android's on-device `EnqueueNoteOnDeviceTest`.
+ * Field semantics are byte-for-byte the old positional signature (see [`SyncEngine::enqueue_note`]).
+ * Named to pair with the read model [`NoteRecord`] — `NoteUpsert` in, `NoteRecord` out.
+ */
+data class NoteUpsert (
+    var `id`: kotlin.String, 
+    var `bookId`: kotlin.String?, 
+    var `plaintext`: kotlin.String, 
+    var `page`: kotlin.String?, 
+    var `tags`: List<kotlin.String>, 
+    var `source`: kotlin.String?, 
+    var `sourceId`: kotlin.String?, 
+    var `sourceMetaJson`: kotlin.String?, 
+    var `chapter`: kotlin.String?, 
+    var `imagePath`: kotlin.String?, 
+    var `inkCropPath`: kotlin.String?, 
+    var `createdAt`: kotlin.Long, 
+    var `deleted`: kotlin.Boolean, 
+    var `clearNullableFields`: List<kotlin.String>
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeNoteUpsert: FfiConverterRustBuffer<NoteUpsert> {
+    override fun read(buf: ByteBuffer): NoteUpsert {
+        return NoteUpsert(
+            FfiConverterString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterSequenceString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterLong.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterSequenceString.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: NoteUpsert) = (
+            FfiConverterString.allocationSize(value.`id`) +
+            FfiConverterOptionalString.allocationSize(value.`bookId`) +
+            FfiConverterString.allocationSize(value.`plaintext`) +
+            FfiConverterOptionalString.allocationSize(value.`page`) +
+            FfiConverterSequenceString.allocationSize(value.`tags`) +
+            FfiConverterOptionalString.allocationSize(value.`source`) +
+            FfiConverterOptionalString.allocationSize(value.`sourceId`) +
+            FfiConverterOptionalString.allocationSize(value.`sourceMetaJson`) +
+            FfiConverterOptionalString.allocationSize(value.`chapter`) +
+            FfiConverterOptionalString.allocationSize(value.`imagePath`) +
+            FfiConverterOptionalString.allocationSize(value.`inkCropPath`) +
+            FfiConverterLong.allocationSize(value.`createdAt`) +
+            FfiConverterBoolean.allocationSize(value.`deleted`) +
+            FfiConverterSequenceString.allocationSize(value.`clearNullableFields`)
+    )
+
+    override fun write(value: NoteUpsert, buf: ByteBuffer) {
+            FfiConverterString.write(value.`id`, buf)
+            FfiConverterOptionalString.write(value.`bookId`, buf)
+            FfiConverterString.write(value.`plaintext`, buf)
+            FfiConverterOptionalString.write(value.`page`, buf)
+            FfiConverterSequenceString.write(value.`tags`, buf)
+            FfiConverterOptionalString.write(value.`source`, buf)
+            FfiConverterOptionalString.write(value.`sourceId`, buf)
+            FfiConverterOptionalString.write(value.`sourceMetaJson`, buf)
+            FfiConverterOptionalString.write(value.`chapter`, buf)
+            FfiConverterOptionalString.write(value.`imagePath`, buf)
+            FfiConverterOptionalString.write(value.`inkCropPath`, buf)
+            FfiConverterLong.write(value.`createdAt`, buf)
+            FfiConverterBoolean.write(value.`deleted`, buf)
+            FfiConverterSequenceString.write(value.`clearNullableFields`, buf)
     }
 }
 

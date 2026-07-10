@@ -1,6 +1,7 @@
 import java.io.File
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Test
+import uniffi.braird_core.NoteUpsert
 import uniffi.braird_core.SyncEngine
 import uniffi.braird_core.Vault
 
@@ -40,12 +41,12 @@ class SelfContainedRoundTripTest {
         val db = File.createTempFile("braird-home", ".sqlite").apply { deleteOnExit() }
         val engine = SyncEngine.open(db.absolutePath, "https://x.supabase.co", "anon", Vault.generate())
         val now = 1_700_000_000_000L
-        engine.enqueueNote(
+        engine.enqueueNote(NoteUpsert(
             id = "n1", bookId = null, plaintext = "surfaced this week", page = null,
             tags = listOf("philosophy"), source = null, sourceId = null, sourceMetaJson = null,
             chapter = null, imagePath = null, inkCropPath = null, createdAt = now - 1000L,
             deleted = false, clearNullableFields = emptyList(),
-        )
+        ))
 
         assertEquals(1u, engine.notesThisWeek(now))
         assertEquals("surfaced this week", engine.recentNote(now, 0uL)?.text)

@@ -7,6 +7,7 @@ import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Test
 import uniffi.braird_core.CryptoException
+import uniffi.braird_core.NoteUpsert
 import uniffi.braird_core.SearchDocKind
 import uniffi.braird_core.SyncEngine
 import uniffi.braird_core.SyncException
@@ -116,7 +117,7 @@ class RoundTripTest {
     fun enqueueNoteWidenedFieldsOverFfi() {
         val db = File.createTempFile("braird-rt", ".sqlite").apply { deleteOnExit() }
         val engine = SyncEngine.open(db.absolutePath, "https://x.supabase.co", "anon", Vault.generate())
-        engine.enqueueNote(
+        engine.enqueueNote(NoteUpsert(
             id = "n1",
             bookId = "b1",
             plaintext = "secret",
@@ -131,9 +132,9 @@ class RoundTripTest {
             createdAt = 0L,
             deleted = false,
             clearNullableFields = emptyList(),
-        )
+        ))
         assertThrows(SyncException::class.java) {
-            engine.enqueueNote(
+            engine.enqueueNote(NoteUpsert(
                 id = "n2",
                 bookId = null,
                 plaintext = "x",
@@ -148,7 +149,7 @@ class RoundTripTest {
                 createdAt = 0L,
                 deleted = false,
                 clearNullableFields = emptyList(),
-            )
+            ))
         }
     }
 
@@ -166,19 +167,19 @@ class RoundTripTest {
             coverSource = null, coverResolvedAt = null, createdAt = 1L, deleted = false,
             clearNullableFields = emptyList(),
         )
-        engine.enqueueNote(
+        engine.enqueueNote(NoteUpsert(
             id = "n1", bookId = "b1", plaintext = "the unexamined life is not worth living",
             page = null, tags = listOf("philosophy"), source = null, sourceId = null,
             sourceMetaJson = null, chapter = null, imagePath = null, inkCropPath = null,
             createdAt = 10L, deleted = false,
             clearNullableFields = emptyList(),
-        )
-        engine.enqueueNote(
+        ))
+        engine.enqueueNote(NoteUpsert(
             id = "n2", bookId = null, plaintext = "running toward the good", page = null,
             tags = emptyList(), source = null, sourceId = null, sourceMetaJson = null,
             chapter = null, imagePath = null, inkCropPath = null, createdAt = 20L, deleted = false,
             clearNullableFields = emptyList(),
-        )
+        ))
         engine.enqueueCustomIdea(
             id = "i1", name = "Antifragility", description = "gains from disorder",
             createdAt = 5L, deleted = false,
@@ -228,18 +229,18 @@ class RoundTripTest {
 
         val now = 1_700_000_000_000L
         val weekMs = 7L * 24 * 60 * 60 * 1000
-        engine.enqueueNote(
+        engine.enqueueNote(NoteUpsert(
             id = "fresh", bookId = null, plaintext = "surfaced this week", page = null,
             tags = listOf("philosophy"), source = null, sourceId = null, sourceMetaJson = null,
             chapter = null, imagePath = null, inkCropPath = null, createdAt = now - 1000L,
             deleted = false, clearNullableFields = emptyList(),
-        )
-        engine.enqueueNote(
+        ))
+        engine.enqueueNote(NoteUpsert(
             id = "old", bookId = null, plaintext = "last month", page = null,
             tags = listOf("ethics"), source = null, sourceId = null, sourceMetaJson = null,
             chapter = null, imagePath = null, inkCropPath = null, createdAt = now - weekMs - 1000L,
             deleted = false, clearNullableFields = emptyList(),
-        )
+        ))
 
         // Only the in-window note counts; the pick is it, decrypted to plaintext across the FFI.
         assertEquals(1u, engine.notesThisWeek(now))

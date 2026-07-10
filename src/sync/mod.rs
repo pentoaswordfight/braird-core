@@ -114,6 +114,35 @@ pub struct SyncSummary {
     pub flush: FlushSummary,
 }
 
+/// Every field a note upsert can carry, passed to [`SyncEngine::enqueue_note`] as ONE record.
+///
+/// This is a bug fix, not just ergonomics (SUR-770): the old 14-positional-arg signature lowered to
+/// ~16 UniFFI FFI slots, and on arm64 (AAPCS64) the args past the 8th spill onto the stack, where
+/// JNA's bundled libffi mis-marshals the by-value `RustBuffer` args — the first byte-validated stack
+/// arg (`deleted`) then fails with "unexpected byte for Boolean" (java-native-access/jna#1259 is the
+/// same class of defect). A record lowers as a SINGLE `RustBuffer` (3 FFI slots, all in registers),
+/// so nothing spills. x86-64 (SysV) tolerated the wide call, so the `:core-roundtrip` desktop jar
+/// never caught it — the arm64 regression net is braird-android's on-device `EnqueueNoteOnDeviceTest`.
+/// Field semantics are byte-for-byte the old positional signature (see [`SyncEngine::enqueue_note`]).
+/// Named to pair with the read model [`NoteRecord`] — `NoteUpsert` in, `NoteRecord` out.
+#[derive(Debug, uniffi::Record)]
+pub struct NoteUpsert {
+    pub id: String,
+    pub book_id: Option<String>,
+    pub plaintext: String,
+    pub page: Option<String>,
+    pub tags: Vec<String>,
+    pub source: Option<String>,
+    pub source_id: Option<String>,
+    pub source_meta_json: Option<String>,
+    pub chapter: Option<String>,
+    pub image_path: Option<String>,
+    pub ink_crop_path: Option<String>,
+    pub created_at: i64,
+    pub deleted: bool,
+    pub clear_nullable_fields: Vec<String>,
+}
+
 /// The on-device sync engine. Owns the SQLite [`Store`], the [`PostgrestClient`], the crypto
 /// [`Vault`] (for seal-at-write), and a tokio current-thread runtime. `Arc<SyncEngine>` is the
 /// UniFFI handle; the interior `Mutex`es make it `Send + Sync` for Swift/Kotlin callers on any
@@ -241,24 +270,23 @@ impl SyncEngine {
     /// under seal-at-write there is no plaintext left. We leave the tag as-is: the rare
     /// stale-tag-after-offline-merge self-heals on the note's next edit (which re-enqueues with a
     /// freshly-computed tag). The tag is never NULL because it is computed pre-seal, from plaintext.
-    #[allow(clippy::too_many_arguments)]
-    pub fn enqueue_note(
-        &self,
-        id: String,
-        book_id: Option<String>,
-        plaintext: String,
-        page: Option<String>,
-        tags: Vec<String>,
-        source: Option<String>,
-        source_id: Option<String>,
-        source_meta_json: Option<String>,
-        chapter: Option<String>,
-        image_path: Option<String>,
-        ink_crop_path: Option<String>,
-        created_at: i64,
-        deleted: bool,
-        clear_nullable_fields: Vec<String>,
-    ) -> Result<(), SyncError> {
+    pub fn enqueue_note(&self, draft: NoteUpsert) -> Result<(), SyncError> {
+        let NoteUpsert {
+            id,
+            book_id,
+            plaintext,
+            page,
+            tags,
+            source,
+            source_id,
+            source_meta_json,
+            chapter,
+            image_path,
+            ink_crop_path,
+            created_at,
+            deleted,
+            clear_nullable_fields,
+        } = draft;
         // Validate source_meta_json BEFORE any seal/stage — a bad payload stages nothing.
         let source_meta = match source_meta_json {
             None => None,
@@ -898,22 +926,7 @@ mod tests {
         .unwrap();
         let marker = "plaintextmarkerzzz";
         engine
-            .enqueue_note(
-                "n1".into(),
-                None,
-                format!("a note about {marker}"),
-                None,
-                vec![],
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                0,
-                false,
-                vec![],
-            )
+            .enqueue_note(note_upsert("n1", &format!("a note about {marker}")))
             .unwrap();
 
         // The search round-trip works (decrypted plaintext is searchable)…
@@ -945,22 +958,11 @@ mod tests {
         )
         .unwrap();
         engine_a
-            .enqueue_note(
-                "n1".into(),
-                Some("b1".into()),
-                "cross-device plaintext".into(),
-                None,
-                vec!["tag".into()],
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                0,
-                false,
-                vec![],
-            )
+            .enqueue_note(NoteUpsert {
+                book_id: Some("b1".into()),
+                tags: vec!["tag".into()],
+                ..note_upsert("n1", "cross-device plaintext")
+            })
             .unwrap();
 
         // A's local synced row is ciphertext at rest — exactly what a flush pushes and a pull delivers.
@@ -996,22 +998,7 @@ mod tests {
         )
         .unwrap();
         engine
-            .enqueue_note(
-                "n1".into(),
-                None,
-                "the secret plaintext".into(),
-                None,
-                vec![],
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                0,
-                false,
-                vec![],
-            )
+            .enqueue_note(note_upsert("n1", "the secret plaintext"))
             .unwrap();
 
         // Read the outbox back through a fresh Store on the same file.
@@ -1051,22 +1038,12 @@ mod tests {
         )
         .unwrap();
         engine
-            .enqueue_note(
-                "n1".into(),
-                Some("b1".into()),
-                "the secret plaintext".into(),
-                Some("5".into()),
-                vec!["philosophy".into()],
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                0,
-                false,
-                vec![],
-            )
+            .enqueue_note(NoteUpsert {
+                book_id: Some("b1".into()),
+                page: Some("5".into()),
+                tags: vec!["philosophy".into()],
+                ..note_upsert("n1", "the secret plaintext")
+            })
             .unwrap();
 
         let store = Store::open(db_path).unwrap();
@@ -1229,22 +1206,19 @@ mod tests {
         let db = dir.path().join("t.sqlite");
         let db_path = db.to_str().unwrap();
         engine_at(db_path)
-            .enqueue_note(
-                "n1".into(),
-                Some("b1".into()),
-                "highlighted line".into(),
-                Some("12".into()),
-                vec!["stoicism".into()],
-                Some("readwise".into()),
-                Some("rw-42".into()),
-                Some(r#"{"highlight_id":"h1","location":42}"#.into()),
-                Some("On Anger".into()),
-                Some("images/n1.jpg".into()),
-                Some("images/n1-ink.jpg".into()),
-                7,
-                false,
-                vec![],
-            )
+            .enqueue_note(NoteUpsert {
+                book_id: Some("b1".into()),
+                page: Some("12".into()),
+                tags: vec!["stoicism".into()],
+                source: Some("readwise".into()),
+                source_id: Some("rw-42".into()),
+                source_meta_json: Some(r#"{"highlight_id":"h1","location":42}"#.into()),
+                chapter: Some("On Anger".into()),
+                image_path: Some("images/n1.jpg".into()),
+                ink_crop_path: Some("images/n1-ink.jpg".into()),
+                created_at: 7,
+                ..note_upsert("n1", "highlighted line")
+            })
             .unwrap();
         let p = outbox_payload(db_path, 0);
         assert_eq!(p["source"], json!("readwise"));
@@ -1273,22 +1247,7 @@ mod tests {
         let db = dir.path().join("t.sqlite");
         let db_path = db.to_str().unwrap();
         engine_at(db_path)
-            .enqueue_note(
-                "n1".into(),
-                None,
-                "x".into(),
-                None,
-                vec![],
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                0,
-                false,
-                vec![],
-            )
+            .enqueue_note(note_upsert("n1", "x"))
             .unwrap();
         let p = outbox_payload(db_path, 0);
         // source is the one always-sent optional (the PWA's `|| 'manual'` / the prior hardcode).
@@ -1316,43 +1275,19 @@ mod tests {
         // (a) not JSON at all, and (b) valid JSON but NOT an object — both rejected.
         assert!(
             engine
-                .enqueue_note(
-                    "n1".into(),
-                    None,
-                    "x".into(),
-                    None,
-                    vec![],
-                    None,
-                    None,
-                    Some("not json".into()),
-                    None,
-                    None,
-                    None,
-                    0,
-                    false,
-                    vec![],
-                )
+                .enqueue_note(NoteUpsert {
+                    source_meta_json: Some("not json".into()),
+                    ..note_upsert("n1", "x")
+                })
                 .is_err(),
             "invalid JSON rejected"
         );
         assert!(
             engine
-                .enqueue_note(
-                    "n2".into(),
-                    None,
-                    "x".into(),
-                    None,
-                    vec![],
-                    None,
-                    None,
-                    Some("[1,2,3]".into()),
-                    None,
-                    None,
-                    None,
-                    0,
-                    false,
-                    vec![],
-                )
+                .enqueue_note(NoteUpsert {
+                    source_meta_json: Some("[1,2,3]".into()),
+                    ..note_upsert("n2", "x")
+                })
                 .is_err(),
             "non-object JSON rejected"
         );
@@ -1395,22 +1330,11 @@ mod tests {
                 .unwrap();
         }
         engine_at(db_path)
-            .enqueue_note(
-                "n1".into(),
-                Some("b1".into()),
-                "edited text".into(),
-                None,
-                vec![],
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                2,
-                false,
-                vec![],
-            )
+            .enqueue_note(NoteUpsert {
+                book_id: Some("b1".into()),
+                created_at: 2,
+                ..note_upsert("n1", "edited text")
+            })
             .unwrap();
         let row = Store::open(db_path)
             .unwrap()
@@ -1498,22 +1422,10 @@ mod tests {
         let db = dir.path().join("t.sqlite");
         let db_path = db.to_str().unwrap();
         engine_at(db_path)
-            .enqueue_note(
-                "n1".into(),
-                None,
-                "plaintext".into(),
-                None,
-                vec![],
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                0,
-                false,
-                vec!["book_id".into(), "chapter".into()],
-            )
+            .enqueue_note(NoteUpsert {
+                clear_nullable_fields: vec!["book_id".into(), "chapter".into()],
+                ..note_upsert("n1", "plaintext")
+            })
             .unwrap();
         let p = outbox_payload(db_path, 0);
         assert_eq!(
@@ -1552,22 +1464,10 @@ mod tests {
         ] {
             assert!(
                 engine
-                    .enqueue_note(
-                        "n1".into(),
-                        None,
-                        "x".into(),
-                        None,
-                        vec![],
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        0,
-                        false,
-                        bad.clone(),
-                    )
+                    .enqueue_note(NoteUpsert {
+                        clear_nullable_fields: bad.clone(),
+                        ..note_upsert("n1", "x")
+                    })
                     .is_err(),
                 "clearing {bad:?} must be rejected"
             );
@@ -1669,6 +1569,28 @@ mod tests {
             Vault::generate(),
         )
         .unwrap()
+    }
+
+    /// Test builder for a note upsert — `id` + `plaintext` with every other field at its "unset"
+    /// default (no book/page/tags/source/meta, `created_at` 0, live). Override specific fields with
+    /// struct-update: `NoteUpsert { book_id: Some("b1".into()), ..note_upsert("n1", "text") }`.
+    fn note_upsert(id: &str, plaintext: &str) -> NoteUpsert {
+        NoteUpsert {
+            id: id.into(),
+            book_id: None,
+            plaintext: plaintext.into(),
+            page: None,
+            tags: vec![],
+            source: None,
+            source_id: None,
+            source_meta_json: None,
+            chapter: None,
+            image_path: None,
+            ink_crop_path: None,
+            created_at: 0,
+            deleted: false,
+            clear_nullable_fields: vec![],
+        }
     }
 
     /// The single queued outbox row (fails if there isn't exactly one). See [`crate::store::OutboxRow`].

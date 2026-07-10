@@ -26,7 +26,7 @@
 #![cfg(not(target_arch = "wasm32"))]
 
 use braird_core::store::Store;
-use braird_core::sync::{membership_id, SyncEngine};
+use braird_core::sync::{membership_id, NoteUpsert, SyncEngine};
 use braird_core::Vault;
 use serde_json::json;
 use std::sync::Arc;
@@ -91,39 +91,39 @@ fn enqueue_full_graph(dev: &SyncEngine, user_id: &str) -> Ids {
         vec![],
     )
     .unwrap();
-    dev.enqueue_note(
-        n1.clone(),
-        Some(book.clone()),
-        "first".into(),
-        None,
-        vec![],
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        TS,
-        false,
-        vec![],
-    )
+    dev.enqueue_note(NoteUpsert {
+        id: n1.clone(),
+        book_id: Some(book.clone()),
+        plaintext: "first".into(),
+        page: None,
+        tags: vec![],
+        source: None,
+        source_id: None,
+        source_meta_json: None,
+        chapter: None,
+        image_path: None,
+        ink_crop_path: None,
+        created_at: TS,
+        deleted: false,
+        clear_nullable_fields: vec![],
+    })
     .unwrap();
-    dev.enqueue_note(
-        n2.clone(),
-        Some(book.clone()),
-        "second".into(),
-        None,
-        vec![],
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        TS,
-        false,
-        vec![],
-    )
+    dev.enqueue_note(NoteUpsert {
+        id: n2.clone(),
+        book_id: Some(book.clone()),
+        plaintext: "second".into(),
+        page: None,
+        tags: vec![],
+        source: None,
+        source_id: None,
+        source_meta_json: None,
+        chapter: None,
+        image_path: None,
+        ink_crop_path: None,
+        created_at: TS,
+        deleted: false,
+        clear_nullable_fields: vec![],
+    })
     .unwrap();
     dev.enqueue_custom_idea(
         idea.clone(),
@@ -517,22 +517,22 @@ fn concurrent_membership_add_converges_to_one_row() {
     // A creates the parents (note + collection) so the membership FK is satisfiable, then flushes.
     let (device_a, db_a) = open_device(&env, &user, vault.clone(), "mem-a");
     device_a
-        .enqueue_note(
-            note.clone(),
-            None,
-            "n".into(),
-            None,
-            vec![],
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            TS,
-            false,
-            vec![],
-        )
+        .enqueue_note(NoteUpsert {
+            id: note.clone(),
+            book_id: None,
+            plaintext: "n".into(),
+            page: None,
+            tags: vec![],
+            source: None,
+            source_id: None,
+            source_meta_json: None,
+            chapter: None,
+            image_path: None,
+            ink_crop_path: None,
+            created_at: TS,
+            deleted: false,
+            clear_nullable_fields: vec![],
+        })
         .unwrap();
     device_a
         .enqueue_collection(collection.clone(), "C".into(), TS, false)
@@ -726,22 +726,22 @@ fn native_authors_cover_and_source_metadata_to_the_server() {
         )
         .expect("author book with cover");
     device
-        .enqueue_note(
-            note.clone(),
-            Some(book.clone()),
-            "a highlighted line".into(),
-            Some("12".into()),
-            vec!["stoicism".into()],
-            Some("readwise".into()),
-            Some("rw-42".into()),
-            Some(r#"{"highlight_id":"h1"}"#.into()),
-            Some("On Anger".into()),
-            Some("img/n.jpg".into()),
-            Some("ink/n.jpg".into()),
-            TS,
-            false,
-            vec![],
-        )
+        .enqueue_note(NoteUpsert {
+            id: note.clone(),
+            book_id: Some(book.clone()),
+            plaintext: "a highlighted line".into(),
+            page: Some("12".into()),
+            tags: vec!["stoicism".into()],
+            source: Some("readwise".into()),
+            source_id: Some("rw-42".into()),
+            source_meta_json: Some(r#"{"highlight_id":"h1"}"#.into()),
+            chapter: Some("On Anger".into()),
+            image_path: Some("img/n.jpg".into()),
+            ink_crop_path: Some("ink/n.jpg".into()),
+            created_at: TS,
+            deleted: false,
+            clear_nullable_fields: vec![],
+        })
         .expect("author note with source metadata");
     device.flush().expect("flush authored rows");
 

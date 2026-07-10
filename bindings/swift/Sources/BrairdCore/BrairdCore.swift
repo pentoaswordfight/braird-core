@@ -634,7 +634,7 @@ public protocol SyncEngineProtocol : AnyObject {
      * stale-tag-after-offline-merge self-heals on the note's next edit (which re-enqueues with a
      * freshly-computed tag). The tag is never NULL because it is computed pre-seal, from plaintext.
      */
-    func enqueueNote(id: String, bookId: String?, plaintext: String, page: String?, tags: [String], source: String?, sourceId: String?, sourceMetaJson: String?, chapter: String?, imagePath: String?, inkCropPath: String?, createdAt: Int64, deleted: Bool, clearNullableFields: [String]) throws 
+    func enqueueNote(draft: NoteUpsert) throws 
     
     /**
      * Enqueue a note-link upsert (SUR-726) — a parent→child annotation edge. Plaintext only;
@@ -965,22 +965,9 @@ open func enqueueLens(id: String, name: String, leafIds: [String], combinator: S
      * stale-tag-after-offline-merge self-heals on the note's next edit (which re-enqueues with a
      * freshly-computed tag). The tag is never NULL because it is computed pre-seal, from plaintext.
      */
-open func enqueueNote(id: String, bookId: String?, plaintext: String, page: String?, tags: [String], source: String?, sourceId: String?, sourceMetaJson: String?, chapter: String?, imagePath: String?, inkCropPath: String?, createdAt: Int64, deleted: Bool, clearNullableFields: [String])throws  {try rustCallWithError(FfiConverterTypeSyncError.lift) {
+open func enqueueNote(draft: NoteUpsert)throws  {try rustCallWithError(FfiConverterTypeSyncError.lift) {
     uniffi_braird_core_fn_method_syncengine_enqueue_note(self.uniffiClonePointer(),
-        FfiConverterString.lower(id),
-        FfiConverterOptionString.lower(bookId),
-        FfiConverterString.lower(plaintext),
-        FfiConverterOptionString.lower(page),
-        FfiConverterSequenceString.lower(tags),
-        FfiConverterOptionString.lower(source),
-        FfiConverterOptionString.lower(sourceId),
-        FfiConverterOptionString.lower(sourceMetaJson),
-        FfiConverterOptionString.lower(chapter),
-        FfiConverterOptionString.lower(imagePath),
-        FfiConverterOptionString.lower(inkCropPath),
-        FfiConverterInt64.lower(createdAt),
-        FfiConverterBool.lower(deleted),
-        FfiConverterSequenceString.lower(clearNullableFields),$0
+        FfiConverterTypeNoteUpsert.lower(draft),$0
     )
 }
 }
@@ -2038,6 +2025,181 @@ public func FfiConverterTypeNoteRecord_lift(_ buf: RustBuffer) throws -> NoteRec
 #endif
 public func FfiConverterTypeNoteRecord_lower(_ value: NoteRecord) -> RustBuffer {
     return FfiConverterTypeNoteRecord.lower(value)
+}
+
+
+/**
+ * Every field a note upsert can carry, passed to [`SyncEngine::enqueue_note`] as ONE record.
+ *
+ * This is a bug fix, not just ergonomics (SUR-770): the old 14-positional-arg signature lowered to
+ * ~16 UniFFI FFI slots, and on arm64 (AAPCS64) the args past the 8th spill onto the stack, where
+ * JNA's bundled libffi mis-marshals the by-value `RustBuffer` args — the first byte-validated stack
+ * arg (`deleted`) then fails with "unexpected byte for Boolean" (java-native-access/jna#1259 is the
+ * same class of defect). A record lowers as a SINGLE `RustBuffer` (3 FFI slots, all in registers),
+ * so nothing spills. x86-64 (SysV) tolerated the wide call, so the `:core-roundtrip` desktop jar
+ * never caught it — the arm64 regression net is braird-android's on-device `EnqueueNoteOnDeviceTest`.
+ * Field semantics are byte-for-byte the old positional signature (see [`SyncEngine::enqueue_note`]).
+ * Named to pair with the read model [`NoteRecord`] — `NoteUpsert` in, `NoteRecord` out.
+ */
+public struct NoteUpsert {
+    public var id: String
+    public var bookId: String?
+    public var plaintext: String
+    public var page: String?
+    public var tags: [String]
+    public var source: String?
+    public var sourceId: String?
+    public var sourceMetaJson: String?
+    public var chapter: String?
+    public var imagePath: String?
+    public var inkCropPath: String?
+    public var createdAt: Int64
+    public var deleted: Bool
+    public var clearNullableFields: [String]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(id: String, bookId: String?, plaintext: String, page: String?, tags: [String], source: String?, sourceId: String?, sourceMetaJson: String?, chapter: String?, imagePath: String?, inkCropPath: String?, createdAt: Int64, deleted: Bool, clearNullableFields: [String]) {
+        self.id = id
+        self.bookId = bookId
+        self.plaintext = plaintext
+        self.page = page
+        self.tags = tags
+        self.source = source
+        self.sourceId = sourceId
+        self.sourceMetaJson = sourceMetaJson
+        self.chapter = chapter
+        self.imagePath = imagePath
+        self.inkCropPath = inkCropPath
+        self.createdAt = createdAt
+        self.deleted = deleted
+        self.clearNullableFields = clearNullableFields
+    }
+}
+
+
+
+extension NoteUpsert: Equatable, Hashable {
+    public static func ==(lhs: NoteUpsert, rhs: NoteUpsert) -> Bool {
+        if lhs.id != rhs.id {
+            return false
+        }
+        if lhs.bookId != rhs.bookId {
+            return false
+        }
+        if lhs.plaintext != rhs.plaintext {
+            return false
+        }
+        if lhs.page != rhs.page {
+            return false
+        }
+        if lhs.tags != rhs.tags {
+            return false
+        }
+        if lhs.source != rhs.source {
+            return false
+        }
+        if lhs.sourceId != rhs.sourceId {
+            return false
+        }
+        if lhs.sourceMetaJson != rhs.sourceMetaJson {
+            return false
+        }
+        if lhs.chapter != rhs.chapter {
+            return false
+        }
+        if lhs.imagePath != rhs.imagePath {
+            return false
+        }
+        if lhs.inkCropPath != rhs.inkCropPath {
+            return false
+        }
+        if lhs.createdAt != rhs.createdAt {
+            return false
+        }
+        if lhs.deleted != rhs.deleted {
+            return false
+        }
+        if lhs.clearNullableFields != rhs.clearNullableFields {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(id)
+        hasher.combine(bookId)
+        hasher.combine(plaintext)
+        hasher.combine(page)
+        hasher.combine(tags)
+        hasher.combine(source)
+        hasher.combine(sourceId)
+        hasher.combine(sourceMetaJson)
+        hasher.combine(chapter)
+        hasher.combine(imagePath)
+        hasher.combine(inkCropPath)
+        hasher.combine(createdAt)
+        hasher.combine(deleted)
+        hasher.combine(clearNullableFields)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeNoteUpsert: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> NoteUpsert {
+        return
+            try NoteUpsert(
+                id: FfiConverterString.read(from: &buf), 
+                bookId: FfiConverterOptionString.read(from: &buf), 
+                plaintext: FfiConverterString.read(from: &buf), 
+                page: FfiConverterOptionString.read(from: &buf), 
+                tags: FfiConverterSequenceString.read(from: &buf), 
+                source: FfiConverterOptionString.read(from: &buf), 
+                sourceId: FfiConverterOptionString.read(from: &buf), 
+                sourceMetaJson: FfiConverterOptionString.read(from: &buf), 
+                chapter: FfiConverterOptionString.read(from: &buf), 
+                imagePath: FfiConverterOptionString.read(from: &buf), 
+                inkCropPath: FfiConverterOptionString.read(from: &buf), 
+                createdAt: FfiConverterInt64.read(from: &buf), 
+                deleted: FfiConverterBool.read(from: &buf), 
+                clearNullableFields: FfiConverterSequenceString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: NoteUpsert, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.id, into: &buf)
+        FfiConverterOptionString.write(value.bookId, into: &buf)
+        FfiConverterString.write(value.plaintext, into: &buf)
+        FfiConverterOptionString.write(value.page, into: &buf)
+        FfiConverterSequenceString.write(value.tags, into: &buf)
+        FfiConverterOptionString.write(value.source, into: &buf)
+        FfiConverterOptionString.write(value.sourceId, into: &buf)
+        FfiConverterOptionString.write(value.sourceMetaJson, into: &buf)
+        FfiConverterOptionString.write(value.chapter, into: &buf)
+        FfiConverterOptionString.write(value.imagePath, into: &buf)
+        FfiConverterOptionString.write(value.inkCropPath, into: &buf)
+        FfiConverterInt64.write(value.createdAt, into: &buf)
+        FfiConverterBool.write(value.deleted, into: &buf)
+        FfiConverterSequenceString.write(value.clearNullableFields, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeNoteUpsert_lift(_ buf: RustBuffer) throws -> NoteUpsert {
+    return try FfiConverterTypeNoteUpsert.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeNoteUpsert_lower(_ value: NoteUpsert) -> RustBuffer {
+    return FfiConverterTypeNoteUpsert.lower(value)
 }
 
 
@@ -3180,7 +3342,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_braird_core_checksum_method_syncengine_enqueue_lens() != 60504) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_braird_core_checksum_method_syncengine_enqueue_note() != 7740) {
+    if (uniffi_braird_core_checksum_method_syncengine_enqueue_note() != 35159) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_enqueue_note_link() != 53465) {

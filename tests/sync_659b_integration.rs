@@ -13,7 +13,7 @@
 
 use braird_core::store::Store;
 use braird_core::sync::outbox::{collapse, OutboxItem};
-use braird_core::sync::SyncEngine;
+use braird_core::sync::{NoteUpsert, SyncEngine};
 use braird_core::Vault;
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -104,22 +104,22 @@ fn flush_seals_text_and_upserts_via_token_handoff() {
         )
         .expect("enqueue book");
     engine
-        .enqueue_note(
-            note_id.clone(),
-            Some(book_id.clone()),
-            plaintext.to_string(),
-            Some("38a".into()),
-            vec!["philosophy".into()],
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            1_700_000_000_000,
-            false,
-            vec![],
-        )
+        .enqueue_note(NoteUpsert {
+            id: note_id.clone(),
+            book_id: Some(book_id.clone()),
+            plaintext: plaintext.to_string(),
+            page: Some("38a".into()),
+            tags: vec!["philosophy".into()],
+            source: None,
+            source_id: None,
+            source_meta_json: None,
+            chapter: None,
+            image_path: None,
+            ink_crop_path: None,
+            created_at: 1_700_000_000_000,
+            deleted: false,
+            clear_nullable_fields: vec![],
+        })
         .expect("enqueue note");
 
     let summary = engine.flush().expect("flush");

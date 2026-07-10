@@ -14,7 +14,7 @@
 #![cfg(not(target_arch = "wasm32"))]
 
 use braird_core::store::Store;
-use braird_core::sync::SyncEngine;
+use braird_core::sync::{NoteUpsert, SyncEngine};
 use braird_core::Vault;
 use std::sync::Arc;
 
@@ -74,22 +74,22 @@ fn pull_roundtrips_notes_and_books_from_the_server() {
         )
         .expect("enqueue book");
     device_a
-        .enqueue_note(
-            note_id.clone(),
-            Some(book_id.clone()),
-            plaintext.to_string(),
-            Some("38a".into()),
-            vec!["philosophy".into()],
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            1_700_000_000_000,
-            false,
-            vec![],
-        )
+        .enqueue_note(NoteUpsert {
+            id: note_id.clone(),
+            book_id: Some(book_id.clone()),
+            plaintext: plaintext.to_string(),
+            page: Some("38a".into()),
+            tags: vec!["philosophy".into()],
+            source: None,
+            source_id: None,
+            source_meta_json: None,
+            chapter: None,
+            image_path: None,
+            ink_crop_path: None,
+            created_at: 1_700_000_000_000,
+            deleted: false,
+            clear_nullable_fields: vec![],
+        })
         .expect("enqueue note");
     let pushed = device_a.flush().expect("flush");
     assert_eq!(pushed.pushed, 2, "book + note flushed");
@@ -182,22 +182,22 @@ fn pull_applies_tombstone_and_never_resurrects() {
         )
         .expect("enqueue book");
     device_a
-        .enqueue_note(
-            note_id.clone(),
-            Some(book_id.clone()),
-            "to be deleted".into(),
-            None,
-            vec![],
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            1_700_000_000_000,
-            false,
-            vec![],
-        )
+        .enqueue_note(NoteUpsert {
+            id: note_id.clone(),
+            book_id: Some(book_id.clone()),
+            plaintext: "to be deleted".into(),
+            page: None,
+            tags: vec![],
+            source: None,
+            source_id: None,
+            source_meta_json: None,
+            chapter: None,
+            image_path: None,
+            ink_crop_path: None,
+            created_at: 1_700_000_000_000,
+            deleted: false,
+            clear_nullable_fields: vec![],
+        })
         .expect("enqueue note");
     device_a.flush().expect("flush create");
 
@@ -213,22 +213,22 @@ fn pull_applies_tombstone_and_never_resurrects() {
 
     // Device A soft-deletes the note (a later updated_at) and flushes the tombstone.
     device_a
-        .enqueue_note(
-            note_id.clone(),
-            Some(book_id.clone()),
-            "to be deleted".into(),
-            None,
-            vec![],
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            1_700_000_000_000,
-            true, // deleted
-            vec![],
-        )
+        .enqueue_note(NoteUpsert {
+            id: note_id.clone(),
+            book_id: Some(book_id.clone()),
+            plaintext: "to be deleted".into(),
+            page: None,
+            tags: vec![],
+            source: None,
+            source_id: None,
+            source_meta_json: None,
+            chapter: None,
+            image_path: None,
+            ink_crop_path: None,
+            created_at: 1_700_000_000_000,
+            deleted: true,
+            clear_nullable_fields: vec![],
+        })
         .expect("enqueue delete");
     device_a.flush().expect("flush delete");
 

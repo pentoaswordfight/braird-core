@@ -117,17 +117,17 @@ final class RoundTripTests: XCTestCase {
         let engine = try SyncEngine.open(
             dbPath: db.path, supabaseUrl: "https://x.supabase.co", anonKey: "anon",
             vault: Vault.generate())
-        try engine.enqueueNote(
+        try engine.enqueueNote(NoteUpsert(
             id: "n1", bookId: "b1", plaintext: "secret", page: "5", tags: ["philosophy"],
             source: "readwise", sourceId: "rw-1", sourceMetaJson: "{\"highlight_id\":\"h1\"}",
             chapter: "1", imagePath: "img/1.jpg", inkCropPath: nil, createdAt: 0, deleted: false,
-            clearNullableFields: [])
+            clearNullableFields: []))
         XCTAssertThrowsError(
-            try engine.enqueueNote(
+            try engine.enqueueNote(NoteUpsert(
                 id: "n2", bookId: nil, plaintext: "x", page: nil, tags: [],
                 source: nil, sourceId: nil, sourceMetaJson: "not json", chapter: nil,
                 imagePath: nil, inkCropPath: nil, createdAt: 0, deleted: false,
-                clearNullableFields: []))
+                clearNullableFields: [])))
     }
 
     /// SUR-744: the read/query surface over the FFI — list/get/counts/search against a populated
@@ -145,16 +145,16 @@ final class RoundTripTests: XCTestCase {
             id: "b1", title: "Meditations", author: "Aurelius", isbn: nil, coverUrl: nil,
             coverSource: nil, coverResolvedAt: nil, createdAt: 1, deleted: false,
             clearNullableFields: [])
-        try engine.enqueueNote(
+        try engine.enqueueNote(NoteUpsert(
             id: "n1", bookId: "b1", plaintext: "the unexamined life is not worth living",
             page: nil, tags: ["philosophy"], source: nil, sourceId: nil, sourceMetaJson: nil,
             chapter: nil, imagePath: nil, inkCropPath: nil, createdAt: 10, deleted: false,
-            clearNullableFields: [])
-        try engine.enqueueNote(
+            clearNullableFields: []))
+        try engine.enqueueNote(NoteUpsert(
             id: "n2", bookId: nil, plaintext: "running toward the good", page: nil, tags: [],
             source: nil, sourceId: nil, sourceMetaJson: nil, chapter: nil, imagePath: nil,
             inkCropPath: nil, createdAt: 20, deleted: false,
-            clearNullableFields: [])
+            clearNullableFields: []))
         try engine.enqueueCustomIdea(
             id: "i1", name: "Antifragility", description: "gains from disorder",
             createdAt: 5, deleted: false)
@@ -207,16 +207,16 @@ final class RoundTripTests: XCTestCase {
 
         let now: Int64 = 1_700_000_000_000
         let weekMs: Int64 = 7 * 24 * 60 * 60 * 1000
-        try engine.enqueueNote(
+        try engine.enqueueNote(NoteUpsert(
             id: "fresh", bookId: nil, plaintext: "surfaced this week", page: nil,
             tags: ["philosophy"], source: nil, sourceId: nil, sourceMetaJson: nil, chapter: nil,
             imagePath: nil, inkCropPath: nil, createdAt: now - 1000, deleted: false,
-            clearNullableFields: [])
-        try engine.enqueueNote(
+            clearNullableFields: []))
+        try engine.enqueueNote(NoteUpsert(
             id: "old", bookId: nil, plaintext: "last month", page: nil, tags: ["ethics"],
             source: nil, sourceId: nil, sourceMetaJson: nil, chapter: nil, imagePath: nil,
             inkCropPath: nil, createdAt: now - weekMs - 1000, deleted: false,
-            clearNullableFields: [])
+            clearNullableFields: []))
 
         // Only the in-window note counts; the pick is it, decrypted to plaintext across the FFI.
         XCTAssertEqual(try engine.notesThisWeek(nowMs: now), 1)
