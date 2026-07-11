@@ -16,6 +16,18 @@
 //       row is an orphan, every row's status is valid, waivers carry a reason, and every
 //       non-waived row names a ticket.
 //
+// STATUS CONTRACT (the check enforces SHAPE, not ticket truth — the human sync-reviewer
+// gate is the backstop, so the shape must not let a lie look green):
+//   core | ios | android — the behavior is IMPLEMENTED there TODAY. This is a present-tense
+//     coverage claim; the referenced ticket must be LANDED. The check cannot verify the
+//     ticket is done, so DO NOT use these for planned/tracked-but-unbuilt work — a `core`
+//     row for an absent behavior reports green and silences the guard for the one thing it
+//     exists to surface (the reconcile-content-tags/SUR-835 case).
+//   waived — the behavior is deliberately NOT covered natively (yet). REQUIRES a reason in
+//     `note`; MAY carry a `ticket` that tracks the eventual port. A not-yet-ported behavior
+//     lives HERE (an explicit, ratified, tracked gap), never as core-with-a-future-ticket.
+//     Flip the row to core/ios/android when the port actually lands.
+//
 // This is CI tooling, not crate code: pure Node (JSON.parse — no npm dep), the Rust core
 // is not touched. Sibling of scripts/extract-sync-schema.mjs; the snapshot is surfc's own
 // emitted artifact (not derived), so staleness is a snapshot compare, not a re-derivation.
