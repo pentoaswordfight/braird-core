@@ -203,6 +203,100 @@ impl PostgrestClient {
         }
         Ok(resp.json::<Vec<Value>>().await?)
     }
+
+    /// Read one global runtime config row from `app_config` (SUR-492 kill-switch, migration 0038):
+    /// `GET /app_config?key=eq.<key>&select=value` — the PostgREST mirror of the PWA's
+    /// `fetchAppConfig` (`surfc/src/supabase.js`). GLOBAL (not user-scoped) and client-readable;
+    /// returns the parsed `value` (jsonb) of the first matching row, or `None` if the key is absent.
+    pub async fn get_app_config(
+        &self,
+        key: &str,
+    ) -> Result<Option<Value>, Box<dyn std::error::Error + Send + Sync>> {
+        let token = self
+            .access_token
+            .as_deref()
+            .ok_or("no access token set — call set_access_token before reading app_config")?;
+
+        let url = format!(
+            "{}/rest/v1/app_config?key=eq.{}&select=value",
+            self.base_url, key
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert("apikey", HeaderValue::from_str(&self.anon_key)?);
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}"))?,
+        );
+
+        let resp = self.http.get(&url).headers(headers).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(Box::new(PostgrestError {
+                status: status.as_u16(),
+                body,
+            }));
+        }
+        // `?key=eq...` returns an array; take the first row's `value` (maybeSingle equivalent).
+        let rows = resp.json::<Vec<Value>>().await?;
+        Ok(rows
+            .into_iter()
+            .next()
+            .and_then(|r| r.get("value").cloned()))
+    }
+
+    /// ⚠ NON-SUPABASE EGRESS (SUR-828) — the core's first outbound call to a host other than
+    /// Supabase. Query the public Open Library Search API for a book cover by `title` (+ optional
+    /// `author`): `GET https://openlibrary.org/search.json?title=…&author=…&limit=1&fields=…`.
+    /// UNAUTHENTICATED (public endpoint — no apikey/Bearer) with a short per-request timeout so a
+    /// slow Open Library never stalls a reconcile pass. Returns the first doc reduced to a
+    /// [`CoverSearchHit`], `None` when there is no result (a definitive miss), or `Err` for a
+    /// transient transport/HTTP/parse failure (the caller leaves the book unstamped to retry).
+    pub async fn openlibrary_search(
+        &self,
+        title: &str,
+        author: Option<&str>,
+    ) -> Result<Option<CoverSearchHit>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut query: Vec<(&str, &str)> = vec![
+            ("title", title),
+            ("limit", "1"),
+            ("fields", "key,title,author_name,cover_i,isbn"),
+        ];
+        if let Some(a) = author.map(str::trim).filter(|a| !a.is_empty()) {
+            query.push(("author", a));
+        }
+        let resp = self
+            .http
+            .get("https://openlibrary.org/search.json")
+            .query(&query)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("Open Library search HTTP {status}: {body}").into());
+        }
+        let data = resp.json::<Value>().await?;
+        let Some(doc) = data
+            .get("docs")
+            .and_then(Value::as_array)
+            .and_then(|docs| docs.first())
+        else {
+            return Ok(None);
+        };
+        let cover_i = doc.get("cover_i").and_then(Value::as_i64);
+        let isbn = doc
+            .get("isbn")
+            .and_then(Value::as_array)
+            .and_then(|a| a.first())
+            .and_then(Value::as_str)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        Ok(Some(CoverSearchHit { cover_i, isbn }))
+    }
 }
 
 /// The PostgREST `in.()` filter URL for a batch-by-id fetch — split out from
@@ -239,6 +333,14 @@ pub trait PostgrestSink {
     async fn fetch_by_ids(&self, _table: &str, _ids: &[String]) -> Result<Vec<Value>, String> {
         Ok(Vec::new())
     }
+
+    /// Read a global runtime config value from `app_config` (SUR-492 kill-switch, migration 0038):
+    /// the parsed `value` (jsonb) for `key`, or `None`. Defaulted to `None` so a non-production
+    /// sink (no config table) reads as "unset" — callers FAIL OPEN on `None`/`Err`, mirroring the
+    /// PWA's `fetchAppConfig`: a transient read failure must not disable a feature the flag GATES.
+    async fn fetch_app_config(&self, _key: &str) -> Result<Option<Value>, String> {
+        Ok(None)
+    }
 }
 
 impl PostgrestSink for PostgrestClient {
@@ -264,6 +366,54 @@ impl PostgrestSink for PostgrestClient {
             return Ok(Vec::new());
         }
         self.get_by_ids(table, ids).await.map_err(|e| e.to_string())
+    }
+
+    async fn fetch_app_config(&self, key: &str) -> Result<Option<Value>, String> {
+        self.get_app_config(key).await.map_err(|e| e.to_string())
+    }
+}
+
+/// One Open Library Search API hit, reduced to the two fields cover resolution needs (SUR-828):
+/// the numeric `cover_i` (→ a `/b/id/<cover_i>` cover URL) and a healed `isbn` (→ a
+/// `/b/isbn/<isbn>` URL — the SUR-566 self-heal). Either or both may be absent; a doc with neither
+/// is a definitive miss.
+#[derive(Debug, Clone, Default)]
+pub struct CoverSearchHit {
+    pub cover_i: Option<i64>,
+    pub isbn: Option<String>,
+}
+
+/// ⚠ The core's FIRST non-Supabase egress seam (SUR-828) — kept in its OWN trait, deliberately NOT
+/// folded into [`PostgrestSink`], so the new outbound boundary is explicit and greppable for the
+/// security-review gate. `PostgrestClient` implements it with a plain unauthenticated `reqwest` GET
+/// to the public Open Library Search API; test sinks inherit the `Ok(None)` default and make no
+/// network call. The egress is additionally gated at the call site ([`super::reconcile`]) by the
+/// SUR-492 `openlibrary_egress` kill-switch and paced (≤10 searches per pass).
+#[allow(async_fn_in_trait)]
+pub trait CoverEgress {
+    /// Query Open Library's Search API for a book cover by `title` (+ optional `author`). Returns
+    /// the first doc as a [`CoverSearchHit`] (`Ok(Some)`), `Ok(None)` for no result (a definitive
+    /// miss the caller stamps so it never re-queries), or `Err` for a transient outage (the caller
+    /// leaves the book UNSTAMPED to retry next pass). Defaulted to `Ok(None)` — a sink overrides it
+    /// only to actually reach Open Library.
+    async fn search_cover(
+        &self,
+        _title: &str,
+        _author: Option<&str>,
+    ) -> Result<Option<CoverSearchHit>, String> {
+        Ok(None)
+    }
+}
+
+impl CoverEgress for PostgrestClient {
+    async fn search_cover(
+        &self,
+        title: &str,
+        author: Option<&str>,
+    ) -> Result<Option<CoverSearchHit>, String> {
+        self.openlibrary_search(title, author)
+            .await
+            .map_err(|e| e.to_string())
     }
 }
 

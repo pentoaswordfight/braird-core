@@ -1,10 +1,10 @@
-//! Post-pull reconciliation (SUR-820). Three passes that run after a successful
-//! [`super::pull`], promoting into the core two of the three post-sync behaviors the PWA's
-//! `fetchAllCloud` orchestration runs in `src/hooks/useAuth.js` (steps 2b/2c/2d) — excluded from
-//! the core at SUR-659, briefly re-homed to Android at SUR-768, and promoted here because they
-//! mutate synced data every client reads (the SUR-812 lesson: state logic reinvented per host
-//! goes wrong) and would otherwise need a whole-corpus scan over the paged FFI app-side. Image
-//! download/cache (the PWA's step 3) stays host-side (SUR-768/SUR-821) — out of scope here.
+//! Post-pull reconciliation (SUR-820, extended by SUR-828). The passes that run after a successful
+//! [`super::pull`], promoting into the core the post-sync behaviors the PWA's `fetchAllCloud`
+//! orchestration runs in `src/hooks/useAuth.js` (steps 2b/2c/2d) plus its book-cover resolution —
+//! excluded from the core at SUR-659, briefly re-homed to Android at SUR-768, and promoted here
+//! because they mutate synced data every client reads (the SUR-812 lesson: state logic reinvented
+//! per host goes wrong) and would otherwise need a whole-corpus scan over the paged FFI app-side.
+//! Image download/cache (the PWA's step 3) stays host-side (SUR-768/SUR-821) — out of scope here.
 //!
 //! 1. **`reconcile_books`** (`useAuth.js` step 2b) — a live note's `book_id` referencing a book
 //!    absent from the local store is backfilled by fetching it from the server. This is a pure
@@ -28,12 +28,20 @@
 //!    (`cidea_sur597_{userId}_{slug}`) is kept byte-identical to the oracle's
 //!    `preservedCustomIdeaId` for every orphaned tag (not just the 26 classical names), so a
 //!    core-created row converges with one the PWA already created for the same user+tag.
+//! 4. **`reconcile_covers`** (SUR-828; `resolveCover` in `surfc/src/lib/coverResolver.js`) —
+//!    a coverless book gets its cover resolved via Open Library (ISBN → a deterministic
+//!    `covers.openlibrary.org` URL by pure construction, no egress; no-ISBN → the Search API for a
+//!    `cover_i`/healed ISBN), persisting `cover_url` + `cover_source` + `cover_resolved_at` through
+//!    the outbox. **⚠ The core's first non-Supabase egress** — gated by the SUR-492
+//!    `openlibrary_egress` kill-switch (read through the Supabase client), paced (≤10 searches per
+//!    pass), and fail-soft (a miss stamps `cover_resolved_at` so it never re-queries; an outage
+//!    leaves it unstamped to retry).
 //!
 //! **Error handling (deliberately asymmetric, mirroring the oracle):** the oracle does NOT wrap
 //! steps 2b/2c in a try/catch (an error there aborts the whole `fetchAllCloud` call), but DOES
 //! wrap step 2d ("Best-effort: a failure must never block the sync"). [`reconcile`] mirrors that
-//! shape internally — a `reconcile_dropped_tags` failure is caught and logged here, never
-//! propagated. Whatever `reconcile` itself returns is, in turn, treated as best-effort by ITS
+//! shape internally — a `reconcile_dropped_tags` or `reconcile_covers` failure is caught and logged
+//! here, never propagated. Whatever `reconcile` itself returns is, in turn, treated as best-effort by ITS
 //! callers ([`super::SyncEngine::pull`], [`super::pull_then_flush`]) — a reconciliation hiccup
 //! (e.g. a network blip fetching a missing book) must never discard an otherwise-successful
 //! pull, so those call sites log-and-zero rather than fail the whole `pull()`/`sync()`. This is a
@@ -46,7 +54,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use serde_json::{json, Map, Value};
 
 use super::epoch_ms;
-use super::http::PostgrestSink;
+use super::http::{CoverEgress, PostgrestSink};
 use super::outbox::resolve_book_id;
 use crate::store::Store;
 
@@ -63,7 +71,20 @@ pub struct ReconcileResult {
     pub notes_rehomed: usize,
     pub notes_detached: usize,
     pub ideas_created: usize,
+    pub covers_resolved: usize,
 }
+
+/// The `app_config` key (SUR-492, migration 0038) whose `{"enabled": bool}` value is the global
+/// Open Library egress kill-switch. GLOBAL, service-role-write / client-read.
+const OPENLIBRARY_EGRESS_KEY: &str = "openlibrary_egress";
+
+/// Max Search-API resolutions per pass (polite-use pacing, founder decision SUR-828). ISBN books
+/// resolve by pure URL construction (no egress) and DON'T count against this — only the no-ISBN
+/// Search-API path does; the rest wait for the next pull.
+const COVER_SEARCH_BUDGET_PER_PASS: usize = 10;
+
+/// Open Library cover-image base, mirroring the PWA's `coverResolver.js` (`COVERS_BASE` + `SIZE`).
+const COVERS_BASE: &str = "https://covers.openlibrary.org/b";
 
 /// `meta` key holding the device-local offline-merge survivor map (loser→survivor book id, JSON
 /// object) — the core mirror of the PWA's `db.meta.get('mergedBookIds')`. **Write-less by design
@@ -75,9 +96,9 @@ const MERGED_BOOK_IDS_KEY: &str = "mergedBookIds";
 
 /// Run the full post-pull reconciliation pass. Order: books-backfill first (so a book fetched
 /// this pass is visible to the stranded-notes check that follows), then stranded-notes, then
-/// dropped-tags (independent of the other two). `user_id` is the token's `sub` — needed only for
-/// the dropped-tag pass's user-scoped custom-idea id.
-pub async fn reconcile<S: PostgrestSink>(
+/// dropped-tags, then cover-resolution (independent of the others). `user_id` is the token's `sub`
+/// — needed only for the dropped-tag pass's user-scoped custom-idea id.
+pub async fn reconcile<S: PostgrestSink + CoverEgress>(
     store: &Store,
     sink: &S,
     user_id: &str,
@@ -90,11 +111,18 @@ pub async fn reconcile<S: PostgrestSink>(
         eprintln!("reconcile: dropped-tag pass failed (non-fatal, retries next pull): {e}");
         0
     });
+    // Best-effort, same posture: an Open Library outage (or a kill-switch read blip) must never
+    // fail the pull it follows — cover resolution simply retries next pull.
+    let covers_resolved = reconcile_covers(store, sink).await.unwrap_or_else(|e| {
+        eprintln!("reconcile: cover-resolution pass failed (non-fatal, retries next pull): {e}");
+        0
+    });
     Ok(ReconcileResult {
         books_backfilled,
         notes_rehomed,
         notes_detached,
         ideas_created,
+        covers_resolved,
     })
 }
 
@@ -318,9 +346,147 @@ fn preserved_custom_idea_id(user_id: &str, name: &str) -> String {
     format!("cidea_sur597_{user_id}_{slug}")
 }
 
+/// Step 2e (SUR-828) — resolve Open Library book covers for coverless books (SUR-198 parity for
+/// natively-created books, which the PWA only resolves on its own create path). Mirrors the PWA's
+/// `resolveCover` (`surfc/src/lib/coverResolver.js`): a book WITH an ISBN gets a deterministic
+/// `covers.openlibrary.org/b/isbn/<isbn>` URL by pure construction — **no network call**; a book
+/// WITHOUT an ISBN hits the Open Library Search API for a `cover_i` (else a healed ISBN, the
+/// SUR-566 self-heal). Persists `cover_url` + `cover_source='openlibrary'` + `cover_resolved_at`
+/// through the outbox (LWW-safe). Returns the number of books settled this pass.
+///
+/// **⚠ New egress boundary (the core's first non-Supabase egress).** Three guards, all mirroring
+/// the PWA:
+/// - **Kill-switch (SUR-492):** read the global `openlibrary_egress` `app_config` flag through the
+///   existing Supabase client; if explicitly `{"enabled": false}` skip the WHOLE pass (zero egress
+///   AND no new `covers.openlibrary.org` URLs — matching the PWA's top-level gate in
+///   `resolveAndPersistCover`). **Fail OPEN** on a missing row / read error / malformed value.
+/// - **Pacing:** at most [`COVER_SEARCH_BUDGET_PER_PASS`] Search-API calls per pass; ISBN books are
+///   free (construct-only). Over budget → leave the book unstamped so it retries next pull.
+/// - **Fail-soft:** a definitive miss (searched, no cover) STAMPS `cover_resolved_at` (SUR-566 — so
+///   the pass never re-hammers Open Library for the same edition); a transient outage leaves it
+///   UNSTAMPED to retry. Manual (`cover_source='manual'`) covers are never touched.
+async fn reconcile_covers<S: PostgrestSink + CoverEgress>(
+    store: &Store,
+    sink: &S,
+) -> Result<usize, String> {
+    if !egress_enabled(sink).await {
+        return Ok(0);
+    }
+
+    let books = store
+        .list_live("books", None, -1, 0)
+        .map_err(|e| format!("list books: {e}"))?;
+
+    let mut resolved = 0;
+    let mut search_budget = COVER_SEARCH_BUDGET_PER_PASS;
+    for book in &books {
+        // Already resolved (a `cover_url` set, or a prior miss stamped `cover_resolved_at`) → skip.
+        // A manual cover is the user's own choice — never overwritten.
+        let has_url = book.get("cover_url").is_some_and(|v| !v.is_null());
+        let stamped = book.get("cover_resolved_at").is_some_and(|v| !v.is_null());
+        if has_url || stamped || row_str(book, "cover_source") == "manual" {
+            continue;
+        }
+
+        let id = row_str(book, "id").to_string();
+        let isbn = book
+            .get("isbn")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+
+        let outcome = if let Some(isbn) = isbn {
+            // ISBN path: construct-only, no egress (byte-matches the PWA's `resolveCover`). A book
+            // with an ISBN always yields a URL — `?default=false` lets the host render nothing if
+            // the edition has no cover, so there is no resolve-time "miss" here.
+            CoverOutcome::Hit(cover_url_from_isbn(isbn))
+        } else {
+            // No-ISBN path: the Search API — the actual Open Library egress, budget-capped.
+            if search_budget == 0 {
+                continue; // over budget this pass — leave UNSTAMPED so it retries next pull.
+            }
+            search_budget -= 1;
+            let author = book.get("author").and_then(Value::as_str);
+            match sink.search_cover(row_str(book, "title"), author).await {
+                Ok(Some(hit)) => match (hit.cover_i, hit.isbn) {
+                    (Some(cover_i), _) => CoverOutcome::Hit(cover_url_from_cover_id(cover_i)),
+                    (None, Some(healed)) => CoverOutcome::Hit(cover_url_from_isbn(&healed)),
+                    (None, None) => CoverOutcome::Miss, // searched, no usable cover → definitive miss
+                },
+                Ok(None) => CoverOutcome::Miss, // no docs → definitive miss
+                Err(e) => {
+                    // Transient outage: never fail the pass; leave the book unstamped to retry.
+                    eprintln!("reconcile_covers: Open Library search for book {id} failed, will retry: {e}");
+                    CoverOutcome::Outage
+                }
+            }
+        };
+
+        let now = epoch_ms();
+        let mut patch = Map::new();
+        patch.insert("id".into(), json!(id));
+        match outcome {
+            CoverOutcome::Hit(url) => {
+                patch.insert("cover_url".into(), json!(url));
+                patch.insert("cover_source".into(), json!("openlibrary"));
+                patch.insert("cover_resolved_at".into(), json!(now));
+            }
+            // SUR-566: stamp even on a miss so the pass never re-queries this edition; url/source
+            // stay null.
+            CoverOutcome::Miss => {
+                patch.insert("cover_resolved_at".into(), json!(now));
+            }
+            CoverOutcome::Outage => continue, // don't stamp — retry next pass
+        }
+        patch.insert("updated_at".into(), json!(now));
+        match store.stage_local_write("books", &id, patch, now) {
+            Ok(()) => resolved += 1,
+            Err(e) => {
+                eprintln!("reconcile_covers: stage cover for book {id} failed, skipping: {e}")
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+/// Read the SUR-492 `openlibrary_egress` kill-switch through the sink's Supabase client. **Fail
+/// OPEN**: a missing row, a read error, or a malformed value all resolve to `true` (enabled),
+/// mirroring the PWA's `isEgressEnabled` / `fetchAppConfig` — the flag GATES the feature, it does
+/// not OWN it, so a transient read failure must not silently disable covers.
+async fn egress_enabled<S: PostgrestSink>(sink: &S) -> bool {
+    sink.fetch_app_config(OPENLIBRARY_EGRESS_KEY)
+        .await
+        .unwrap_or(None)
+        .as_ref()
+        .and_then(|v| v.get("enabled"))
+        .and_then(Value::as_bool)
+        .unwrap_or(true)
+}
+
+enum CoverOutcome {
+    Hit(String),
+    Miss,
+    Outage,
+}
+
+fn row_str<'a>(row: &'a Map<String, Value>, key: &str) -> &'a str {
+    row.get(key).and_then(Value::as_str).unwrap_or("")
+}
+
+/// `covers.openlibrary.org/b/isbn/<isbn>-M.jpg?default=false` — the PWA's `coverUrlFromIsbn`.
+fn cover_url_from_isbn(isbn: &str) -> String {
+    format!("{COVERS_BASE}/isbn/{isbn}-M.jpg?default=false")
+}
+
+/// `covers.openlibrary.org/b/id/<cover_i>-M.jpg?default=false` — the PWA's `coverUrlFromCoverId`.
+fn cover_url_from_cover_id(cover_i: i64) -> String {
+    format!("{COVERS_BASE}/id/{cover_i}-M.jpg?default=false")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sync::http::CoverSearchHit;
     use std::cell::RefCell;
 
     fn block<F: std::future::Future>(f: F) -> F::Output {
@@ -333,20 +499,45 @@ mod tests {
     /// A minimal stub sink: canned rows returned per table for `fetch_by_ids`; `upsert`/
     /// `fetch_page` are inert (reconcile never calls them). Records every `fetch_by_ids` call so
     /// tests can assert reconcile_books didn't fetch when nothing was missing.
+    /// Per-title Open Library stub outcome (SUR-828): a found hit or a simulated transient outage.
+    /// A title with no entry defaults to `Ok(None)` — the "no result / definitive miss" case.
+    enum StubCover {
+        Hit(CoverSearchHit),
+        Outage,
+    }
+
     struct StubSink {
         by_ids: std::collections::HashMap<String, Vec<Value>>,
         calls: RefCell<Vec<(String, Vec<String>)>>,
+        // SUR-828 cover-resolution stubbing:
+        app_config: std::collections::HashMap<String, Value>,
+        cover_by_title: std::collections::HashMap<String, StubCover>,
+        searches: RefCell<Vec<String>>, // titles searched — assert egress happened (or didn't)
     }
     impl StubSink {
         fn new() -> Self {
             Self {
                 by_ids: std::collections::HashMap::new(),
                 calls: RefCell::new(Vec::new()),
+                app_config: std::collections::HashMap::new(),
+                cover_by_title: std::collections::HashMap::new(),
+                searches: RefCell::new(Vec::new()),
             }
         }
         fn with(mut self, table: &str, rows: Vec<Value>) -> Self {
             self.by_ids.insert(table.to_string(), rows);
             self
+        }
+        fn with_app_config(mut self, key: &str, value: Value) -> Self {
+            self.app_config.insert(key.to_string(), value);
+            self
+        }
+        fn with_cover(mut self, title: &str, cover: StubCover) -> Self {
+            self.cover_by_title.insert(title.to_string(), cover);
+            self
+        }
+        fn search_count(&self) -> usize {
+            self.searches.borrow().len()
         }
     }
     impl PostgrestSink for StubSink {
@@ -382,6 +573,23 @@ mod tests {
                         .is_some_and(|id| ids.iter().any(|i| i == id))
                 })
                 .collect())
+        }
+        async fn fetch_app_config(&self, key: &str) -> Result<Option<Value>, String> {
+            Ok(self.app_config.get(key).cloned())
+        }
+    }
+    impl CoverEgress for StubSink {
+        async fn search_cover(
+            &self,
+            title: &str,
+            _author: Option<&str>,
+        ) -> Result<Option<CoverSearchHit>, String> {
+            self.searches.borrow_mut().push(title.to_string());
+            match self.cover_by_title.get(title) {
+                Some(StubCover::Hit(h)) => Ok(Some(h.clone())),
+                Some(StubCover::Outage) => Err("simulated Open Library outage".into()),
+                None => Ok(None),
+            }
         }
     }
 
@@ -741,7 +949,11 @@ mod tests {
                     .unwrap(),
             )
             .unwrap();
-        let sink = StubSink::new().with("books", vec![book("missing-book", false)]);
+        // Kill-switch OFF: this test exercises the other passes, not cover resolution — keep the
+        // coverless fixtures from triggering Open Library egress.
+        let sink = StubSink::new()
+            .with("books", vec![book("missing-book", false)])
+            .with_app_config(OPENLIBRARY_EGRESS_KEY, json!({ "enabled": false }));
 
         let first = block(reconcile(&store, &sink, "user-1")).unwrap();
         assert_eq!(
@@ -751,6 +963,7 @@ mod tests {
                 notes_rehomed: 1,
                 notes_detached: 0,
                 ideas_created: 1,
+                covers_resolved: 0, // kill-switch off — no cover work this pass
             }
         );
 
@@ -760,5 +973,225 @@ mod tests {
             ReconcileResult::default(),
             "a second pass over an already-reconciled store changes nothing"
         );
+    }
+
+    // ── reconcile_covers (SUR-828) ───────────────────────────────────────────
+
+    fn put(store: &Store, table: &str, row: &Value) {
+        store.apply_row(table, row.as_object().unwrap()).unwrap();
+    }
+
+    /// A coverless book (no `cover_url` / `cover_source` / `cover_resolved_at`).
+    fn cbook(id: &str, title: &str, isbn: Option<&str>) -> Value {
+        json!({
+            "id": id, "title": title, "isbn": isbn,
+            "created_at": 1, "updated_at": 1, "deleted": false
+        })
+    }
+
+    fn hit(cover_i: Option<i64>, isbn: Option<&str>) -> StubCover {
+        StubCover::Hit(CoverSearchHit {
+            cover_i,
+            isbn: isbn.map(str::to_string),
+        })
+    }
+
+    fn cover_of(store: &Store, id: &str) -> (Value, Value, Value) {
+        let b = store.get_row("books", id).unwrap().unwrap();
+        (
+            b.get("cover_url").cloned().unwrap_or(Value::Null),
+            b.get("cover_source").cloned().unwrap_or(Value::Null),
+            b.get("cover_resolved_at").cloned().unwrap_or(Value::Null),
+        )
+    }
+
+    #[test]
+    fn an_isbn_book_resolves_by_pure_construction_with_no_egress() {
+        let store = Store::open_in_memory().unwrap();
+        put(&store, "books", &cbook("b1", "Dune", Some("9780441172719")));
+        let sink = StubSink::new();
+
+        let resolved = block(reconcile_covers(&store, &sink)).unwrap();
+
+        assert_eq!(resolved, 1);
+        assert_eq!(
+            sink.search_count(),
+            0,
+            "ISBN path never hits the Search API"
+        );
+        let (url, source, stamped) = cover_of(&store, "b1");
+        assert_eq!(
+            url,
+            json!("https://covers.openlibrary.org/b/isbn/9780441172719-M.jpg?default=false")
+        );
+        assert_eq!(source, json!("openlibrary"));
+        assert!(!stamped.is_null(), "cover_resolved_at stamped");
+    }
+
+    #[test]
+    fn a_no_isbn_book_uses_the_search_cover_id() {
+        let store = Store::open_in_memory().unwrap();
+        put(&store, "books", &cbook("b1", "Dune", None));
+        let sink = StubSink::new().with_cover("Dune", hit(Some(42), None));
+
+        assert_eq!(block(reconcile_covers(&store, &sink)).unwrap(), 1);
+        assert_eq!(sink.search_count(), 1);
+        assert_eq!(
+            cover_of(&store, "b1").0,
+            json!("https://covers.openlibrary.org/b/id/42-M.jpg?default=false")
+        );
+    }
+
+    #[test]
+    fn a_no_isbn_book_falls_back_to_a_healed_isbn_when_no_cover_id() {
+        let store = Store::open_in_memory().unwrap();
+        put(&store, "books", &cbook("b1", "Dune", None));
+        let sink = StubSink::new().with_cover("Dune", hit(None, Some("9780441172719")));
+
+        assert_eq!(block(reconcile_covers(&store, &sink)).unwrap(), 1);
+        assert_eq!(
+            cover_of(&store, "b1").0,
+            json!("https://covers.openlibrary.org/b/isbn/9780441172719-M.jpg?default=false")
+        );
+    }
+
+    #[test]
+    fn a_definitive_miss_stamps_resolved_at_and_the_second_pass_is_a_no_op() {
+        let store = Store::open_in_memory().unwrap();
+        put(&store, "books", &cbook("b1", "Ghost", None)); // no with_cover → NoDocs
+        let sink = StubSink::new();
+
+        assert_eq!(block(reconcile_covers(&store, &sink)).unwrap(), 1);
+        let (url, source, stamped) = cover_of(&store, "b1");
+        assert_eq!(url, Value::Null, "a miss leaves cover_url null");
+        assert_eq!(source, Value::Null);
+        assert!(!stamped.is_null(), "but stamps cover_resolved_at (SUR-566)");
+
+        // Second pass: already stamped → skipped, no re-query (never re-hammers Open Library).
+        assert_eq!(block(reconcile_covers(&store, &sink)).unwrap(), 0);
+        assert_eq!(sink.search_count(), 1, "no second search for the same book");
+    }
+
+    #[test]
+    fn a_manual_cover_is_never_touched() {
+        let store = Store::open_in_memory().unwrap();
+        put(
+            &store,
+            "books",
+            &json!({ "id": "b1", "title": "Set By Hand", "cover_source": "manual",
+                "created_at": 1, "updated_at": 1, "deleted": false }),
+        );
+        let sink = StubSink::new().with_cover("Set By Hand", hit(Some(9), None));
+
+        assert_eq!(block(reconcile_covers(&store, &sink)).unwrap(), 0);
+        assert_eq!(
+            sink.search_count(),
+            0,
+            "manual rows are skipped before any egress"
+        );
+        assert_eq!(cover_of(&store, "b1").0, Value::Null);
+    }
+
+    #[test]
+    fn an_already_resolved_book_is_skipped() {
+        let store = Store::open_in_memory().unwrap();
+        put(
+            &store,
+            "books",
+            &json!({ "id": "b1", "title": "Done", "cover_url": "u", "cover_source": "openlibrary",
+                "cover_resolved_at": 5, "created_at": 1, "updated_at": 1, "deleted": false }),
+        );
+        let sink = StubSink::new();
+        assert_eq!(block(reconcile_covers(&store, &sink)).unwrap(), 0);
+        assert_eq!(sink.search_count(), 0);
+    }
+
+    #[test]
+    fn the_kill_switch_gates_egress_in_both_states() {
+        // OFF → zero egress, book left unstamped.
+        let store = Store::open_in_memory().unwrap();
+        put(&store, "books", &cbook("b1", "Dune", None));
+        let sink = StubSink::new()
+            .with_app_config(OPENLIBRARY_EGRESS_KEY, json!({ "enabled": false }))
+            .with_cover("Dune", hit(Some(42), None));
+        assert_eq!(block(reconcile_covers(&store, &sink)).unwrap(), 0);
+        assert_eq!(
+            sink.search_count(),
+            0,
+            "kill-switch off → zero Open Library egress"
+        );
+        assert_eq!(
+            cover_of(&store, "b1").2,
+            Value::Null,
+            "and no stamp — retried if re-enabled"
+        );
+
+        // ON → resolves normally.
+        let store = Store::open_in_memory().unwrap();
+        put(&store, "books", &cbook("b1", "Dune", None));
+        let sink = StubSink::new()
+            .with_app_config(OPENLIBRARY_EGRESS_KEY, json!({ "enabled": true }))
+            .with_cover("Dune", hit(Some(42), None));
+        assert_eq!(block(reconcile_covers(&store, &sink)).unwrap(), 1);
+        assert_eq!(sink.search_count(), 1);
+    }
+
+    #[test]
+    fn a_malformed_or_missing_flag_fails_open() {
+        let store = Store::open_in_memory().unwrap();
+        put(&store, "books", &cbook("b1", "Dune", Some("111")));
+        // No app_config row at all → fetch_app_config returns None → fail OPEN (egress allowed).
+        let sink = StubSink::new();
+        assert_eq!(block(reconcile_covers(&store, &sink)).unwrap(), 1);
+    }
+
+    #[test]
+    fn a_transient_outage_leaves_the_book_unstamped_to_retry() {
+        let store = Store::open_in_memory().unwrap();
+        put(&store, "books", &cbook("b1", "Flaky", None));
+        let sink = StubSink::new().with_cover("Flaky", StubCover::Outage);
+
+        assert_eq!(block(reconcile_covers(&store, &sink)).unwrap(), 0);
+        assert_eq!(
+            cover_of(&store, "b1").2,
+            Value::Null,
+            "an outage must NOT stamp — the book retries next pass"
+        );
+    }
+
+    #[test]
+    fn an_outage_never_fails_the_overall_reconcile_pass() {
+        let store = Store::open_in_memory().unwrap();
+        put(&store, "books", &cbook("b1", "Flaky", None));
+        let sink = StubSink::new().with_cover("Flaky", StubCover::Outage);
+
+        // reconcile() wraps cover-resolution best-effort — an outage yields covers_resolved: 0,
+        // never an Err.
+        let r = block(reconcile(&store, &sink, "user-1")).unwrap();
+        assert_eq!(r.covers_resolved, 0);
+    }
+
+    #[test]
+    fn the_search_budget_caps_egress_per_pass_with_the_rest_next_pull() {
+        let store = Store::open_in_memory().unwrap();
+        for i in 0..(COVER_SEARCH_BUDGET_PER_PASS + 2) {
+            put(
+                &store,
+                "books",
+                &cbook(&format!("b{i:02}"), &format!("t{i:02}"), None),
+            );
+        }
+        let sink = StubSink::new(); // all titles → NoDocs (miss)
+
+        let first = block(reconcile_covers(&store, &sink)).unwrap();
+        assert_eq!(
+            first, COVER_SEARCH_BUDGET_PER_PASS,
+            "capped at the per-pass budget"
+        );
+        assert_eq!(sink.search_count(), COVER_SEARCH_BUDGET_PER_PASS);
+
+        // The 2 that missed the budget are still unstamped → resolved on the next pass.
+        let second = block(reconcile_covers(&store, &sink)).unwrap();
+        assert_eq!(second, 2);
     }
 }

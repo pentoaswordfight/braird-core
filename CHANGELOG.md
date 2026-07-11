@@ -6,6 +6,33 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+### Added
+
+- **SUR-828 — Open Library cover resolution as a reconciliation case.** A new case on the
+  post-pull reconciliation pass (`src/sync/reconcile.rs`, SUR-820) that resolves book covers for
+  natively-created books — SUR-198 parity, since the PWA only resolves covers on its own create
+  path, leaving iOS/Android-created books coverless on every client. Mirrors the PWA's `resolveCover`
+  (`surfc/src/lib/coverResolver.js`): a book WITH an ISBN gets a deterministic
+  `covers.openlibrary.org/b/isbn/<isbn>-M.jpg?default=false` URL by pure construction (no network
+  call); a book WITHOUT an ISBN queries the Open Library Search API for a `cover_i` (else a healed
+  ISBN — the SUR-566 self-heal). Persists `cover_url` + `cover_source='openlibrary'` +
+  `cover_resolved_at` through the outbox (LWW-safe); manual covers are never touched. A miss STAMPS
+  `cover_resolved_at` (SUR-566 — so the pass never re-queries the same edition) while a transient
+  outage leaves it unstamped to retry.
+
+  **⚠ New egress boundary — the core's first non-Supabase egress.** Introduced behind a dedicated,
+  greppable `CoverEgress` trait (kept OFF `PostgrestSink`) so the boundary is explicit for review.
+  Three guards, all mirroring the PWA: (a) **kill-switch** — the global SUR-492 `openlibrary_egress`
+  `app_config` flag is read through the existing Supabase client (`fetch_app_config`) and, when
+  `{"enabled": false}`, skips the whole pass (zero egress, no new `covers.openlibrary.org` URLs);
+  it **fails open** on a missing row / read error / malformed value; (b) **pacing** — at most 10
+  Search-API calls per pass (ISBN books are construct-only and free), the rest deferred to the next
+  pull; (c) **fail-soft** — an Open Library outage never fails reconciliation or the pull. No crypto
+  constants or ciphertext touched.
+
+  **FFI:** `ReconcileSummary` (nested on `PullSummary`) gains a `coversResolved: u32` field;
+  Kotlin + Swift bindings regenerated via `scripts/gen-bindings.sh`. Purely additive.
+
 ## [0.4.2] - 2026-07-11
 
 Sixth tagged release. Ships the **arm64 `enqueue_book` FFI fix** (SUR-843 — collapsed to a

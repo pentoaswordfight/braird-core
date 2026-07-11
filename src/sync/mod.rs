@@ -70,16 +70,18 @@ pub struct SupersededEdit {
 /// The result of the post-pull reconciliation pass across the FFI (SUR-820): books backfilled by
 /// id (a note's `book_id` referenced a book absent locally), notes rehomed to a known
 /// offline-merge survivor vs. detached locally-only when no survivor is known, and custom ideas
-/// created for a note tag orphaned from the current canon. Nested onto [`PullSummary`] (not
-/// flattened) — a pull-mechanics count (`pulled`/`merged`) and a reconciliation-outcome count are
-/// different concerns. A reconciliation failure never fails the `pull`/`sync` it's attached to
-/// (best-effort — see [`reconcile`]); this summary is all-zero in that case.
+/// created for a note tag orphaned from the current canon, and book covers resolved via Open
+/// Library for natively-created books (SUR-828). Nested onto [`PullSummary`] (not flattened) — a
+/// pull-mechanics count (`pulled`/`merged`) and a reconciliation-outcome count are different
+/// concerns. A reconciliation failure never fails the `pull`/`sync` it's attached to (best-effort —
+/// see [`reconcile`]); this summary is all-zero in that case.
 #[derive(Debug, Default, uniffi::Record)]
 pub struct ReconcileSummary {
     pub books_backfilled: u32,
     pub notes_rehomed: u32,
     pub notes_detached: u32,
     pub ideas_created: u32,
+    pub covers_resolved: u32,
 }
 
 impl From<reconcile::ReconcileResult> for ReconcileSummary {
@@ -89,6 +91,7 @@ impl From<reconcile::ReconcileResult> for ReconcileSummary {
             notes_rehomed: r.notes_rehomed as u32,
             notes_detached: r.notes_detached as u32,
             ideas_created: r.ideas_created as u32,
+            covers_resolved: r.covers_resolved as u32,
         }
     }
 }
@@ -758,7 +761,7 @@ impl SyncEngine {
 /// If ANY table's pull failed (partial or total), returns `Err` and does NOT flush: a failed table
 /// never rebased its outbox, so flushing it could re-push a stale edit over a newer server row this
 /// pull didn't fetch (reopening SUR-736). On a fully-clean pull, flushes and returns both results.
-pub async fn pull_then_flush<S: http::PostgrestSink>(
+pub async fn pull_then_flush<S: http::PostgrestSink + http::CoverEgress>(
     store: &Store,
     sink: &S,
     user_id: &str,
@@ -815,7 +818,7 @@ pub async fn pull_then_flush<S: http::PostgrestSink>(
 /// [`SyncEngine::pull`] and covered directly by a stub-sink test (mirrors [`pull_then_flush`]'s
 /// own testability shape — the concrete `PostgrestClient` inside `SyncEngine` can't be made to
 /// fail one table but not another).
-pub async fn pull_and_reconcile<S: http::PostgrestSink>(
+pub async fn pull_and_reconcile<S: http::PostgrestSink + http::CoverEgress>(
     store: &Store,
     sink: &S,
     token: &str,
