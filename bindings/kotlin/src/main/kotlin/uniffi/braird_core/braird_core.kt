@@ -813,7 +813,7 @@ internal interface UniffiLib : Library {
     ): Pointer
     fun uniffi_braird_core_fn_method_syncengine_counts(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
-    fun uniffi_braird_core_fn_method_syncengine_enqueue_book(`ptr`: Pointer,`id`: RustBuffer.ByValue,`title`: RustBuffer.ByValue,`author`: RustBuffer.ByValue,`isbn`: RustBuffer.ByValue,`coverUrl`: RustBuffer.ByValue,`coverSource`: RustBuffer.ByValue,`coverResolvedAt`: RustBuffer.ByValue,`createdAt`: Long,`deleted`: Byte,`clearNullableFields`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    fun uniffi_braird_core_fn_method_syncengine_enqueue_book(`ptr`: Pointer,`draft`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     fun uniffi_braird_core_fn_method_syncengine_enqueue_collection(`ptr`: Pointer,`id`: RustBuffer.ByValue,`name`: RustBuffer.ByValue,`createdAt`: Long,`deleted`: Byte,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
@@ -1088,7 +1088,7 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_braird_core_checksum_method_syncengine_counts() != 34830.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_book() != 57249.toShort()) {
+    if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_book() != 62499.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_collection() != 43786.toShort()) {
@@ -1614,8 +1614,11 @@ public interface SyncEngineInterface {
      * as an explicit JSON `null` (→ SQL NULL locally, → server column NULLed on flush). Only the
      * `?? null` columns are clearable ([`clearable_columns`] — `isbn`/covers here); a column both
      * set and cleared, or a non-clearable name, is rejected and nothing is staged.
+     *
+     * Takes a single [`BookUpsert`] record, not positional args (SUR-843 — arm64 FFI stack-spill fix;
+     * see the [`BookUpsert`] doc). Field semantics are unchanged.
      */
-    fun `enqueueBook`(`id`: kotlin.String, `title`: kotlin.String, `author`: kotlin.String?, `isbn`: kotlin.String?, `coverUrl`: kotlin.String?, `coverSource`: kotlin.String?, `coverResolvedAt`: kotlin.Long?, `createdAt`: kotlin.Long, `deleted`: kotlin.Boolean, `clearNullableFields`: List<kotlin.String>)
+    fun `enqueueBook`(`draft`: BookUpsert)
     
     /**
      * Enqueue a collection upsert (SUR-726). Plaintext metadata only.
@@ -1917,13 +1920,16 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
      * as an explicit JSON `null` (→ SQL NULL locally, → server column NULLed on flush). Only the
      * `?? null` columns are clearable ([`clearable_columns`] — `isbn`/covers here); a column both
      * set and cleared, or a non-clearable name, is rejected and nothing is staged.
+     *
+     * Takes a single [`BookUpsert`] record, not positional args (SUR-843 — arm64 FFI stack-spill fix;
+     * see the [`BookUpsert`] doc). Field semantics are unchanged.
      */
-    @Throws(SyncException::class)override fun `enqueueBook`(`id`: kotlin.String, `title`: kotlin.String, `author`: kotlin.String?, `isbn`: kotlin.String?, `coverUrl`: kotlin.String?, `coverSource`: kotlin.String?, `coverResolvedAt`: kotlin.Long?, `createdAt`: kotlin.Long, `deleted`: kotlin.Boolean, `clearNullableFields`: List<kotlin.String>)
+    @Throws(SyncException::class)override fun `enqueueBook`(`draft`: BookUpsert)
         = 
     callWithPointer {
     uniffiRustCallWithError(SyncException) { _status ->
     UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_enqueue_book(
-        it, FfiConverterString.lower(`id`),FfiConverterString.lower(`title`),FfiConverterOptionalString.lower(`author`),FfiConverterOptionalString.lower(`isbn`),FfiConverterOptionalString.lower(`coverUrl`),FfiConverterOptionalString.lower(`coverSource`),FfiConverterOptionalLong.lower(`coverResolvedAt`),FfiConverterLong.lower(`createdAt`),FfiConverterBoolean.lower(`deleted`),FfiConverterSequenceString.lower(`clearNullableFields`),_status)
+        it, FfiConverterTypeBookUpsert.lower(`draft`),_status)
 }
     }
     
@@ -2888,6 +2894,85 @@ public object FfiConverterTypeBookRecord: FfiConverterRustBuffer<BookRecord> {
             FfiConverterLong.write(value.`createdAt`, buf)
             FfiConverterLong.write(value.`updatedAt`, buf)
             FfiConverterUInt.write(value.`noteCount`, buf)
+    }
+}
+
+
+
+/**
+ * A book upsert draft (SUR-843) — the record form of [`SyncEngine::enqueue_book`]'s arguments.
+ *
+ * Collapsed from 10 positional args to a single `uniffi::Record` for the SAME arm64 reason as
+ * [`NoteUpsert`] (SUR-770): the positional signature lowered its trailing `clear_nullable_fields:
+ * Vec<String>` to a by-value `RustBuffer` at FFI slot 11 — past x7, so it spilled onto the stack,
+ * where JNA's bundled libffi mis-marshals struct-by-value args on arm64 (java-native-access/jna#1259).
+ * x86-64 (SysV) tolerated the wide call, so CI + the desktop `:core-roundtrip` jar were blind to it;
+ * iOS (Swift backend, no JNA) was unaffected. A record lowers as a SINGLE `RustBuffer` (3 FFI slots,
+ * all in registers), so nothing spills. This was LATENT — no host called `enqueue_book` on arm64 yet
+ * (book creation is deferred to SUR-819) — but converted now, at the cheapest moment (zero call-sites
+ * to churn). The `scripts/check-ffi-arg-slots.mjs` guard now fails the build on any future wide export.
+ * Field semantics are byte-for-byte the old positional signature (see [`SyncEngine::enqueue_book`]).
+ * Named to pair with the read model [`BookRecord`] — `BookUpsert` in, `BookRecord` out.
+ */
+data class BookUpsert (
+    var `id`: kotlin.String, 
+    var `title`: kotlin.String, 
+    var `author`: kotlin.String?, 
+    var `isbn`: kotlin.String?, 
+    var `coverUrl`: kotlin.String?, 
+    var `coverSource`: kotlin.String?, 
+    var `coverResolvedAt`: kotlin.Long?, 
+    var `createdAt`: kotlin.Long, 
+    var `deleted`: kotlin.Boolean, 
+    var `clearNullableFields`: List<kotlin.String>
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeBookUpsert: FfiConverterRustBuffer<BookUpsert> {
+    override fun read(buf: ByteBuffer): BookUpsert {
+        return BookUpsert(
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalLong.read(buf),
+            FfiConverterLong.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterSequenceString.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: BookUpsert) = (
+            FfiConverterString.allocationSize(value.`id`) +
+            FfiConverterString.allocationSize(value.`title`) +
+            FfiConverterOptionalString.allocationSize(value.`author`) +
+            FfiConverterOptionalString.allocationSize(value.`isbn`) +
+            FfiConverterOptionalString.allocationSize(value.`coverUrl`) +
+            FfiConverterOptionalString.allocationSize(value.`coverSource`) +
+            FfiConverterOptionalLong.allocationSize(value.`coverResolvedAt`) +
+            FfiConverterLong.allocationSize(value.`createdAt`) +
+            FfiConverterBoolean.allocationSize(value.`deleted`) +
+            FfiConverterSequenceString.allocationSize(value.`clearNullableFields`)
+    )
+
+    override fun write(value: BookUpsert, buf: ByteBuffer) {
+            FfiConverterString.write(value.`id`, buf)
+            FfiConverterString.write(value.`title`, buf)
+            FfiConverterOptionalString.write(value.`author`, buf)
+            FfiConverterOptionalString.write(value.`isbn`, buf)
+            FfiConverterOptionalString.write(value.`coverUrl`, buf)
+            FfiConverterOptionalString.write(value.`coverSource`, buf)
+            FfiConverterOptionalLong.write(value.`coverResolvedAt`, buf)
+            FfiConverterLong.write(value.`createdAt`, buf)
+            FfiConverterBoolean.write(value.`deleted`, buf)
+            FfiConverterSequenceString.write(value.`clearNullableFields`, buf)
     }
 }
 

@@ -143,6 +143,33 @@ pub struct NoteUpsert {
     pub clear_nullable_fields: Vec<String>,
 }
 
+/// A book upsert draft (SUR-843) — the record form of [`SyncEngine::enqueue_book`]'s arguments.
+///
+/// Collapsed from 10 positional args to a single `uniffi::Record` for the SAME arm64 reason as
+/// [`NoteUpsert`] (SUR-770): the positional signature lowered its trailing `clear_nullable_fields:
+/// Vec<String>` to a by-value `RustBuffer` at FFI slot 11 — past x7, so it spilled onto the stack,
+/// where JNA's bundled libffi mis-marshals struct-by-value args on arm64 (java-native-access/jna#1259).
+/// x86-64 (SysV) tolerated the wide call, so CI + the desktop `:core-roundtrip` jar were blind to it;
+/// iOS (Swift backend, no JNA) was unaffected. A record lowers as a SINGLE `RustBuffer` (3 FFI slots,
+/// all in registers), so nothing spills. This was LATENT — no host called `enqueue_book` on arm64 yet
+/// (book creation is deferred to SUR-819) — but converted now, at the cheapest moment (zero call-sites
+/// to churn). The `scripts/check-ffi-arg-slots.mjs` guard now fails the build on any future wide export.
+/// Field semantics are byte-for-byte the old positional signature (see [`SyncEngine::enqueue_book`]).
+/// Named to pair with the read model [`BookRecord`] — `BookUpsert` in, `BookRecord` out.
+#[derive(Debug, uniffi::Record)]
+pub struct BookUpsert {
+    pub id: String,
+    pub title: String,
+    pub author: Option<String>,
+    pub isbn: Option<String>,
+    pub cover_url: Option<String>,
+    pub cover_source: Option<String>,
+    pub cover_resolved_at: Option<i64>,
+    pub created_at: i64,
+    pub deleted: bool,
+    pub clear_nullable_fields: Vec<String>,
+}
+
 /// The on-device sync engine. Owns the SQLite [`Store`], the [`PostgrestClient`], the crypto
 /// [`Vault`] (for seal-at-write), and a tokio current-thread runtime. `Arc<SyncEngine>` is the
 /// UniFFI handle; the interior `Mutex`es make it `Send + Sync` for Swift/Kotlin callers on any
@@ -210,20 +237,22 @@ impl SyncEngine {
     /// as an explicit JSON `null` (→ SQL NULL locally, → server column NULLed on flush). Only the
     /// `?? null` columns are clearable ([`clearable_columns`] — `isbn`/covers here); a column both
     /// set and cleared, or a non-clearable name, is rejected and nothing is staged.
-    #[allow(clippy::too_many_arguments)]
-    pub fn enqueue_book(
-        &self,
-        id: String,
-        title: String,
-        author: Option<String>,
-        isbn: Option<String>,
-        cover_url: Option<String>,
-        cover_source: Option<String>,
-        cover_resolved_at: Option<i64>,
-        created_at: i64,
-        deleted: bool,
-        clear_nullable_fields: Vec<String>,
-    ) -> Result<(), SyncError> {
+    ///
+    /// Takes a single [`BookUpsert`] record, not positional args (SUR-843 — arm64 FFI stack-spill fix;
+    /// see the [`BookUpsert`] doc). Field semantics are unchanged.
+    pub fn enqueue_book(&self, draft: BookUpsert) -> Result<(), SyncError> {
+        let BookUpsert {
+            id,
+            title,
+            author,
+            isbn,
+            cover_url,
+            cover_source,
+            cover_resolved_at,
+            created_at,
+            deleted,
+            clear_nullable_fields,
+        } = draft;
         let now = epoch_ms();
         let mut row = Map::new();
         row.insert("id".into(), json!(id));
@@ -1100,18 +1129,11 @@ mod tests {
         )
         .unwrap();
         engine
-            .enqueue_book(
-                "b1".into(),
-                "New Title".into(),
-                Some("A".into()),
-                None,
-                None,
-                None,
-                None,
-                1,
-                false,
-                vec![],
-            )
+            .enqueue_book(BookUpsert {
+                author: Some("A".into()),
+                created_at: 1,
+                ..book_upsert("b1", "New Title")
+            })
             .unwrap();
 
         let store = Store::open(db_path).unwrap();
@@ -1137,18 +1159,15 @@ mod tests {
         let db = dir.path().join("t.sqlite");
         let db_path = db.to_str().unwrap();
         engine_at(db_path)
-            .enqueue_book(
-                "b1".into(),
-                "Meditations".into(),
-                Some("Aurelius".into()),
-                Some("978-0140449334".into()),
-                Some("https://cover".into()),
-                Some("openlibrary".into()),
-                Some(1_700_000_000_000),
-                1,
-                false,
-                vec![],
-            )
+            .enqueue_book(BookUpsert {
+                author: Some("Aurelius".into()),
+                isbn: Some("978-0140449334".into()),
+                cover_url: Some("https://cover".into()),
+                cover_source: Some("openlibrary".into()),
+                cover_resolved_at: Some(1_700_000_000_000),
+                created_at: 1,
+                ..book_upsert("b1", "Meditations")
+            })
             .unwrap();
         let row = Store::open(db_path)
             .unwrap()
@@ -1173,18 +1192,10 @@ mod tests {
         let db = dir.path().join("t.sqlite");
         let db_path = db.to_str().unwrap();
         engine_at(db_path)
-            .enqueue_book(
-                "b1".into(),
-                "T".into(),
-                None,
-                None,
-                None,
-                None,
-                None,
-                1,
-                false,
-                vec![],
-            )
+            .enqueue_book(BookUpsert {
+                created_at: 1,
+                ..book_upsert("b1", "T")
+            })
             .unwrap();
         let p = outbox_payload(db_path, 0);
         let obj = p.as_object().unwrap();
@@ -1370,18 +1381,12 @@ mod tests {
         let db = dir.path().join("t.sqlite");
         let db_path = db.to_str().unwrap();
         engine_at(db_path)
-            .enqueue_book(
-                "b1".into(),
-                "T".into(),
-                None,
-                None,
-                Some("https://cover".into()),
-                None,
-                None,
-                1,
-                false,
-                vec!["isbn".into()],
-            )
+            .enqueue_book(BookUpsert {
+                cover_url: Some("https://cover".into()),
+                created_at: 1,
+                clear_nullable_fields: vec!["isbn".into()],
+                ..book_upsert("b1", "T")
+            })
             .unwrap();
         let p = outbox_payload(db_path, 0);
         let obj = p.as_object().unwrap();
@@ -1494,18 +1499,12 @@ mod tests {
         let engine = engine_at(db_path);
         assert!(
             engine
-                .enqueue_book(
-                    "b1".into(),
-                    "T".into(),
-                    None,
-                    Some("978-x".into()), // isbn set…
-                    None,
-                    None,
-                    None,
-                    1,
-                    false,
-                    vec!["isbn".into()], // …and cleared → contradiction
-                )
+                .enqueue_book(BookUpsert {
+                    isbn: Some("978-x".into()), // isbn set…
+                    created_at: 1,
+                    clear_nullable_fields: vec!["isbn".into()], // …and cleared → contradiction
+                    ..book_upsert("b1", "T")
+                })
                 .is_err(),
             "set-and-clear of the same column is rejected"
         );
@@ -1533,20 +1532,7 @@ mod tests {
             Vault::generate(),
         )
         .unwrap();
-        engine
-            .enqueue_book(
-                "b1".into(),
-                "T".into(),
-                None,
-                None,
-                None,
-                None,
-                None,
-                0,
-                false,
-                vec![],
-            )
-            .unwrap();
+        engine.enqueue_book(book_upsert("b1", "T")).unwrap();
 
         assert!(
             engine.sync().is_err(),
@@ -1587,6 +1573,24 @@ mod tests {
             chapter: None,
             image_path: None,
             ink_crop_path: None,
+            created_at: 0,
+            deleted: false,
+            clear_nullable_fields: vec![],
+        }
+    }
+
+    /// Test builder for a book upsert — `id` + `title` with every other field at its "unset"
+    /// default (no author/isbn/covers, `created_at` 0, live). Override specific fields with
+    /// struct-update: `BookUpsert { author: Some("A".into()), ..book_upsert("b1", "Title") }`.
+    fn book_upsert(id: &str, title: &str) -> BookUpsert {
+        BookUpsert {
+            id: id.into(),
+            title: title.into(),
+            author: None,
+            isbn: None,
+            cover_url: None,
+            cover_source: None,
+            cover_resolved_at: None,
             created_at: 0,
             deleted: false,
             clear_nullable_fields: vec![],

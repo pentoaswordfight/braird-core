@@ -26,7 +26,7 @@
 #![cfg(not(target_arch = "wasm32"))]
 
 use braird_core::store::Store;
-use braird_core::sync::{membership_id, NoteUpsert, SyncEngine};
+use braird_core::sync::{membership_id, BookUpsert, NoteUpsert, SyncEngine};
 use braird_core::Vault;
 use serde_json::json;
 use std::sync::Arc;
@@ -78,18 +78,18 @@ fn enqueue_full_graph(dev: &SyncEngine, user_id: &str) -> Ids {
     let lens = format!("lens-{user_id}");
     let collection = format!("col-{user_id}");
 
-    dev.enqueue_book(
-        book.clone(),
-        "Apology".into(),
-        Some("Plato".into()),
-        None,
-        None,
-        None,
-        None,
-        TS,
-        false,
-        vec![],
-    )
+    dev.enqueue_book(BookUpsert {
+        id: book.clone(),
+        title: "Apology".into(),
+        author: Some("Plato".into()),
+        isbn: None,
+        cover_url: None,
+        cover_source: None,
+        cover_resolved_at: None,
+        created_at: TS,
+        deleted: false,
+        clear_nullable_fields: vec![],
+    })
     .unwrap();
     dev.enqueue_note(NoteUpsert {
         id: n1.clone(),
@@ -665,18 +665,18 @@ fn export_import_parity_every_column_roundtrips_and_partial_edit_preserves_colum
     // A PARTIAL local edit (rename the book — the FFI carries only id/title/author) + flush must NOT
     // null the untouched server columns (the upsert `merge-duplicates` patches only the sent fields).
     device
-        .enqueue_book(
-            book.clone(),
-            "Renamed".into(),
-            Some("A".into()),
-            None,
-            None,
-            None,
-            None,
-            TS,
-            false,
-            vec![],
-        )
+        .enqueue_book(BookUpsert {
+            id: book.clone(),
+            title: "Renamed".into(),
+            author: Some("A".into()),
+            isbn: None,
+            cover_url: None,
+            cover_source: None,
+            cover_resolved_at: None,
+            created_at: TS,
+            deleted: false,
+            clear_nullable_fields: vec![],
+        })
         .expect("partial rename");
     device.flush().expect("flush partial edit");
     let server = test_support::select(&env, &user.access_token, "books", &format!("id=eq.{book}"));
@@ -712,18 +712,18 @@ fn native_authors_cover_and_source_metadata_to_the_server() {
 
     let (device, db) = open_device(&env, &user, vault.clone(), "authoring");
     device
-        .enqueue_book(
-            book.clone(),
-            "Meditations".into(),
-            Some("Aurelius".into()),
-            Some("978-0140449334".into()),
-            Some("https://cover".into()),
-            Some("openlibrary".into()),
-            Some(TS),
-            TS,
-            false,
-            vec![],
-        )
+        .enqueue_book(BookUpsert {
+            id: book.clone(),
+            title: "Meditations".into(),
+            author: Some("Aurelius".into()),
+            isbn: Some("978-0140449334".into()),
+            cover_url: Some("https://cover".into()),
+            cover_source: Some("openlibrary".into()),
+            cover_resolved_at: Some(TS),
+            created_at: TS,
+            deleted: false,
+            clear_nullable_fields: vec![],
+        })
         .expect("author book with cover");
     device
         .enqueue_note(NoteUpsert {

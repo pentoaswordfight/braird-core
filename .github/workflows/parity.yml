@@ -153,6 +153,17 @@ jobs:
         if: steps.guard.outputs.ready == 'true'
         run: bash scripts/gen-bindings.sh
 
+      # SUR-843: static guard for the arm64 stack-spill FFI class (SUR-770). Inspects the
+      # freshly-regenerated Kotlin externs and fails on any by-value RustBuffer at integer-slot
+      # ≥9 — the exact defect x86-64 CI + the desktop :core-roundtrip jar are blind to. This
+      # catches the class here, before it reaches a device. Self-check first (guards the guard's
+      # own FP-bank counting rule); then scan the real surface.
+      - name: Guard — no wide FFI export spills a RustBuffer onto the arm64 stack
+        if: steps.guard.outputs.ready == 'true'
+        run: |
+          node scripts/check-ffi-arg-slots.mjs --self-check
+          node scripts/check-ffi-arg-slots.mjs
+
       - name: Fail if the committed bindings are stale
         if: steps.guard.outputs.ready == 'true'
         run: |

@@ -115,6 +115,18 @@ name the persona(s), propose changes. **Do not merge.**
   regenerates through that same script and fails the PR on any diff. UniFFI's runtime
   checksum guard only catches signature drift; the diff also catches a newly-exported
   symbol that was never regenerated and docstring-only changes (SUR-742).
+- **Wide `#[uniffi::export]` methods take a `uniffi::Record`, not positional args (SUR-843).**
+  Any method whose args could exceed **8 integer/pointer FFI slots** must collapse them into a
+  single `uniffi::Record` (as `enqueue_note` → `NoteUpsert`, `enqueue_book` → `BookUpsert`).
+  Reason: on arm64 (AAPCS64) args past x7 spill onto the stack, where JNA's libffi mis-marshals
+  a by-value `RustBuffer` (a lowered `String`/`Option`/`Vec`) — jna#1259. x86-64 CI + the
+  desktop `:core-roundtrip` jar are blind to it (SysV lays args out differently), so a real
+  arm64 device is the only *runtime* catch. **Count integer/pointer slots only** — `f64`/`f32`
+  ride the separate FP bank (v0–v7) and consume no integer slot (this is why
+  `enqueue_note_signals`, with two `f64`s, is safe). A record lowers as ONE `RustBuffer`
+  (3 slots, all in registers). `scripts/check-ffi-arg-slots.mjs` (bindings-drift job) enforces
+  this statically, failing the build on any `RustBuffer` at slot ≥9 — so the class is caught in
+  CI, not on a device. Name the record to pair with its read model (`NoteUpsert`↔`NoteRecord`).
 - Never commit `.env`, the `SURFC_READ_PAT`, or any credential. CI references secrets by
   name only.
 - After merge, the parity contract is the regression net — keep it green.
