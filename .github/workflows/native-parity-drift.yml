@@ -1,0 +1,74 @@
+name: Native-parity drift check
+
+# SUR-842. Fails the build if the vendored native-parity surface diverges from
+# surfc/main — i.e. if surfc's load-bearing sync-behavior registry (SUR-845, emitted
+# as src/sync/sync-surface.json) grew, lost, or re-described a behavior without this
+# repo re-vendoring the snapshot AND accounting for it in the coverage manifest. This
+# is the class-of-gap guard from the 2026-07-09/10 PWA-parity audit: a new PWA sync
+# behavior that a native decomposition silently drops now reds CI instead of being
+# caught by hand.
+#
+# surfc is the single source of truth; this repo vendors a COPY of its emitted snapshot
+# (vendored/native-parity/sync-surface.json) plus a hand-maintained coverage manifest
+# (vendored/native-parity/manifest.json). scripts/check-native-parity.mjs re-fetches the
+# live snapshot from surfc/main here and asserts (a) the vendored copy is current and
+# (b) every registered behavior has a manifest row (ticket or reasoned waiver).
+#
+# Sibling of schema-drift.yml (which re-derives a schema fixture); here the snapshot is
+# surfc's own emitted artifact, so the script compares snapshots + checks coverage rather
+# than re-deriving. CI tooling only — no Rust crate change. Requires the SURFC_READ_PAT
+# secret (cross-repo read-only PAT).
+
+on:
+  # Per-PR: re-check against surfc/main on every PR to main — so a PR editing the manifest
+  # or the vendored snapshot is cross-checked, and the per-PR guarantee is real (clone +
+  # node ~10s).
+  pull_request:
+    branches: [main]
+  # On push to the guarded paths (a snapshot / manifest / script / workflow change).
+  push:
+    paths:
+      - 'vendored/native-parity/**'
+      - 'scripts/check-native-parity.mjs'
+      - '.github/workflows/native-parity-drift.yml'
+  # Weekly: the only trigger that catches surfc-side drift when NO PR here touches anything
+  # (surfc adds a sync behavior while this repo is static) — the cross-repo case a per-PR
+  # trigger alone cannot see.
+  schedule:
+    - cron: '0 9 * * 1' # Monday 09:00 UTC (with the crypto + schema drift checks)
+  workflow_dispatch:
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Guard — skip until the snapshot is vendored
+        id: guard
+        run: |
+          if [ -f vendored/native-parity/sync-surface.json ] && [ -f vendored/native-parity/manifest.json ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "No vendored/native-parity surface yet — nothing to drift-check."
+          fi
+
+      - name: Set up Node
+        if: steps.guard.outputs.ready == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24.15.0'
+
+      # Shallow clone of surfc/main — the checker reads only src/sync/sync-surface.json.
+      # A plain depth-1 checkout is robust and the repo is small enough at depth 1.
+      - name: Fetch surfc/main sources
+        if: steps.guard.outputs.ready == 'true'
+        run: |
+          git clone --depth 1 \
+            "https://x-access-token:${{ secrets.SURFC_READ_PAT }}@github.com/pentoaswordfight/surfc.git" \
+            /tmp/surfc
+
+      - name: Assert the native-parity surface has not drifted from surfc/main
+        if: steps.guard.outputs.ready == 'true'
+        run: node scripts/check-native-parity.mjs /tmp/surfc --check

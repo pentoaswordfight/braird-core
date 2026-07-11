@@ -6,6 +6,20 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+### Added
+
+- **SUR-842 — native-parity drift guard.** A new CI surface that fails the build when
+  surfc's sync-behavior registry (SUR-845, emitted as `src/sync/sync-surface.json`) grows,
+  loses, or re-describes a behavior that this repo hasn't accounted for. `vendored/native-parity/sync-surface.json`
+  is a byte copy of that snapshot; `vendored/native-parity/manifest.json` maps every one of the
+  23 registered behaviors to its native home (`core`/`ios`/`android` ticket) or a reasoned
+  waiver. `scripts/check-native-parity.mjs` re-fetches the live snapshot from `surfc/main` and
+  asserts (a) the vendored copy is current and (b) the manifest covers every behavior (waivers
+  require a reason; ported rows require a ticket) — fail-loud, naming the offending id.
+  `.github/workflows/native-parity-drift.yml` runs it per-PR + weekly (mirrors `schema-drift.yml`;
+  needs `SURFC_READ_PAT`). **Node/CI tooling only — no crate code, no `Cargo.toml` change.** This
+  turns the 2026-07-09/10 PWA-parity audit's class-of-gap from audit-caught into CI-enforced.
+
 ## [0.4.1] - 2026-07-10
 
 Fifth tagged release. Ships the **arm64 `enqueue_note` FFI fix** (SUR-770 — collapsed to a

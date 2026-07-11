@@ -1,0 +1,130 @@
+{
+  "version": 1,
+  "source": "src/sync/parityRegistry.js",
+  "ticket": "SUR-845",
+  "entries": [
+    {
+      "id": "flush-outbox",
+      "kind": "post-sync-step",
+      "order": 1,
+      "description": "Flush the offline outbox to the cloud before pulling (encrypting queued note text; remapping notes queued against merged-away books onto the survivor — SUR-463 R3)."
+    },
+    {
+      "id": "pull-and-merge",
+      "kind": "post-sync-step",
+      "order": 2,
+      "description": "Pull all 8 synced tables incrementally by per-table server change_seq cursor (SUR-739/SUR-652) and merge into the local store last-write-wins by updatedAt, stored as ciphertext."
+    },
+    {
+      "id": "backfill-missing-books",
+      "kind": "post-sync-step",
+      "order": 3,
+      "description": "Fetch any book a live note references that the incremental pull did not deliver, so no note renders against a missing book."
+    },
+    {
+      "id": "rehome-stranded-notes",
+      "kind": "post-sync-step",
+      "order": 4,
+      "description": "Re-home notes left pointing at a book merged away on another device: to the survivor with this device’s merge map, detached without one; push survivor re-homes to the cloud (SUR-463)."
+    },
+    {
+      "id": "preserve-dropped-tags",
+      "kind": "post-sync-step",
+      "order": 5,
+      "description": "Preserve every dropped classical canon leaf still on a note as a user-scoped custom idea and flush the new customs immediately; non-fatal, self-heals next sync (SUR-597)."
+    },
+    {
+      "id": "hydrate-images",
+      "kind": "post-sync-step",
+      "order": 6,
+      "description": "Download missing note images AND ink crops from cloud storage into device-local dataUrl fields (no updatedAt bump); per-item non-fatal (SUR-524)."
+    },
+    {
+      "id": "reload-and-decrypt",
+      "kind": "post-sync-step",
+      "order": 7,
+      "description": "Reload all local records with decrypt-on-read so app state holds plaintext; count and report decrypt failures."
+    },
+    {
+      "id": "advance-cursors",
+      "kind": "post-sync-step",
+      "order": 8,
+      "description": "Advance each per-table change_seq cursor to the max pulled and persist the legacy lastSyncAt checkpoint; runs only when every prior step succeeded."
+    },
+    {
+      "id": "reconcile-content-tags",
+      "kind": "synced-table-helper",
+      "description": "Load-time self-heal of missing contentTag fingerprints from decrypted notes + exact-duplicate cluster detection for the merge prompt (SUR-638)."
+    },
+    {
+      "id": "preserve-dropped-tags-as-custom",
+      "kind": "synced-table-helper",
+      "description": "Idempotent dropped-canon-leaf → custom-idea preservation with user-scoped ids; also dispatched as sync step preserve-dropped-tags (SUR-597)."
+    },
+    {
+      "id": "merge-books",
+      "kind": "synced-table-helper",
+      "description": "Merge duplicate books: reassign notes to the survivor, soft-delete losers, record the loser→survivor map, null moved notes’ contentTag for re-derivation (SUR-463/SUR-638)."
+    },
+    {
+      "id": "unmerge-books",
+      "kind": "synced-table-helper",
+      "description": "Undo a book merge: restore notes to their original books and re-null their contentTag symmetrically."
+    },
+    {
+      "id": "merge-notes",
+      "kind": "synced-table-helper",
+      "description": "Merge duplicate notes: union tags, adopt an image from a loser, re-point note_links edges (deduping self-loops), migrate collection memberships to the survivor (SUR-638)."
+    },
+    {
+      "id": "rehome-stranded-notes-helper",
+      "kind": "synced-table-helper",
+      "description": "Move notes off merged-away (soft-deleted) books onto the survivor per the merge map, detaching when no mapping exists; also dispatched as sync step rehome-stranded-notes (SUR-463)."
+    },
+    {
+      "id": "merge-cloud-records",
+      "kind": "synced-table-helper",
+      "description": "Last-write-wins merge of pulled cloud rows into the local store by updatedAt across all 8 synced tables; ciphertext preserved as-is."
+    },
+    {
+      "id": "ensure-note-signals",
+      "kind": "synced-table-helper",
+      "description": "Create a note’s birth signal row if absent (local-only until a behavioural bump syncs it)."
+    },
+    {
+      "id": "bump-exposure",
+      "kind": "synced-table-helper",
+      "description": "Bump a note’s exposure recency signal."
+    },
+    {
+      "id": "bump-engagement",
+      "kind": "synced-table-helper",
+      "description": "Bump a note’s engagement recency signal."
+    },
+    {
+      "id": "record-return-visit",
+      "kind": "synced-table-helper",
+      "description": "Record a return visit to a note: bump return-visit count + exposure recency."
+    },
+    {
+      "id": "record-annotation",
+      "kind": "synced-table-helper",
+      "description": "Mark a note as annotated (hasAnnotation=true) when a margin child is created."
+    },
+    {
+      "id": "refresh-annotation-signal",
+      "kind": "synced-table-helper",
+      "description": "Reconcile the cached hasAnnotation flag against live note_links edge truth."
+    },
+    {
+      "id": "record-stitch-spawn",
+      "kind": "synced-table-helper",
+      "description": "Record a stitch spawned from a note: bump stitch-spawn count + engagement recency."
+    },
+    {
+      "id": "soft-delete-signals-for-note",
+      "kind": "synced-table-helper",
+      "description": "Tombstone a note’s signal row when the note is soft-deleted."
+    }
+  ]
+}
