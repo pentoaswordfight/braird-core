@@ -21,7 +21,11 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   on JS stable sort over load order) only on a measure-zero exact tie. Dedup keys on the stored
   `content_tag` alone — note text is never decrypted here. Idempotent (a second pass is a no-op);
   best-effort like the dropped-tag pass, so a hiccup never fails the pull. No crypto constants or
-  ciphertext touched.
+  ciphertext touched. The child-row re-points (`note_links`, `collection_memberships`) run BEFORE the
+  loser soft-deletes and fail-fast: a loser is only tombstoned once all of its edges/memberships have
+  been re-pointed onto the survivor, so a transient write failure defers the whole collapse to the
+  next pull rather than stranding a live edge against a tombstoned note (the core can't span the
+  oracle's single Dexie transaction across separate outbox writes).
 
   **FFI:** `ReconcileSummary` (nested on `PullSummary`) gains a `dupesCollapsed: u32` field;
   Kotlin + Swift bindings regenerated via `scripts/gen-bindings.sh`. Purely additive.

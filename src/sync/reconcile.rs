@@ -421,6 +421,16 @@ fn row_i64(row: &Map<String, Value>, key: &str) -> i64 {
 /// Collapse `losers` into `survivor`, mirroring the PWA's `mergeNotes` (`surfc/src/db.js`): union
 /// tags, adopt an image only if the survivor lacks one, re-point edges + memberships, soft-delete
 /// the losers. Returns the number of losers soft-deleted.
+///
+/// **Ordering is a safety invariant.** The child-row re-points (`note_links`, `collection_memberships`)
+/// run BEFORE the loser soft-deletes, and a stage failure in either helper is PROPAGATED (via `?`) —
+/// so a loser is only ever tombstoned once ALL of its edges/memberships have been successfully
+/// re-pointed onto the survivor. The oracle gets this for free from a single Dexie transaction; the
+/// core can't span one SQLite transaction across these separate outbox writes, so instead it
+/// fail-fasts: on a transient stage failure the whole collapse is abandoned for this pass (the
+/// cluster's losers stay live) and re-attempted next pull, idempotently. This closes the window
+/// where a live edge could be left pointing at a tombstoned note — which no later pass would fix,
+/// since clusters are only built from LIVE notes.
 fn merge_into_survivor(
     store: &Store,
     survivor: &Map<String, Value>,
@@ -476,7 +486,10 @@ fn merge_into_survivor(
     repoint_memberships(store, &sid, &loser_ids, now)?;
 
     // ── Soft-delete the losers (tombstone: only `deleted`/`updated_at` change; the partial patch
-    // leaves every other column intact). Per-loser isolation. ──
+    // leaves every other column intact). Per-loser isolation is SAFE here — unlike the repoints
+    // above: every edge/membership has already been moved onto the (live) survivor, so a loser
+    // whose delete is deferred strands nothing; it just stays a live duplicate and is re-collapsed
+    // on the next pass. ──
     let mut collapsed = 0;
     for lid in &loser_ids {
         let mut patch = Map::new();
@@ -547,9 +560,12 @@ fn repoint_note_links(
             patch.insert("to_note_id".into(), json!(to));
         }
         patch.insert("updated_at".into(), json!(now));
-        if let Err(err) = store.stage_local_write("note_links", &eid, patch, now) {
-            eprintln!("reconcile_content_dupes: repoint edge {eid} failed, skipping: {err}");
-        }
+        // Propagate (do NOT swallow): the caller must not soft-delete a loser whose edge failed to
+        // re-point, or the edge would be stranded live against a tombstoned note (see
+        // `merge_into_survivor`'s ordering invariant).
+        store
+            .stage_local_write("note_links", &eid, patch, now)
+            .map_err(|e| format!("repoint edge {eid}: {e}"))?;
     }
     Ok(())
 }
@@ -585,10 +601,11 @@ fn repoint_memberships(
         tomb.insert("id".into(), json!(mid));
         tomb.insert("deleted".into(), json!(true));
         tomb.insert("updated_at".into(), json!(now));
-        if let Err(e) = store.stage_local_write("collection_memberships", &mid, tomb, now) {
-            eprintln!("reconcile_content_dupes: tombstone membership {mid} failed, skipping: {e}");
-            continue;
-        }
+        // Propagate (see `merge_into_survivor`'s ordering invariant): a loser must not be
+        // soft-deleted while its collection membership is still un-tombstoned.
+        store
+            .stage_local_write("collection_memberships", &mid, tomb, now)
+            .map_err(|e| format!("tombstone membership {mid}: {e}"))?;
         if !survivor_collections.insert(cid.clone()) {
             continue; // survivor already filed (live) in this collection — nothing to add.
         }
@@ -604,9 +621,9 @@ fn repoint_memberships(
         rec.insert("created_at".into(), json!(existing_created.unwrap_or(now)));
         rec.insert("updated_at".into(), json!(now));
         rec.insert("deleted".into(), json!(false));
-        if let Err(e) = store.stage_local_write("collection_memberships", &smid, rec, now) {
-            eprintln!("reconcile_content_dupes: survivor membership {smid} failed, skipping: {e}");
-        }
+        store
+            .stage_local_write("collection_memberships", &smid, rec, now)
+            .map_err(|e| format!("survivor membership {smid}: {e}"))?;
     }
     Ok(())
 }
