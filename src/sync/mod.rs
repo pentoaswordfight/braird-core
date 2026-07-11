@@ -69,6 +69,12 @@ pub struct SupersededEdit {
 
 /// The result of the post-pull reconciliation pass across the FFI (SUR-820): books backfilled by
 /// id (a note's `book_id` referenced a book absent locally), notes rehomed to a known
+/// offline-merge survivor vs. detached locally-only when no survivor is known, custom ideas
+/// created for a note tag orphaned from the current canon, and duplicate notes collapsed by shared
+/// `content_tag` (SUR-835). Nested onto [`PullSummary`] (not flattened) — a pull-mechanics count
+/// (`pulled`/`merged`) and a reconciliation-outcome count are different concerns. A reconciliation
+/// failure never fails the `pull`/`sync` it's attached to (best-effort — see [`reconcile`]); this
+/// summary is all-zero in that case.
 /// offline-merge survivor vs. detached locally-only when no survivor is known, and custom ideas
 /// created for a note tag orphaned from the current canon, and book covers resolved via Open
 /// Library for natively-created books (SUR-828). Nested onto [`PullSummary`] (not flattened) — a
@@ -81,6 +87,7 @@ pub struct ReconcileSummary {
     pub notes_rehomed: u32,
     pub notes_detached: u32,
     pub ideas_created: u32,
+    pub dupes_collapsed: u32,
     pub covers_resolved: u32,
 }
 
@@ -91,6 +98,7 @@ impl From<reconcile::ReconcileResult> for ReconcileSummary {
             notes_rehomed: r.notes_rehomed as u32,
             notes_detached: r.notes_detached as u32,
             ideas_created: r.ideas_created as u32,
+            dupes_collapsed: r.dupes_collapsed as u32,
             covers_resolved: r.covers_resolved as u32,
         }
     }
