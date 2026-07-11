@@ -1,10 +1,10 @@
-//! Post-pull reconciliation (SUR-820). Three passes that run after a successful
-//! [`super::pull`], promoting into the core two of the three post-sync behaviors the PWA's
-//! `fetchAllCloud` orchestration runs in `src/hooks/useAuth.js` (steps 2b/2c/2d) — excluded from
-//! the core at SUR-659, briefly re-homed to Android at SUR-768, and promoted here because they
-//! mutate synced data every client reads (the SUR-812 lesson: state logic reinvented per host
-//! goes wrong) and would otherwise need a whole-corpus scan over the paged FFI app-side. Image
-//! download/cache (the PWA's step 3) stays host-side (SUR-768/SUR-821) — out of scope here.
+//! Post-pull reconciliation (SUR-820, extended by SUR-835). The passes that run after a successful
+//! [`super::pull`], promoting into the core post-sync behaviors the PWA's `fetchAllCloud`
+//! orchestration runs in `src/hooks/useAuth.js` (steps 2b/2c/2d) plus its content-tag dedup —
+//! excluded from the core at SUR-659, briefly re-homed to Android at SUR-768, and promoted here
+//! because they mutate synced data every client reads (the SUR-812 lesson: state logic reinvented
+//! per host goes wrong) and would otherwise need a whole-corpus scan over the paged FFI app-side.
+//! Image download/cache (the PWA's step 3) stays host-side (SUR-768/SUR-821) — out of scope here.
 //!
 //! 1. **`reconcile_books`** (`useAuth.js` step 2b) — a live note's `book_id` referencing a book
 //!    absent from the local store is backfilled by fetching it from the server. This is a pure
@@ -28,12 +28,18 @@
 //!    (`cidea_sur597_{userId}_{slug}`) is kept byte-identical to the oracle's
 //!    `preservedCustomIdeaId` for every orphaned tag (not just the 26 classical names), so a
 //!    core-created row converges with one the PWA already created for the same user+tag.
+//! 4. **`reconcile_content_dupes`** (SUR-835; `reconcileContentTags` + `mergeNotes` in `db.js`) —
+//!    live notes sharing a `content_tag` (the SUR-638 per-user HMAC content fingerprint) are
+//!    collapsed into one survivor, picked deterministically (most tags, then earliest `created_at`,
+//!    then lowest `id`) so two devices reconciling independently converge on the SAME keeper. The
+//!    losers' tags, image, `note_links` edges and `collection_memberships` are merged onto the
+//!    survivor and the losers soft-deleted — all through the outbox (LWW-safe).
 //!
 //! **Error handling (deliberately asymmetric, mirroring the oracle):** the oracle does NOT wrap
 //! steps 2b/2c in a try/catch (an error there aborts the whole `fetchAllCloud` call), but DOES
 //! wrap step 2d ("Best-effort: a failure must never block the sync"). [`reconcile`] mirrors that
-//! shape internally — a `reconcile_dropped_tags` failure is caught and logged here, never
-//! propagated. Whatever `reconcile` itself returns is, in turn, treated as best-effort by ITS
+//! shape internally — a `reconcile_dropped_tags` or `reconcile_content_dupes` failure is caught and
+//! logged here, never propagated. Whatever `reconcile` itself returns is, in turn, treated as best-effort by ITS
 //! callers ([`super::SyncEngine::pull`], [`super::pull_then_flush`]) — a reconciliation hiccup
 //! (e.g. a network blip fetching a missing book) must never discard an otherwise-successful
 //! pull, so those call sites log-and-zero rather than fail the whole `pull()`/`sync()`. This is a
@@ -63,6 +69,7 @@ pub struct ReconcileResult {
     pub notes_rehomed: usize,
     pub notes_detached: usize,
     pub ideas_created: usize,
+    pub dupes_collapsed: usize,
 }
 
 /// `meta` key holding the device-local offline-merge survivor map (loser→survivor book id, JSON
@@ -75,8 +82,10 @@ const MERGED_BOOK_IDS_KEY: &str = "mergedBookIds";
 
 /// Run the full post-pull reconciliation pass. Order: books-backfill first (so a book fetched
 /// this pass is visible to the stranded-notes check that follows), then stranded-notes, then
-/// dropped-tags (independent of the other two). `user_id` is the token's `sub` — needed only for
-/// the dropped-tag pass's user-scoped custom-idea id.
+/// dropped-tags (independent of the other two), then content-dedup LAST — after stranded-notes,
+/// because that pass nulls a rehomed note's now-stale `content_tag`, and a null-tagged note is
+/// (correctly) skipped by dedup. `user_id` is the token's `sub` — needed only for the dropped-tag
+/// pass's user-scoped custom-idea id.
 pub async fn reconcile<S: PostgrestSink>(
     store: &Store,
     sink: &S,
@@ -90,11 +99,18 @@ pub async fn reconcile<S: PostgrestSink>(
         eprintln!("reconcile: dropped-tag pass failed (non-fatal, retries next pull): {e}");
         0
     });
+    // Best-effort, same posture as the dropped-tag pass: a content-dedup hiccup must never fail
+    // the pull it follows — it simply retries next pull (the pass is idempotent).
+    let dupes_collapsed = reconcile_content_dupes(store).unwrap_or_else(|e| {
+        eprintln!("reconcile: content-dedup pass failed (non-fatal, retries next pull): {e}");
+        0
+    });
     Ok(ReconcileResult {
         books_backfilled,
         notes_rehomed,
         notes_detached,
         ideas_created,
+        dupes_collapsed,
     })
 }
 
@@ -316,6 +332,261 @@ fn preserved_custom_idea_id(user_id: &str, name: &str) -> String {
         .collect::<Vec<_>>()
         .join("_");
     format!("cidea_sur597_{user_id}_{slug}")
+}
+
+/// Step 2e (SUR-835) — retroactive content-tag dedup. Collapse live notes that share a
+/// `content_tag` (the per-user HMAC content fingerprint, SUR-638) into one survivor, mirroring the
+/// PWA's user-driven `mergeNotes` (`surfc/src/db.js`): union the losers' tags onto the survivor,
+/// adopt a loser's image only when the survivor has none, re-point the losers' `note_links` edges
+/// and `collection_memberships` onto the survivor (dedup/tombstone self-loops + duplicate edges),
+/// then soft-delete the losers. Every mutation is staged through the outbox (LWW-safe) so the
+/// collapse converges across the fleet. Returns the number of losers collapsed.
+///
+/// **Survivor selection is a convergence contract:** two devices reconciling independently MUST
+/// pick the same survivor, or each soft-deletes the other's. Ported from
+/// `pickContentDuplicateSurvivor` (most tags wins, then earliest `created_at`) with an explicit
+/// final `id` tiebreak so the order is TOTAL and device-independent — the oracle leans on JS
+/// stable sort over the client's load order, which two native devices can't be assumed to share.
+/// The only case this is stricter than the oracle is a measure-zero exact tie (equal tag-count AND
+/// equal `created_at`); flagged for `sync-reviewer`.
+///
+/// Dedup keys on the STORED `content_tag` alone — the core never decrypts note text here (a
+/// deliberate, safe divergence from the oracle's detect path, which reads text only to *recompute*
+/// a missing tag; the core leaves a tagless note untouched rather than recompute it).
+fn reconcile_content_dupes(store: &Store) -> Result<usize, String> {
+    let notes = store
+        .list_live("notes", None, -1, 0)
+        .map_err(|e| format!("list notes: {e}"))?;
+
+    // Group live notes by their stored content_tag. A note with no content_tag can't be
+    // fingerprint-matched without decrypting + re-deriving (out of scope) — skip it.
+    let mut by_tag: BTreeMap<String, Vec<Map<String, Value>>> = BTreeMap::new();
+    for row in &notes {
+        match row.get("content_tag").and_then(Value::as_str) {
+            Some(tag) if !tag.is_empty() => {
+                by_tag.entry(tag.to_string()).or_default().push(row.clone())
+            }
+            _ => {}
+        }
+    }
+
+    let mut collapsed = 0;
+    for (_tag, mut cluster) in by_tag {
+        if cluster.len() < 2 {
+            continue;
+        }
+        // Total, device-independent survivor order (see the doc comment): most tags, then earliest
+        // created_at, then lowest id. `sort_by` is stable, but the id tiebreak makes it moot.
+        cluster.sort_by(|a, b| {
+            let a_tags = a.get("tags").and_then(Value::as_array).map_or(0, Vec::len);
+            let b_tags = b.get("tags").and_then(Value::as_array).map_or(0, Vec::len);
+            b_tags
+                .cmp(&a_tags)
+                .then_with(|| row_i64(a, "created_at").cmp(&row_i64(b, "created_at")))
+                .then_with(|| row_str(a, "id").cmp(row_str(b, "id")))
+        });
+        let survivor = cluster[0].clone();
+        // Per-cluster isolation (see `reconcile_books`): one failed merge must not abort the pass.
+        match merge_into_survivor(store, &survivor, &cluster[1..]) {
+            Ok(n) => collapsed += n,
+            Err(e) => eprintln!(
+                "reconcile_content_dupes: merge into survivor failed, skipping cluster: {e}"
+            ),
+        }
+    }
+    Ok(collapsed)
+}
+
+fn row_str<'a>(row: &'a Map<String, Value>, key: &str) -> &'a str {
+    row.get(key).and_then(Value::as_str).unwrap_or("")
+}
+
+fn row_i64(row: &Map<String, Value>, key: &str) -> i64 {
+    row.get(key).and_then(Value::as_i64).unwrap_or(0)
+}
+
+/// Collapse `losers` into `survivor`, mirroring the PWA's `mergeNotes` (`surfc/src/db.js`): union
+/// tags, adopt an image only if the survivor lacks one, re-point edges + memberships, soft-delete
+/// the losers. Returns the number of losers soft-deleted.
+fn merge_into_survivor(
+    store: &Store,
+    survivor: &Map<String, Value>,
+    losers: &[Map<String, Value>],
+) -> Result<usize, String> {
+    let now = epoch_ms();
+    let sid = row_str(survivor, "id").to_string();
+    let loser_ids: BTreeSet<String> = losers
+        .iter()
+        .map(|l| row_str(l, "id").to_string())
+        .collect();
+
+    // ── Union tags: survivor's first (order stable), then losers', dedup preserving first seen. ──
+    let mut tags: Vec<Value> = survivor
+        .get("tags")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut seen_tags: HashSet<String> = tags
+        .iter()
+        .filter_map(|t| t.as_str().map(str::to_string))
+        .collect();
+    for l in losers {
+        if let Some(arr) = l.get("tags").and_then(Value::as_array) {
+            for t in arr.iter().filter_map(Value::as_str) {
+                if seen_tags.insert(t.to_string()) {
+                    tags.push(Value::String(t.to_string()));
+                }
+            }
+        }
+    }
+
+    let mut survivor_patch = Map::new();
+    survivor_patch.insert("id".into(), json!(sid));
+    survivor_patch.insert("tags".into(), Value::Array(tags));
+    // Adopt a loser's image only when the survivor has NEITHER (`image_path` null/absent). The core
+    // has no `imageDataUrl` local-copy field the PWA also considers — only the synced `image_path`.
+    let survivor_has_image = survivor.get("image_path").is_some_and(|v| !v.is_null());
+    if !survivor_has_image {
+        if let Some(donor) = losers
+            .iter()
+            .find(|l| l.get("image_path").is_some_and(|v| !v.is_null()))
+        {
+            survivor_patch.insert("image_path".into(), donor["image_path"].clone());
+        }
+    }
+    survivor_patch.insert("updated_at".into(), json!(now));
+    store
+        .stage_local_write("notes", &sid, survivor_patch, now)
+        .map_err(|e| format!("stage survivor {sid}: {e}"))?;
+
+    repoint_note_links(store, &sid, &loser_ids, now)?;
+    repoint_memberships(store, &sid, &loser_ids, now)?;
+
+    // ── Soft-delete the losers (tombstone: only `deleted`/`updated_at` change; the partial patch
+    // leaves every other column intact). Per-loser isolation. ──
+    let mut collapsed = 0;
+    for lid in &loser_ids {
+        let mut patch = Map::new();
+        patch.insert("id".into(), json!(lid));
+        patch.insert("deleted".into(), json!(true));
+        patch.insert("updated_at".into(), json!(now));
+        match store.stage_local_write("notes", lid, patch, now) {
+            Ok(()) => collapsed += 1,
+            Err(e) => {
+                eprintln!("reconcile_content_dupes: soft-delete loser {lid} failed, skipping: {e}")
+            }
+        }
+    }
+    Ok(collapsed)
+}
+
+/// Re-point every live `note_links` edge that touches a loser onto the survivor, dropping
+/// self-loops and duplicates. Mirrors the `mergeNotes` edge block: `seen` is seeded with edges that
+/// DON'T touch a loser so a re-pointed edge dedups against one the survivor already owns.
+fn repoint_note_links(
+    store: &Store,
+    sid: &str,
+    loser_ids: &BTreeSet<String>,
+    now: i64,
+) -> Result<(), String> {
+    let edges = store
+        .list_live("note_links", None, -1, 0)
+        .map_err(|e| format!("list note_links: {e}"))?;
+    let edge_key = |from: &str, to: &str, rel: &str| format!("{from}|{to}|{rel}");
+
+    let mut seen: HashSet<String> = HashSet::new();
+    for e in &edges {
+        let (from, to) = (row_str(e, "from_note_id"), row_str(e, "to_note_id"));
+        if !loser_ids.contains(from) && !loser_ids.contains(to) {
+            seen.insert(edge_key(from, to, row_str(e, "relation_type")));
+        }
+    }
+    for e in &edges {
+        let (from0, to0) = (row_str(e, "from_note_id"), row_str(e, "to_note_id"));
+        if !loser_ids.contains(from0) && !loser_ids.contains(to0) {
+            continue;
+        }
+        let from = if loser_ids.contains(from0) {
+            sid
+        } else {
+            from0
+        };
+        let to = if loser_ids.contains(to0) { sid } else { to0 };
+        let key = edge_key(from, to, row_str(e, "relation_type"));
+        let eid = row_str(e, "id").to_string();
+        let mut patch = Map::new();
+        patch.insert("id".into(), json!(eid));
+        if from == to || seen.contains(&key) {
+            // Self-loop (a loser linked to the survivor) or a duplicate of an existing edge → drop.
+            patch.insert("deleted".into(), json!(true));
+        } else {
+            seen.insert(key);
+            patch.insert("from_note_id".into(), json!(from));
+            patch.insert("to_note_id".into(), json!(to));
+        }
+        patch.insert("updated_at".into(), json!(now));
+        if let Err(err) = store.stage_local_write("note_links", &eid, patch, now) {
+            eprintln!("reconcile_content_dupes: repoint edge {eid} failed, skipping: {err}");
+        }
+    }
+    Ok(())
+}
+
+/// Re-point every live `collection_membership` off a loser onto the survivor. A membership id is
+/// the deterministic `{collection_id}:{note_id}`, so the loser's row can't be mutated in place;
+/// instead tombstone it and ensure the survivor has exactly one LIVE membership in that collection
+/// (reactivate its own deterministic row, preserving `created_at`, else create it). Mirrors the
+/// `mergeNotes` membership block.
+fn repoint_memberships(
+    store: &Store,
+    sid: &str,
+    loser_ids: &BTreeSet<String>,
+    now: i64,
+) -> Result<(), String> {
+    let memberships = store
+        .list_live("collection_memberships", None, -1, 0)
+        .map_err(|e| format!("list collection_memberships: {e}"))?;
+    let mut survivor_collections: HashSet<String> = memberships
+        .iter()
+        .filter(|m| row_str(m, "note_id") == sid)
+        .map(|m| row_str(m, "collection_id").to_string())
+        .collect();
+
+    for m in &memberships {
+        if !loser_ids.contains(row_str(m, "note_id")) {
+            continue;
+        }
+        let mid = row_str(m, "id").to_string();
+        let cid = row_str(m, "collection_id").to_string();
+        // Tombstone the loser's membership — its un-filing must propagate.
+        let mut tomb = Map::new();
+        tomb.insert("id".into(), json!(mid));
+        tomb.insert("deleted".into(), json!(true));
+        tomb.insert("updated_at".into(), json!(now));
+        if let Err(e) = store.stage_local_write("collection_memberships", &mid, tomb, now) {
+            eprintln!("reconcile_content_dupes: tombstone membership {mid} failed, skipping: {e}");
+            continue;
+        }
+        if !survivor_collections.insert(cid.clone()) {
+            continue; // survivor already filed (live) in this collection — nothing to add.
+        }
+        let smid = format!("{cid}:{sid}");
+        let existing_created = store
+            .get_row("collection_memberships", &smid)
+            .map_err(|e| format!("get membership {smid}: {e}"))?
+            .and_then(|r| r.get("created_at").and_then(Value::as_i64));
+        let mut rec = Map::new();
+        rec.insert("id".into(), json!(smid));
+        rec.insert("note_id".into(), json!(sid));
+        rec.insert("collection_id".into(), json!(cid));
+        rec.insert("created_at".into(), json!(existing_created.unwrap_or(now)));
+        rec.insert("updated_at".into(), json!(now));
+        rec.insert("deleted".into(), json!(false));
+        if let Err(e) = store.stage_local_write("collection_memberships", &smid, rec, now) {
+            eprintln!("reconcile_content_dupes: survivor membership {smid} failed, skipping: {e}");
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -751,6 +1022,7 @@ mod tests {
                 notes_rehomed: 1,
                 notes_detached: 0,
                 ideas_created: 1,
+                dupes_collapsed: 0, // the fixtures carry no content_tag, so nothing to dedup
             }
         );
 
@@ -760,5 +1032,288 @@ mod tests {
             ReconcileResult::default(),
             "a second pass over an already-reconciled store changes nothing"
         );
+    }
+
+    // ── reconcile_content_dupes (SUR-835) ────────────────────────────────────
+
+    /// A note carrying a `content_tag` (+ optional `image_path`) for the dedup tests.
+    fn cnote(id: &str, tag: &str, tags: &[&str], created_at: i64, image: Option<&str>) -> Value {
+        json!({
+            "id": id, "book_id": null, "text": "enc:v2:x", "tags": tags,
+            "content_tag": tag, "image_path": image,
+            "created_at": created_at, "updated_at": created_at, "deleted": false
+        })
+    }
+
+    fn put(store: &Store, table: &str, row: &Value) {
+        store.apply_row(table, row.as_object().unwrap()).unwrap();
+    }
+
+    fn is_deleted(store: &Store, table: &str, id: &str) -> bool {
+        matches!(
+            store.get_row(table, id).unwrap().unwrap().get("deleted"),
+            Some(Value::Bool(true))
+        )
+    }
+
+    fn live_ids(store: &Store, table: &str) -> Vec<String> {
+        store
+            .list_live(table, None, -1, 0)
+            .unwrap()
+            .iter()
+            .map(|r| row_str(r, "id").to_string())
+            .collect()
+    }
+
+    #[test]
+    fn collapses_a_pair_keeping_the_note_with_more_tags() {
+        let store = Store::open_in_memory().unwrap();
+        put(&store, "notes", &cnote("n1", "T", &["a"], 1, None));
+        put(&store, "notes", &cnote("n2", "T", &["a", "b"], 2, None)); // more tags → survivor
+
+        let collapsed = reconcile_content_dupes(&store).unwrap();
+
+        assert_eq!(collapsed, 1);
+        assert_eq!(live_ids(&store, "notes"), vec!["n2"]);
+        assert!(is_deleted(&store, "notes", "n1"));
+    }
+
+    #[test]
+    fn tie_on_tag_count_breaks_to_earliest_created_at() {
+        let store = Store::open_in_memory().unwrap();
+        put(&store, "notes", &cnote("late", "T", &["x"], 5, None));
+        put(&store, "notes", &cnote("early", "T", &["x"], 3, None)); // earliest → survivor
+        put(&store, "notes", &cnote("mid", "T", &["x"], 4, None));
+
+        assert_eq!(reconcile_content_dupes(&store).unwrap(), 2);
+        assert_eq!(live_ids(&store, "notes"), vec!["early"]);
+    }
+
+    #[test]
+    fn full_tie_breaks_to_lowest_id_for_cross_device_convergence() {
+        let store = Store::open_in_memory().unwrap();
+        // Same tag-count AND same created_at: only the id tiebreak decides — deterministically.
+        put(&store, "notes", &cnote("bbb", "T", &["x"], 5, None));
+        put(&store, "notes", &cnote("aaa", "T", &["x"], 5, None)); // lowest id → survivor
+
+        assert_eq!(reconcile_content_dupes(&store).unwrap(), 1);
+        assert_eq!(live_ids(&store, "notes"), vec!["aaa"]);
+    }
+
+    #[test]
+    fn two_devices_in_different_insert_order_converge_on_the_same_survivor() {
+        let mk = |order: [&str; 3]| {
+            let store = Store::open_in_memory().unwrap();
+            let rows = std::collections::HashMap::from([
+                ("p", cnote("p", "T", &["a", "b"], 2, None)),
+                ("q", cnote("q", "T", &["a"], 1, None)),
+                ("r", cnote("r", "T", &["a"], 3, None)),
+            ]);
+            for id in order {
+                put(&store, "notes", &rows[id]);
+            }
+            reconcile_content_dupes(&store).unwrap();
+            live_ids(&store, "notes")
+        };
+        // "p" has the most tags → survivor, regardless of the order rows landed locally.
+        assert_eq!(mk(["p", "q", "r"]), vec!["p"]);
+        assert_eq!(mk(["r", "q", "p"]), vec!["p"]);
+    }
+
+    #[test]
+    fn survivor_gets_the_union_of_all_tags_order_preserved() {
+        let store = Store::open_in_memory().unwrap();
+        put(&store, "notes", &cnote("n1", "T", &["a", "b"], 1, None)); // tie count, earliest → survivor
+        put(&store, "notes", &cnote("n2", "T", &["b", "c"], 2, None));
+
+        reconcile_content_dupes(&store).unwrap();
+
+        let tags = store.get_row("notes", "n1").unwrap().unwrap()["tags"].clone();
+        assert_eq!(
+            tags,
+            json!(["a", "b", "c"]),
+            "survivor's order first, losers' new tags appended"
+        );
+    }
+
+    #[test]
+    fn survivor_adopts_a_losers_image_only_when_it_has_none() {
+        // Survivor lacks an image → adopts the loser's.
+        let store = Store::open_in_memory().unwrap();
+        put(&store, "notes", &cnote("s", "T", &["a", "b"], 1, None));
+        put(&store, "notes", &cnote("l", "T", &["a"], 2, Some("img-l")));
+        reconcile_content_dupes(&store).unwrap();
+        assert_eq!(
+            store.get_row("notes", "s").unwrap().unwrap()["image_path"],
+            json!("img-l")
+        );
+
+        // Survivor already has an image → keeps its own.
+        let store = Store::open_in_memory().unwrap();
+        put(
+            &store,
+            "notes",
+            &cnote("s", "T", &["a", "b"], 1, Some("img-s")),
+        );
+        put(&store, "notes", &cnote("l", "T", &["a"], 2, Some("img-l")));
+        reconcile_content_dupes(&store).unwrap();
+        assert_eq!(
+            store.get_row("notes", "s").unwrap().unwrap()["image_path"],
+            json!("img-s")
+        );
+    }
+
+    fn edge(id: &str, from: &str, to: &str, rel: &str) -> Value {
+        json!({
+            "id": id, "from_note_id": from, "to_note_id": to, "relation_type": rel,
+            "created_at": 1, "updated_at": 1, "deleted": false
+        })
+    }
+
+    #[test]
+    fn note_links_repoint_to_survivor_dropping_self_loops_and_duplicates() {
+        let store = Store::open_in_memory().unwrap();
+        // S survives, L is the loser (more tags on S). X is an unrelated note.
+        put(&store, "notes", &cnote("S", "T", &["a", "b"], 1, None));
+        put(&store, "notes", &cnote("L", "T", &["a"], 2, None));
+        put(
+            &store,
+            "notes",
+            &json!({ "id": "X", "text": "enc:v2:x", "tags": [],
+            "created_at": 1, "updated_at": 1, "deleted": false }),
+        );
+        put(&store, "note_links", &edge("e1", "X", "L", "ref")); // → repoint to X→S
+        put(&store, "note_links", &edge("e2", "L", "S", "ref")); // → self-loop S→S, dropped
+        put(&store, "note_links", &edge("e3", "X", "S", "dup")); // pre-existing
+        put(&store, "note_links", &edge("e4", "X", "L", "dup")); // → dup of e3, dropped
+
+        reconcile_content_dupes(&store).unwrap();
+
+        let e1 = store.get_row("note_links", "e1").unwrap().unwrap();
+        assert_eq!(e1["from_note_id"], json!("X"));
+        assert_eq!(e1["to_note_id"], json!("S"), "e1 repointed L→S");
+        assert!(!is_deleted(&store, "note_links", "e1"));
+        assert!(is_deleted(&store, "note_links", "e2"), "self-loop dropped");
+        assert!(
+            is_deleted(&store, "note_links", "e4"),
+            "duplicate edge dropped"
+        );
+        assert!(
+            !is_deleted(&store, "note_links", "e3"),
+            "pre-existing edge untouched"
+        );
+        assert_eq!(
+            store.get_row("note_links", "e3").unwrap().unwrap()["updated_at"],
+            json!(1),
+            "an untouched edge keeps its updated_at (never staged)"
+        );
+    }
+
+    fn membership(id: &str, note: &str, collection: &str, deleted: bool, created_at: i64) -> Value {
+        json!({
+            "id": id, "note_id": note, "collection_id": collection,
+            "created_at": created_at, "updated_at": created_at, "deleted": deleted
+        })
+    }
+
+    #[test]
+    fn memberships_repoint_to_survivor_dedup_and_reactivate() {
+        let store = Store::open_in_memory().unwrap();
+        put(&store, "notes", &cnote("S", "T", &["a", "b"], 1, None));
+        put(&store, "notes", &cnote("L", "T", &["a"], 2, None));
+        // L in c1 (survivor absent → survivor row created, reactivating a tombstone w/ its createdAt).
+        put(
+            &store,
+            "collection_memberships",
+            &membership("c1:L", "L", "c1", false, 10),
+        );
+        put(
+            &store,
+            "collection_memberships",
+            &membership("c1:S", "S", "c1", true, 100),
+        ); // tombstoned
+           // L in c2 where S is already live → tombstone L's, no new survivor row (dedup).
+        put(
+            &store,
+            "collection_memberships",
+            &membership("c2:L", "L", "c2", false, 20),
+        );
+        put(
+            &store,
+            "collection_memberships",
+            &membership("c2:S", "S", "c2", false, 30),
+        );
+
+        reconcile_content_dupes(&store).unwrap();
+
+        assert!(
+            is_deleted(&store, "collection_memberships", "c1:L"),
+            "loser's c1 membership tombstoned"
+        );
+        let c1s = store
+            .get_row("collection_memberships", "c1:S")
+            .unwrap()
+            .unwrap();
+        assert!(
+            !matches!(c1s.get("deleted"), Some(Value::Bool(true))),
+            "survivor reactivated in c1"
+        );
+        assert_eq!(
+            c1s["created_at"],
+            json!(100),
+            "reactivation preserves the original filing time"
+        );
+        assert!(
+            is_deleted(&store, "collection_memberships", "c2:L"),
+            "loser's c2 membership tombstoned"
+        );
+        assert!(
+            !is_deleted(&store, "collection_memberships", "c2:S"),
+            "survivor already in c2 — untouched"
+        );
+        assert_eq!(
+            store
+                .get_row("collection_memberships", "c2:S")
+                .unwrap()
+                .unwrap()["updated_at"],
+            json!(30),
+            "no redundant survivor write for a collection it's already in"
+        );
+    }
+
+    #[test]
+    fn a_second_pass_is_a_no_op() {
+        let store = Store::open_in_memory().unwrap();
+        put(&store, "notes", &cnote("n1", "T", &["a"], 1, None));
+        put(&store, "notes", &cnote("n2", "T", &["a", "b"], 2, None));
+
+        assert_eq!(reconcile_content_dupes(&store).unwrap(), 1);
+        assert_eq!(
+            reconcile_content_dupes(&store).unwrap(),
+            0,
+            "only the survivor is live with tag T — nothing left to collapse"
+        );
+    }
+
+    #[test]
+    fn notes_without_a_content_tag_are_never_matched() {
+        let store = Store::open_in_memory().unwrap();
+        // Two notes, no content_tag at all — not fingerprint-matchable, must be left alone.
+        put(&store, "notes", &note("n1", None, &[], 1));
+        put(&store, "notes", &note("n2", None, &[], 2));
+        // And an empty-string tag is treated as absent.
+        put(&store, "notes", &cnote("n3", "", &[], 3, None));
+        put(&store, "notes", &cnote("n4", "", &[], 4, None));
+
+        assert_eq!(reconcile_content_dupes(&store).unwrap(), 0);
+        assert_eq!(live_ids(&store, "notes").len(), 4, "nothing collapsed");
+    }
+
+    #[test]
+    fn a_singleton_content_tag_is_left_untouched() {
+        let store = Store::open_in_memory().unwrap();
+        put(&store, "notes", &cnote("only", "T", &["a"], 1, None));
+        assert_eq!(reconcile_content_dupes(&store).unwrap(), 0);
+        assert_eq!(live_ids(&store, "notes"), vec!["only"]);
     }
 }
