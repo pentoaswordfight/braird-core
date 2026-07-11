@@ -2464,15 +2464,11 @@ public struct ReconcileSummary {
     public var notesDetached: UInt32
     public var ideasCreated: UInt32
     public var dupesCollapsed: UInt32
-
-    // Default memberwise initializers are never public by default, so we
-    // declare one manually.
-    public init(booksBackfilled: UInt32, notesRehomed: UInt32, notesDetached: UInt32, ideasCreated: UInt32, dupesCollapsed: UInt32) {
     public var coversResolved: UInt32
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(booksBackfilled: UInt32, notesRehomed: UInt32, notesDetached: UInt32, ideasCreated: UInt32, coversResolved: UInt32) {
+    public init(booksBackfilled: UInt32, notesRehomed: UInt32, notesDetached: UInt32, ideasCreated: UInt32, dupesCollapsed: UInt32, coversResolved: UInt32) {
         self.booksBackfilled = booksBackfilled
         self.notesRehomed = notesRehomed
         self.notesDetached = notesDetached
@@ -2499,6 +2495,8 @@ extension ReconcileSummary: Equatable, Hashable {
             return false
         }
         if lhs.dupesCollapsed != rhs.dupesCollapsed {
+            return false
+        }
         if lhs.coversResolved != rhs.coversResolved {
             return false
         }
@@ -2527,7 +2525,7 @@ public struct FfiConverterTypeReconcileSummary: FfiConverterRustBuffer {
                 notesRehomed: FfiConverterUInt32.read(from: &buf), 
                 notesDetached: FfiConverterUInt32.read(from: &buf), 
                 ideasCreated: FfiConverterUInt32.read(from: &buf), 
-                dupesCollapsed: FfiConverterUInt32.read(from: &buf)
+                dupesCollapsed: FfiConverterUInt32.read(from: &buf), 
                 coversResolved: FfiConverterUInt32.read(from: &buf)
         )
     }

@@ -28,6 +28,8 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   oracle's single Dexie transaction across separate outbox writes).
 
   **FFI:** `ReconcileSummary` (nested on `PullSummary`) gains a `dupesCollapsed: u32` field;
+  Kotlin + Swift bindings regenerated via `scripts/gen-bindings.sh`. Purely additive.
+
 - **SUR-828 — Open Library cover resolution as a reconciliation case.** A new case on the
   post-pull reconciliation pass (`src/sync/reconcile.rs`, SUR-820) that resolves book covers for
   natively-created books — SUR-198 parity, since the PWA only resolves covers on its own create

@@ -1,9 +1,7 @@
-//! Post-pull reconciliation (SUR-820, extended by SUR-835). The passes that run after a successful
-//! [`super::pull`], promoting into the core post-sync behaviors the PWA's `fetchAllCloud`
-//! orchestration runs in `src/hooks/useAuth.js` (steps 2b/2c/2d) plus its content-tag dedup —
-//! Post-pull reconciliation (SUR-820, extended by SUR-828). The passes that run after a successful
-//! [`super::pull`], promoting into the core the post-sync behaviors the PWA's `fetchAllCloud`
-//! orchestration runs in `src/hooks/useAuth.js` (steps 2b/2c/2d) plus its book-cover resolution —
+//! Post-pull reconciliation (SUR-820, extended by SUR-835 + SUR-828). The passes that run after a
+//! successful [`super::pull`], promoting into the core the post-sync behaviors the PWA's
+//! `fetchAllCloud` orchestration runs in `src/hooks/useAuth.js` (steps 2b/2c/2d) plus its
+//! content-tag dedup and book-cover resolution —
 //! excluded from the core at SUR-659, briefly re-homed to Android at SUR-768, and promoted here
 //! because they mutate synced data every client reads (the SUR-812 lesson: state logic reinvented
 //! per host goes wrong) and would otherwise need a whole-corpus scan over the paged FFI app-side.
@@ -37,7 +35,7 @@
 //!    then lowest `id`) so two devices reconciling independently converge on the SAME keeper. The
 //!    losers' tags, image, `note_links` edges and `collection_memberships` are merged onto the
 //!    survivor and the losers soft-deleted — all through the outbox (LWW-safe).
-//! 4. **`reconcile_covers`** (SUR-828; `resolveCover` in `surfc/src/lib/coverResolver.js`) —
+//! 5. **`reconcile_covers`** (SUR-828; `resolveCover` in `surfc/src/lib/coverResolver.js`) —
 //!    a coverless book gets its cover resolved via Open Library (ISBN → a deterministic
 //!    `covers.openlibrary.org` URL by pure construction, no egress; no-ISBN → the Search API for a
 //!    `cover_i`/healed ISBN), persisting `cover_url` + `cover_source` + `cover_resolved_at` through
@@ -50,10 +48,9 @@
 //! **Error handling (deliberately asymmetric, mirroring the oracle):** the oracle does NOT wrap
 //! steps 2b/2c in a try/catch (an error there aborts the whole `fetchAllCloud` call), but DOES
 //! wrap step 2d ("Best-effort: a failure must never block the sync"). [`reconcile`] mirrors that
-//! shape internally — a `reconcile_dropped_tags` or `reconcile_content_dupes` failure is caught and
-//! logged here, never propagated. Whatever `reconcile` itself returns is, in turn, treated as best-effort by ITS
-//! shape internally — a `reconcile_dropped_tags` or `reconcile_covers` failure is caught and logged
-//! here, never propagated. Whatever `reconcile` itself returns is, in turn, treated as best-effort by ITS
+//! shape internally — a `reconcile_dropped_tags`, `reconcile_content_dupes`, or `reconcile_covers`
+//! failure is caught and logged here, never propagated. Whatever `reconcile` itself returns is, in
+//! turn, treated as best-effort by ITS
 //! callers ([`super::SyncEngine::pull`], [`super::pull_then_flush`]) — a reconciliation hiccup
 //! (e.g. a network blip fetching a missing book) must never discard an otherwise-successful
 //! pull, so those call sites log-and-zero rather than fail the whole `pull()`/`sync()`. This is a
@@ -109,13 +106,10 @@ const MERGED_BOOK_IDS_KEY: &str = "mergedBookIds";
 
 /// Run the full post-pull reconciliation pass. Order: books-backfill first (so a book fetched
 /// this pass is visible to the stranded-notes check that follows), then stranded-notes, then
-/// dropped-tags (independent of the other two), then content-dedup LAST — after stranded-notes,
-/// because that pass nulls a rehomed note's now-stale `content_tag`, and a null-tagged note is
-/// (correctly) skipped by dedup. `user_id` is the token's `sub` — needed only for the dropped-tag
-/// pass's user-scoped custom-idea id.
-pub async fn reconcile<S: PostgrestSink>(
-/// dropped-tags, then cover-resolution (independent of the others). `user_id` is the token's `sub`
-/// — needed only for the dropped-tag pass's user-scoped custom-idea id.
+/// dropped-tags, then content-dedup, then cover-resolution (independent of the others).
+/// Content-dedup runs after stranded-notes because that pass nulls a rehomed note's now-stale
+/// `content_tag`, and a null-tagged note is (correctly) skipped by dedup. `user_id` is the token's
+/// `sub` — needed only for the dropped-tag pass's user-scoped custom-idea id.
 pub async fn reconcile<S: PostgrestSink + CoverEgress>(
     store: &Store,
     sink: &S,
@@ -133,6 +127,8 @@ pub async fn reconcile<S: PostgrestSink + CoverEgress>(
     // the pull it follows — it simply retries next pull (the pass is idempotent).
     let dupes_collapsed = reconcile_content_dupes(store).unwrap_or_else(|e| {
         eprintln!("reconcile: content-dedup pass failed (non-fatal, retries next pull): {e}");
+        0
+    });
     // Best-effort, same posture: an Open Library outage (or a kill-switch read blip) must never
     // fail the pull it follows — cover resolution simply retries next pull.
     let covers_resolved = reconcile_covers(store, sink).await.unwrap_or_else(|e| {
@@ -661,6 +657,8 @@ fn repoint_memberships(
             .map_err(|e| format!("survivor membership {smid}: {e}"))?;
     }
     Ok(())
+}
+
 /// Step 2e (SUR-828) — resolve Open Library book covers for coverless books (SUR-198 parity for
 /// natively-created books, which the PWA only resolves on its own create path). Mirrors the PWA's
 /// `resolveCover` (`surfc/src/lib/coverResolver.js`): a book WITH an ISBN gets a deterministic
@@ -798,10 +796,6 @@ enum CoverOutcome {
     Hit(String),
     Miss,
     Outage,
-}
-
-fn row_str<'a>(row: &'a Map<String, Value>, key: &str) -> &'a str {
-    row.get(key).and_then(Value::as_str).unwrap_or("")
 }
 
 /// Byte-mirror of the PWA's `normalizeIsbn` (`surfc/src/lib/coverResolver.js`): strip everything
@@ -1618,11 +1612,10 @@ mod tests {
             reconcile_content_dupes(&store).unwrap(),
             0,
             "only the survivor is live with tag T — nothing left to collapse"
-    // ── reconcile_covers (SUR-828) ───────────────────────────────────────────
-
-    fn put(store: &Store, table: &str, row: &Value) {
-        store.apply_row(table, row.as_object().unwrap()).unwrap();
+        );
     }
+
+    // ── reconcile_covers (SUR-828) ───────────────────────────────────────────
 
     /// A coverless book (no `cover_url` / `cover_source` / `cover_resolved_at`).
     fn cbook(id: &str, title: &str, isbn: Option<&str>) -> Value {
@@ -1986,6 +1979,9 @@ mod tests {
         put(&store, "notes", &cnote("only", "T", &["a"], 1, None));
         assert_eq!(reconcile_content_dupes(&store).unwrap(), 0);
         assert_eq!(live_ids(&store, "notes"), vec!["only"]);
+    }
+
+    #[test]
     fn an_outage_never_fails_the_overall_reconcile_pass() {
         let store = Store::open_in_memory().unwrap();
         put(&store, "books", &cbook("b1", "Flaky", None));
