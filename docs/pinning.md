@@ -138,6 +138,32 @@ target resolves the `braird_coreFFI` module the wrapper's `import braird_coreFFI
 > of scope (the dev fleet is Apple Silicon). The macOS-host slice is inert baggage for an iOS-only
 > consumer but is a shipped, tested slice.
 
+## Toolchain & AGP compatibility
+
+The AAR is built by an AGP `com.android.library` module (`bindings/android`) pinned to
+**AGP 8.13.0 / Gradle 9.5.0** (Gradle held below 9.6.0 — AGP 8.x relies on a Gradle internal
+removed there). The desktop jar (`bindings/kotlin`) and its `:core-roundtrip` self-containment
+check (`bindings/consumer-smoke`) are plain `kotlin("jvm")` on a **separate** Gradle 9.6.1
+wrapper — no AGP at all, so an app-side AGP bump can't reach them.
+
+**Consumer AGP baseline: braird-android is on AGP 9.2.1 / Gradle 9.5.0** (SUR-853). The next
+AAR cut targets this consumer.
+
+**Forward-compat verified (SUR-854, 2026-07-11).** The pinned AAR (`v0.4.1`, sha256
+`a5dc38d4…`, the exact bytes in the app's `braird-core.lock`) declares
+`minAndroidGradlePluginVersion=1.0.0` and `minCompileSdk=1` in its `aar-metadata.properties`
+— the module sets no `aarMetadata { }` override, so both sit at AGP's default floor. Any
+AGP ≥ 1.0.0 consumer satisfies them, so the AGP 9.2.1 app resolves and links the AAR with
+**no metadata warning or error**. (The breaking direction — an AGP-9-built AAR consumed by an
+AGP-8 app — has no consumer.) The desktop-jar `:core-roundtrip` path is JVM-only and
+untouched (JNA still `5.17.0`).
+
+**AGP-alignment decision: leave the AAR-build module on AGP 8.13.0** — do *not* align at the
+next cut. Forward-compat holds, and moving the producer into AGP 9.x would churn the
+checksum-coupled release pipeline (16 KB alignment, parity round-trips) for zero consumer
+benefit. Revisit only when AGP ships a 9.6-clean release (which lifts the Gradle 9.5 cap) or
+a library feature forces a higher `minAndroidGradlePluginVersion`.
+
 ## Bumping the core
 
 The bump is **one hand-made PR in the app repo** — and that PR *is* the integration gate:
