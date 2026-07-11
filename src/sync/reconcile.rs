@@ -34,8 +34,9 @@
 //!    `cover_i`/healed ISBN), persisting `cover_url` + `cover_source` + `cover_resolved_at` through
 //!    the outbox. **⚠ The core's first non-Supabase egress** — gated by the SUR-492
 //!    `openlibrary_egress` kill-switch (read through the Supabase client), paced (≤10 searches per
-//!    pass), and fail-soft (a miss stamps `cover_resolved_at` so it never re-queries; an outage
-//!    leaves it unstamped to retry).
+//!    pass), and fail-soft (a miss stamps `cover_resolved_at` so it never re-queries UNTIL the book
+//!    is edited — a metadata change bumps `updated_at` past the stamp and re-opens it, mirroring
+//!    the PWA's edit-time re-resolution; an outage leaves it unstamped to retry).
 //!
 //! **Error handling (deliberately asymmetric, mirroring the oracle):** the oracle does NOT wrap
 //! steps 2b/2c in a try/catch (an error there aborts the whole `fetchAllCloud` call), but DOES
@@ -380,12 +381,26 @@ async fn reconcile_covers<S: PostgrestSink + CoverEgress>(
     let mut resolved = 0;
     let mut search_budget = COVER_SEARCH_BUDGET_PER_PASS;
     for book in &books {
-        // Already resolved (a `cover_url` set, or a prior miss stamped `cover_resolved_at`) → skip.
         // A manual cover is the user's own choice — never overwritten.
-        let has_url = book.get("cover_url").is_some_and(|v| !v.is_null());
-        let stamped = book.get("cover_resolved_at").is_some_and(|v| !v.is_null());
-        if has_url || stamped || row_str(book, "cover_source") == "manual" {
+        if row_str(book, "cover_source") == "manual" {
             continue;
+        }
+        // A book that already has a cover is left as-is.
+        if book.get("cover_url").is_some_and(|v| !v.is_null()) {
+            continue;
+        }
+        // A prior attempt stamped `cover_resolved_at`. Re-resolve ONLY if the book has been edited
+        // SINCE (its `updated_at` moved past the stamp) — a metadata edit that changes the
+        // cover-lookup inputs (new title/author/ISBN, all of which bump `updated_at` via
+        // `enqueue_book`) must retry with the new inputs, mirroring the PWA's create/EDIT
+        // re-resolution. An unchanged stamped book is skipped so the pass never re-hammers Open
+        // Library (SUR-566) — reconcile's own resolve writes `cover_resolved_at == updated_at`, so
+        // it stays skipped until the next real edit.
+        if let Some(resolved_at) = book.get("cover_resolved_at").and_then(Value::as_i64) {
+            let updated_at = book.get("updated_at").and_then(Value::as_i64).unwrap_or(0);
+            if resolved_at >= updated_at {
+                continue;
+            }
         }
 
         let id = row_str(book, "id").to_string();
@@ -1128,6 +1143,77 @@ mod tests {
         let sink = StubSink::new();
         assert_eq!(block(reconcile_covers(&store, &sink)).unwrap(), 0);
         assert_eq!(sink.search_count(), 0);
+    }
+
+    #[test]
+    fn a_stamped_book_not_edited_since_stays_skipped() {
+        let store = Store::open_in_memory().unwrap();
+        // A prior miss stamped it; updated_at == cover_resolved_at (reconcile writes both equal).
+        put(
+            &store,
+            "books",
+            &json!({ "id": "b1", "title": "Ghost",
+            "cover_resolved_at": 100, "created_at": 1, "updated_at": 100, "deleted": false }),
+        );
+        let sink = StubSink::new();
+
+        assert_eq!(block(reconcile_covers(&store, &sink)).unwrap(), 0);
+        assert_eq!(
+            sink.search_count(),
+            0,
+            "unchanged since the stamp — no re-query (SUR-566)"
+        );
+    }
+
+    #[test]
+    fn a_missed_book_edited_after_the_stamp_re_resolves() {
+        let store = Store::open_in_memory().unwrap();
+        // Missed + stamped at t=100, then the user fixed the title (updated_at bumped to 200 by
+        // enqueue_book). cover_url is still null. The later lookup inputs must be retried.
+        put(
+            &store,
+            "books",
+            &json!({ "id": "b1", "title": "Dune",
+            "cover_resolved_at": 100, "created_at": 1, "updated_at": 200, "deleted": false }),
+        );
+        let sink = StubSink::new().with_cover("Dune", hit(Some(42), None));
+
+        assert_eq!(block(reconcile_covers(&store, &sink)).unwrap(), 1);
+        assert_eq!(
+            sink.search_count(),
+            1,
+            "the edit re-opened the book for resolution"
+        );
+        assert_eq!(
+            cover_of(&store, "b1").0,
+            json!("https://covers.openlibrary.org/b/id/42-M.jpg?default=false")
+        );
+        // And it's idempotent again: the resolve wrote updated_at == cover_resolved_at.
+        assert_eq!(block(reconcile_covers(&store, &sink)).unwrap(), 0);
+        assert_eq!(sink.search_count(), 1);
+    }
+
+    #[test]
+    fn a_covered_book_is_left_alone_even_after_an_edit() {
+        let store = Store::open_in_memory().unwrap();
+        // Has a cover; edited after the stamp. We leave covered books as-is (no egress/flicker on a
+        // plain edit) — the reviewer's concern is coverless books, and this one has a cover.
+        put(
+            &store,
+            "books",
+            &json!({ "id": "b1", "title": "Dune", "cover_url": "u",
+            "cover_source": "openlibrary", "cover_resolved_at": 100,
+            "created_at": 1, "updated_at": 200, "deleted": false }),
+        );
+        let sink = StubSink::new().with_cover("Dune", hit(Some(42), None));
+
+        assert_eq!(block(reconcile_covers(&store, &sink)).unwrap(), 0);
+        assert_eq!(sink.search_count(), 0);
+        assert_eq!(
+            cover_of(&store, "b1").0,
+            json!("u"),
+            "existing cover untouched"
+        );
     }
 
     #[test]

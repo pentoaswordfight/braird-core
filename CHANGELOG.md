@@ -18,7 +18,10 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   ISBN — the SUR-566 self-heal). Persists `cover_url` + `cover_source='openlibrary'` +
   `cover_resolved_at` through the outbox (LWW-safe); manual covers are never touched. A miss STAMPS
   `cover_resolved_at` (SUR-566 — so the pass never re-queries the same edition) while a transient
-  outage leaves it unstamped to retry.
+  outage leaves it unstamped to retry. A later metadata edit (new title/author/ISBN via
+  `enqueue_book`) bumps `updated_at` past the stamp, re-opening the book for resolution on the next
+  pass — mirroring the PWA's create/edit re-resolution, so a corrected book is no longer stuck
+  coverless (covered books are left as-is).
 
   **⚠ New egress boundary — the core's first non-Supabase egress.** Introduced behind a dedicated,
   greppable `CoverEgress` trait (kept OFF `PostgrestSink`) so the boundary is explicit for review.
