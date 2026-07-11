@@ -102,6 +102,17 @@ binding-only PRs (`bindings/kotlin`, `bindings/swift`) onto the release row and 
 `naming-reviewer` + `crypto-reviewer`
 (the SUR-778 review caught exactly that).
 
+**Wide-export convention — a `#[uniffi::export]` method that could exceed 8 integer/pointer FFI
+slots takes a single `uniffi::Record`, and `scripts/check-ffi-arg-slots.mjs` (bindings-drift job)
+enforces it (SUR-843).** On arm64 a by-value `RustBuffer` (a lowered `String`/`Option`/`Vec`)
+that spills past x7 is mis-marshalled by JNA's libffi (jna#1259) — invisible to x86-64 CI + the
+desktop `:core-roundtrip` jar. The guard inspects the generated Kotlin externs and fails on any
+`RustBuffer` at slot ≥9 (counting integer/pointer slots only — `f64`/`f32` ride the FP bank), so
+the class fails the build instead of shipping to a device. `naming-reviewer` owns the record's
+name (pair it with the read model, `NoteUpsert`↔`NoteRecord`, `BookUpsert`↔`BookRecord`); it's a
+`crypto-reviewer` note wherever the collapsed method crosses the seal boundary. Fixed cases:
+`enqueue_note` → `NoteUpsert` (SUR-770), `enqueue_book` → `BookUpsert` (SUR-843).
+
 **Test-only seams are a `crypto-reviewer` / `naming-reviewer` BLOCKER if they reach the
 public binding.** `with_raw_mk` (construct-from-raw-hex) and any IV/salt override on
 `wrap_with_prf` live behind the `test-seams` Cargo feature, which is **OFF** for the

@@ -573,8 +573,11 @@ public protocol SyncEngineProtocol : AnyObject {
      * as an explicit JSON `null` (→ SQL NULL locally, → server column NULLed on flush). Only the
      * `?? null` columns are clearable ([`clearable_columns`] — `isbn`/covers here); a column both
      * set and cleared, or a non-clearable name, is rejected and nothing is staged.
+     *
+     * Takes a single [`BookUpsert`] record, not positional args (SUR-843 — arm64 FFI stack-spill fix;
+     * see the [`BookUpsert`] doc). Field semantics are unchanged.
      */
-    func enqueueBook(id: String, title: String, author: String?, isbn: String?, coverUrl: String?, coverSource: String?, coverResolvedAt: Int64?, createdAt: Int64, deleted: Bool, clearNullableFields: [String]) throws 
+    func enqueueBook(draft: BookUpsert) throws 
     
     /**
      * Enqueue a collection upsert (SUR-726). Plaintext metadata only.
@@ -854,19 +857,13 @@ open func counts()throws  -> StoreCounts {
      * as an explicit JSON `null` (→ SQL NULL locally, → server column NULLed on flush). Only the
      * `?? null` columns are clearable ([`clearable_columns`] — `isbn`/covers here); a column both
      * set and cleared, or a non-clearable name, is rejected and nothing is staged.
+     *
+     * Takes a single [`BookUpsert`] record, not positional args (SUR-843 — arm64 FFI stack-spill fix;
+     * see the [`BookUpsert`] doc). Field semantics are unchanged.
      */
-open func enqueueBook(id: String, title: String, author: String?, isbn: String?, coverUrl: String?, coverSource: String?, coverResolvedAt: Int64?, createdAt: Int64, deleted: Bool, clearNullableFields: [String])throws  {try rustCallWithError(FfiConverterTypeSyncError.lift) {
+open func enqueueBook(draft: BookUpsert)throws  {try rustCallWithError(FfiConverterTypeSyncError.lift) {
     uniffi_braird_core_fn_method_syncengine_enqueue_book(self.uniffiClonePointer(),
-        FfiConverterString.lower(id),
-        FfiConverterString.lower(title),
-        FfiConverterOptionString.lower(author),
-        FfiConverterOptionString.lower(isbn),
-        FfiConverterOptionString.lower(coverUrl),
-        FfiConverterOptionString.lower(coverSource),
-        FfiConverterOptionInt64.lower(coverResolvedAt),
-        FfiConverterInt64.lower(createdAt),
-        FfiConverterBool.lower(deleted),
-        FfiConverterSequenceString.lower(clearNullableFields),$0
+        FfiConverterTypeBookUpsert.lower(draft),$0
     )
 }
 }
@@ -1687,6 +1684,151 @@ public func FfiConverterTypeBookRecord_lift(_ buf: RustBuffer) throws -> BookRec
 #endif
 public func FfiConverterTypeBookRecord_lower(_ value: BookRecord) -> RustBuffer {
     return FfiConverterTypeBookRecord.lower(value)
+}
+
+
+/**
+ * A book upsert draft (SUR-843) — the record form of [`SyncEngine::enqueue_book`]'s arguments.
+ *
+ * Collapsed from 10 positional args to a single `uniffi::Record` for the SAME arm64 reason as
+ * [`NoteUpsert`] (SUR-770): the positional signature lowered its trailing `clear_nullable_fields:
+ * Vec<String>` to a by-value `RustBuffer` at FFI slot 11 — past x7, so it spilled onto the stack,
+ * where JNA's bundled libffi mis-marshals struct-by-value args on arm64 (java-native-access/jna#1259).
+ * x86-64 (SysV) tolerated the wide call, so CI + the desktop `:core-roundtrip` jar were blind to it;
+ * iOS (Swift backend, no JNA) was unaffected. A record lowers as a SINGLE `RustBuffer` (3 FFI slots,
+ * all in registers), so nothing spills. This was LATENT — no host called `enqueue_book` on arm64 yet
+ * (book creation is deferred to SUR-819) — but converted now, at the cheapest moment (zero call-sites
+ * to churn). The `scripts/check-ffi-arg-slots.mjs` guard now fails the build on any future wide export.
+ * Field semantics are byte-for-byte the old positional signature (see [`SyncEngine::enqueue_book`]).
+ * Named to pair with the read model [`BookRecord`] — `BookUpsert` in, `BookRecord` out.
+ */
+public struct BookUpsert {
+    public var id: String
+    public var title: String
+    public var author: String?
+    public var isbn: String?
+    public var coverUrl: String?
+    public var coverSource: String?
+    public var coverResolvedAt: Int64?
+    public var createdAt: Int64
+    public var deleted: Bool
+    public var clearNullableFields: [String]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(id: String, title: String, author: String?, isbn: String?, coverUrl: String?, coverSource: String?, coverResolvedAt: Int64?, createdAt: Int64, deleted: Bool, clearNullableFields: [String]) {
+        self.id = id
+        self.title = title
+        self.author = author
+        self.isbn = isbn
+        self.coverUrl = coverUrl
+        self.coverSource = coverSource
+        self.coverResolvedAt = coverResolvedAt
+        self.createdAt = createdAt
+        self.deleted = deleted
+        self.clearNullableFields = clearNullableFields
+    }
+}
+
+
+
+extension BookUpsert: Equatable, Hashable {
+    public static func ==(lhs: BookUpsert, rhs: BookUpsert) -> Bool {
+        if lhs.id != rhs.id {
+            return false
+        }
+        if lhs.title != rhs.title {
+            return false
+        }
+        if lhs.author != rhs.author {
+            return false
+        }
+        if lhs.isbn != rhs.isbn {
+            return false
+        }
+        if lhs.coverUrl != rhs.coverUrl {
+            return false
+        }
+        if lhs.coverSource != rhs.coverSource {
+            return false
+        }
+        if lhs.coverResolvedAt != rhs.coverResolvedAt {
+            return false
+        }
+        if lhs.createdAt != rhs.createdAt {
+            return false
+        }
+        if lhs.deleted != rhs.deleted {
+            return false
+        }
+        if lhs.clearNullableFields != rhs.clearNullableFields {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(id)
+        hasher.combine(title)
+        hasher.combine(author)
+        hasher.combine(isbn)
+        hasher.combine(coverUrl)
+        hasher.combine(coverSource)
+        hasher.combine(coverResolvedAt)
+        hasher.combine(createdAt)
+        hasher.combine(deleted)
+        hasher.combine(clearNullableFields)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeBookUpsert: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> BookUpsert {
+        return
+            try BookUpsert(
+                id: FfiConverterString.read(from: &buf), 
+                title: FfiConverterString.read(from: &buf), 
+                author: FfiConverterOptionString.read(from: &buf), 
+                isbn: FfiConverterOptionString.read(from: &buf), 
+                coverUrl: FfiConverterOptionString.read(from: &buf), 
+                coverSource: FfiConverterOptionString.read(from: &buf), 
+                coverResolvedAt: FfiConverterOptionInt64.read(from: &buf), 
+                createdAt: FfiConverterInt64.read(from: &buf), 
+                deleted: FfiConverterBool.read(from: &buf), 
+                clearNullableFields: FfiConverterSequenceString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: BookUpsert, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.id, into: &buf)
+        FfiConverterString.write(value.title, into: &buf)
+        FfiConverterOptionString.write(value.author, into: &buf)
+        FfiConverterOptionString.write(value.isbn, into: &buf)
+        FfiConverterOptionString.write(value.coverUrl, into: &buf)
+        FfiConverterOptionString.write(value.coverSource, into: &buf)
+        FfiConverterOptionInt64.write(value.coverResolvedAt, into: &buf)
+        FfiConverterInt64.write(value.createdAt, into: &buf)
+        FfiConverterBool.write(value.deleted, into: &buf)
+        FfiConverterSequenceString.write(value.clearNullableFields, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeBookUpsert_lift(_ buf: RustBuffer) throws -> BookUpsert {
+    return try FfiConverterTypeBookUpsert.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeBookUpsert_lower(_ value: BookUpsert) -> RustBuffer {
+    return FfiConverterTypeBookUpsert.lower(value)
 }
 
 
@@ -3327,7 +3469,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_braird_core_checksum_method_syncengine_counts() != 34830) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_braird_core_checksum_method_syncengine_enqueue_book() != 57249) {
+    if (uniffi_braird_core_checksum_method_syncengine_enqueue_book() != 62499) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_enqueue_collection() != 43786) {

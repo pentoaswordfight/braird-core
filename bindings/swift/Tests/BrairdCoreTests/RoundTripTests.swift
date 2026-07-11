@@ -141,10 +141,10 @@ final class RoundTripTests: XCTestCase {
             dbPath: db.path, supabaseUrl: "https://x.supabase.co", anonKey: "anon",
             vault: Vault.generate())
 
-        try engine.enqueueBook(
+        try engine.enqueueBook(draft: BookUpsert(
             id: "b1", title: "Meditations", author: "Aurelius", isbn: nil, coverUrl: nil,
             coverSource: nil, coverResolvedAt: nil, createdAt: 1, deleted: false,
-            clearNullableFields: [])
+            clearNullableFields: []))
         try engine.enqueueNote(draft: NoteUpsert(
             id: "n1", bookId: "b1", plaintext: "the unexamined life is not worth living",
             page: nil, tags: ["philosophy"], source: nil, sourceId: nil, sourceMetaJson: nil,

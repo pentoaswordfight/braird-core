@@ -14,7 +14,7 @@
 #![cfg(not(target_arch = "wasm32"))]
 
 use braird_core::store::Store;
-use braird_core::sync::{NoteUpsert, SyncEngine};
+use braird_core::sync::{BookUpsert, NoteUpsert, SyncEngine};
 use braird_core::Vault;
 use std::sync::Arc;
 
@@ -60,18 +60,18 @@ fn pull_roundtrips_notes_and_books_from_the_server() {
     // ── Device A: write locally + flush to the server (produces enc:v2 ciphertext on the wire) ──
     let (device_a, db_a) = open_device(&env, &user, vault.clone(), "a");
     device_a
-        .enqueue_book(
-            book_id.clone(),
-            "Apology".into(),
-            Some("Plato".into()),
-            None,
-            None,
-            None,
-            None,
-            1_700_000_000_000,
-            false,
-            vec![],
-        )
+        .enqueue_book(BookUpsert {
+            id: book_id.clone(),
+            title: "Apology".into(),
+            author: Some("Plato".into()),
+            isbn: None,
+            cover_url: None,
+            cover_source: None,
+            cover_resolved_at: None,
+            created_at: 1_700_000_000_000,
+            deleted: false,
+            clear_nullable_fields: vec![],
+        })
         .expect("enqueue book");
     device_a
         .enqueue_note(NoteUpsert {
@@ -168,18 +168,18 @@ fn pull_applies_tombstone_and_never_resurrects() {
     // Device A creates a book + note and flushes.
     let (device_a, db_a) = open_device(&env, &user, vault.clone(), "tomb-a");
     device_a
-        .enqueue_book(
-            book_id.clone(),
-            "Book".into(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            1_700_000_000_000,
-            false,
-            vec![],
-        )
+        .enqueue_book(BookUpsert {
+            id: book_id.clone(),
+            title: "Book".into(),
+            author: None,
+            isbn: None,
+            cover_url: None,
+            cover_source: None,
+            cover_resolved_at: None,
+            created_at: 1_700_000_000_000,
+            deleted: false,
+            clear_nullable_fields: vec![],
+        })
         .expect("enqueue book");
     device_a
         .enqueue_note(NoteUpsert {

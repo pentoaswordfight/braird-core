@@ -8,6 +8,17 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ### Added
 
+- **SUR-843 — static guard for the arm64 wide-FFI stack-spill class.**
+  `scripts/check-ffi-arg-slots.mjs` (run in the `bindings-drift` job) inspects the generated
+  Kotlin externs and fails the build on any `#[uniffi::export]` method that lands a by-value
+  `RustBuffer` (a lowered `String`/`Option`/`Vec`) at integer-slot ≥9 — the exact arm64
+  (AAPCS64 + JNA/libffi #1259) defect that x86-64 CI and the desktop `:core-roundtrip` jar are
+  structurally blind to. It counts integer/pointer slots only (`f64`/`f32` ride the FP bank and
+  consume none — why `enqueue_note_signals` is safe), so the fix is to collapse the args into a
+  `uniffi::Record`. Verified it flags the pre-fix `enqueue_book` (`clearNullableFields` at slot
+  11) and nothing else across the whole binding surface. Node/CI tooling only — no crate code.
+  The convention is now written into `CLAUDE.md` + `GATING.md`.
+
 - **SUR-842 — native-parity drift guard.** A new CI surface that fails the build when
   surfc's sync-behavior registry (SUR-845, emitted as `src/sync/sync-surface.json`) grows,
   loses, or re-describes a behavior that this repo hasn't accounted for. `vendored/native-parity/sync-surface.json`
@@ -21,6 +32,16 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   turns the 2026-07-09/10 PWA-parity audit's class-of-gap from audit-caught into CI-enforced.
 
 ### Changed
+
+- **SUR-843 — `enqueue_book` takes a `BookUpsert` record, not 10 positional args (BREAKING
+  binding).** Same arm64 FFI fix as `enqueue_note` → `NoteUpsert` (SUR-770): the positional
+  signature spilled its trailing `clear_nullable_fields: Vec<String>` to a by-value `RustBuffer`
+  at FFI slot 11 — past x7, onto the stack, where JNA's libffi mis-marshals it on arm64. A record
+  lowers as ONE `RustBuffer` (3 slots, all in registers). **Latent, not a shipped crash** — no
+  host called `enqueue_book` on arm64 yet (book creation is deferred to SUR-819); converted now
+  at the cheapest moment (zero call-sites to churn). Field semantics are byte-for-byte the old
+  signature; named to pair with the read model `BookRecord`. Hosts update their call-site when
+  they pin the release that ships this. No crypto constants touched; no store/schema change.
 
 - **SUR-854 — AGP 9.2.1 producer-side compat verified (docs only).** braird-android bumped
   to AGP 9.2.1 (SUR-853); confirmed the pinned braird-core AAR (`v0.4.1`) resolves under it

@@ -6,6 +6,7 @@ import org.json.JSONObject
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Test
+import uniffi.braird_core.BookUpsert
 import uniffi.braird_core.CryptoException
 import uniffi.braird_core.NoteUpsert
 import uniffi.braird_core.SearchDocKind
@@ -162,11 +163,11 @@ class RoundTripTest {
         val db = File.createTempFile("braird-rt", ".sqlite").apply { deleteOnExit() }
         val engine = SyncEngine.open(db.absolutePath, "https://x.supabase.co", "anon", Vault.generate())
 
-        engine.enqueueBook(
+        engine.enqueueBook(BookUpsert(
             id = "b1", title = "Meditations", author = "Aurelius", isbn = null, coverUrl = null,
             coverSource = null, coverResolvedAt = null, createdAt = 1L, deleted = false,
             clearNullableFields = emptyList(),
-        )
+        ))
         engine.enqueueNote(NoteUpsert(
             id = "n1", bookId = "b1", plaintext = "the unexamined life is not worth living",
             page = null, tags = listOf("philosophy"), source = null, sourceId = null,
