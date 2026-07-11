@@ -20,6 +20,17 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   needs `SURFC_READ_PAT`). **Node/CI tooling only — no crate code, no `Cargo.toml` change.** This
   turns the 2026-07-09/10 PWA-parity audit's class-of-gap from audit-caught into CI-enforced.
 
+### Changed
+
+- **SUR-854 — AGP 9.2.1 producer-side compat verified (docs only).** braird-android bumped
+  to AGP 9.2.1 (SUR-853); confirmed the pinned braird-core AAR (`v0.4.1`) resolves under it
+  with no change. The released AAR declares `minAndroidGradlePluginVersion=1.0.0` /
+  `minCompileSdk=1` (module sets no `aarMetadata{}` override), so any AGP ≥ 1.0.0 consumer
+  satisfies it — forward-compat holds. Desktop-jar `:core-roundtrip` is `kotlin("jvm")`, AGP-
+  independent, unaffected. Decision recorded: **leave the AAR-build module on AGP 8.13.0** (no
+  align-at-next-cut). `docs/pinning.md` now carries a *Toolchain & AGP compatibility* section
+  noting the 9.2.1 consumer baseline. No crate code, no artifact change.
+
 ## [0.4.1] - 2026-07-10
 
 Fifth tagged release. Ships the **arm64 `enqueue_note` FFI fix** (SUR-770 — collapsed to a
