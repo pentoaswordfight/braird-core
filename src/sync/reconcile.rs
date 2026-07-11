@@ -353,6 +353,19 @@ fn preserved_custom_idea_id(user_id: &str, name: &str) -> String {
 /// Dedup keys on the STORED `content_tag` alone — the core never decrypts note text here (a
 /// deliberate, safe divergence from the oracle's detect path, which reads text only to *recompute*
 /// a missing tag; the core leaves a tagless note untouched rather than recompute it).
+///
+/// **Accepted residual risk (flagged for `sync-reviewer`):** because this runs pre-decrypt on
+/// stored rows, it has no equivalent to the oracle's `decryptError` gate (`reconcileContentTags`
+/// operates on already-decrypted notes and excludes decrypt-failures from clustering). A row only
+/// ever *has* a `content_tag` because it was encryptable at write time, so the only path to
+/// "tagged but currently undecryptable" is post-write corruption (bit-rot, a key-version bug). If
+/// such a corrupted note shares a `content_tag` with a healthy one, the two are BY DEFINITION the
+/// same content (the tag is `HMAC(normText, bookId)`), so collapsing them loses nothing — EXCEPT
+/// the narrow case where the corrupted note has more tags and is thus picked as survivor, keeping
+/// the unreadable copy over the readable one. This requires post-write corruption AND a surviving
+/// tag AND the corrupted row winning the survivor sort — accepted as sufficiently rare; the core
+/// can't cheaply detect decrypt-failure in the sync layer (no vault/keys here). Revisit if a
+/// decrypt-health signal ever reaches this layer (prefer a decryptable note as survivor).
 fn reconcile_content_dupes(store: &Store) -> Result<usize, String> {
     let notes = store
         .list_live("notes", None, -1, 0)
@@ -483,15 +496,24 @@ fn merge_into_survivor(
 /// Re-point every live `note_links` edge that touches a loser onto the survivor, dropping
 /// self-loops and duplicates. Mirrors the `mergeNotes` edge block: `seen` is seeded with edges that
 /// DON'T touch a loser so a re-pointed edge dedups against one the survivor already owns.
+///
+/// **Determinism (convergence):** when two losers in one cluster each link to the same external
+/// note with the same `relation_type`, both re-point to the SAME key and one must be kept, the
+/// other dropped — and two devices must agree on WHICH, or the fleet's per-row LWW can settle on a
+/// duplicate (both live) or a lost edge (both deleted). The oracle keeps the first in Dexie
+/// primary-key order (`id` ascending); `list_live` returns `created_at DESC, id DESC`, a different
+/// order — so we re-sort by `id` ascending here to keep the SAME edge the PWA (and any other native
+/// device) keeps. Same fix philosophy as the survivor pick's total `id` tiebreak.
 fn repoint_note_links(
     store: &Store,
     sid: &str,
     loser_ids: &BTreeSet<String>,
     now: i64,
 ) -> Result<(), String> {
-    let edges = store
+    let mut edges = store
         .list_live("note_links", None, -1, 0)
         .map_err(|e| format!("list note_links: {e}"))?;
+    edges.sort_by(|a, b| row_str(a, "id").cmp(row_str(b, "id")));
     let edge_key = |from: &str, to: &str, rel: &str| format!("{from}|{to}|{rel}");
 
     let mut seen: HashSet<String> = HashSet::new();
@@ -1207,6 +1229,37 @@ mod tests {
             json!(1),
             "an untouched edge keeps its updated_at (never staged)"
         );
+    }
+
+    #[test]
+    fn two_losers_sharing_a_duplicate_edge_collapse_to_one_deterministically() {
+        let store = Store::open_in_memory().unwrap();
+        // S survives (most tags); L1, L2 are both losers in the same content-tag cluster.
+        put(&store, "notes", &cnote("S", "T", &["a", "b", "c"], 1, None));
+        put(&store, "notes", &cnote("L1", "T", &["a"], 2, None));
+        put(&store, "notes", &cnote("L2", "T", &["a"], 3, None));
+        put(
+            &store,
+            "notes",
+            &json!({ "id": "X", "text": "enc:v2:x", "tags": [],
+            "created_at": 1, "updated_at": 1, "deleted": false }),
+        );
+        // Both losers link to X with the same relation → both re-point to X→S "ref": one must be
+        // kept, one dropped. Insert e2 first so list_live's created_at/id-DESC order would surface
+        // it before e1 — proving the id-ascending re-sort (not raw scan order) decides the keeper.
+        put(&store, "note_links", &edge("e2", "X", "L2", "ref"));
+        put(&store, "note_links", &edge("e1", "X", "L1", "ref"));
+
+        reconcile_content_dupes(&store).unwrap();
+
+        // Exactly one live X→S "ref" edge survives, and it's the lowest-id one (e1) — the SAME edge
+        // the PWA (Dexie id-asc) keeps, so two devices converge instead of leaving a dup or a gap.
+        assert_eq!(live_ids(&store, "note_links"), vec!["e1"]);
+        assert_eq!(
+            store.get_row("note_links", "e1").unwrap().unwrap()["to_note_id"],
+            json!("S")
+        );
+        assert!(is_deleted(&store, "note_links", "e2"));
     }
 
     fn membership(id: &str, note: &str, collection: &str, deleted: bool, created_at: i64) -> Value {
