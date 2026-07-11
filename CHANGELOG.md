@@ -6,6 +6,15 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-07-11
+
+Sixth tagged release. Ships the **arm64 `enqueue_book` FFI fix** (SUR-843 — collapsed to a
+`BookUpsert` record; BREAKING binding, hosts update their call-site when they pin this) plus
+its **static arg-slot guard**, which makes the whole stack-spill class fail x86-64 CI instead
+of only a real arm64 device. Also carries two CI-only guards with no crate or artifact change:
+the **native-parity drift guard** (SUR-842) and the **AGP 9.2.1 producer-side compat**
+verification (SUR-854, docs only). No crypto constants touched; note text / ciphertext unchanged.
+
 ### Added
 
 - **SUR-843 — static guard for the arm64 wide-FFI stack-spill class.**
