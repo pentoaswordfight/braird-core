@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 use base64::Engine;
 use braird_core::store::Store;
-use braird_core::sync::http::PostgrestSink;
+use braird_core::sync::http::{CoverEgress, PostgrestSink};
 use braird_core::sync::{pull, pull_and_reconcile, pull_then_flush, push};
 use serde_json::{json, Value};
 
@@ -83,7 +83,15 @@ impl PostgrestSink for RecordingSink {
         }
         Ok(self.remote.get(table).cloned().unwrap_or_default())
     }
+    // These SUR-736 tests are about the pull/rebase/flush ordering, not covers — disable the
+    // SUR-828 Open Library egress so coverless fixtures don't trigger cover-resolution writes.
+    async fn fetch_app_config(&self, _key: &str) -> Result<Option<Value>, String> {
+        Ok(Some(json!({ "enabled": false })))
+    }
 }
+
+// SUR-828: no cover egress in these tests (the kill-switch above is off); the default no-op is fine.
+impl CoverEgress for RecordingSink {}
 
 fn one(table: &str, rows: Vec<Value>) -> HashMap<String, Vec<Value>> {
     let mut m = HashMap::new();

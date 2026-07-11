@@ -3297,12 +3297,12 @@ public object FfiConverterTypePullSummary: FfiConverterRustBuffer<PullSummary> {
 /**
  * The result of the post-pull reconciliation pass across the FFI (SUR-820): books backfilled by
  * id (a note's `book_id` referenced a book absent locally), notes rehomed to a known
- * offline-merge survivor vs. detached locally-only when no survivor is known, custom ideas
- * created for a note tag orphaned from the current canon, and duplicate notes collapsed by shared
- * `content_tag` (SUR-835). Nested onto [`PullSummary`] (not flattened) — a pull-mechanics count
- * (`pulled`/`merged`) and a reconciliation-outcome count are different concerns. A reconciliation
- * failure never fails the `pull`/`sync` it's attached to (best-effort — see [`reconcile`]); this
- * summary is all-zero in that case.
+ * offline-merge survivor vs. detached locally-only when no survivor is known, and custom ideas
+ * created for a note tag orphaned from the current canon, and book covers resolved via Open
+ * Library for natively-created books (SUR-828). Nested onto [`PullSummary`] (not flattened) — a
+ * pull-mechanics count (`pulled`/`merged`) and a reconciliation-outcome count are different
+ * concerns. A reconciliation failure never fails the `pull`/`sync` it's attached to (best-effort —
+ * see [`reconcile`]); this summary is all-zero in that case.
  */
 data class ReconcileSummary (
     var `booksBackfilled`: kotlin.UInt, 
@@ -3310,6 +3310,7 @@ data class ReconcileSummary (
     var `notesDetached`: kotlin.UInt, 
     var `ideasCreated`: kotlin.UInt, 
     var `dupesCollapsed`: kotlin.UInt
+    var `coversResolved`: kotlin.UInt
 ) {
     
     companion object
@@ -3335,6 +3336,7 @@ public object FfiConverterTypeReconcileSummary: FfiConverterRustBuffer<Reconcile
             FfiConverterUInt.allocationSize(value.`notesDetached`) +
             FfiConverterUInt.allocationSize(value.`ideasCreated`) +
             FfiConverterUInt.allocationSize(value.`dupesCollapsed`)
+            FfiConverterUInt.allocationSize(value.`coversResolved`)
     )
 
     override fun write(value: ReconcileSummary, buf: ByteBuffer) {
@@ -3343,6 +3345,7 @@ public object FfiConverterTypeReconcileSummary: FfiConverterRustBuffer<Reconcile
             FfiConverterUInt.write(value.`notesDetached`, buf)
             FfiConverterUInt.write(value.`ideasCreated`, buf)
             FfiConverterUInt.write(value.`dupesCollapsed`, buf)
+            FfiConverterUInt.write(value.`coversResolved`, buf)
     }
 }
 

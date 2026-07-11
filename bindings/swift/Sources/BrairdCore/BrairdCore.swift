@@ -2451,6 +2451,12 @@ public func FfiConverterTypePullSummary_lower(_ value: PullSummary) -> RustBuffe
  * (`pulled`/`merged`) and a reconciliation-outcome count are different concerns. A reconciliation
  * failure never fails the `pull`/`sync` it's attached to (best-effort — see [`reconcile`]); this
  * summary is all-zero in that case.
+ * offline-merge survivor vs. detached locally-only when no survivor is known, and custom ideas
+ * created for a note tag orphaned from the current canon, and book covers resolved via Open
+ * Library for natively-created books (SUR-828). Nested onto [`PullSummary`] (not flattened) — a
+ * pull-mechanics count (`pulled`/`merged`) and a reconciliation-outcome count are different
+ * concerns. A reconciliation failure never fails the `pull`/`sync` it's attached to (best-effort —
+ * see [`reconcile`]); this summary is all-zero in that case.
  */
 public struct ReconcileSummary {
     public var booksBackfilled: UInt32
@@ -2462,11 +2468,17 @@ public struct ReconcileSummary {
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
     public init(booksBackfilled: UInt32, notesRehomed: UInt32, notesDetached: UInt32, ideasCreated: UInt32, dupesCollapsed: UInt32) {
+    public var coversResolved: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(booksBackfilled: UInt32, notesRehomed: UInt32, notesDetached: UInt32, ideasCreated: UInt32, coversResolved: UInt32) {
         self.booksBackfilled = booksBackfilled
         self.notesRehomed = notesRehomed
         self.notesDetached = notesDetached
         self.ideasCreated = ideasCreated
         self.dupesCollapsed = dupesCollapsed
+        self.coversResolved = coversResolved
     }
 }
 
@@ -2487,6 +2499,7 @@ extension ReconcileSummary: Equatable, Hashable {
             return false
         }
         if lhs.dupesCollapsed != rhs.dupesCollapsed {
+        if lhs.coversResolved != rhs.coversResolved {
             return false
         }
         return true
@@ -2498,6 +2511,7 @@ extension ReconcileSummary: Equatable, Hashable {
         hasher.combine(notesDetached)
         hasher.combine(ideasCreated)
         hasher.combine(dupesCollapsed)
+        hasher.combine(coversResolved)
     }
 }
 
@@ -2514,6 +2528,7 @@ public struct FfiConverterTypeReconcileSummary: FfiConverterRustBuffer {
                 notesDetached: FfiConverterUInt32.read(from: &buf), 
                 ideasCreated: FfiConverterUInt32.read(from: &buf), 
                 dupesCollapsed: FfiConverterUInt32.read(from: &buf)
+                coversResolved: FfiConverterUInt32.read(from: &buf)
         )
     }
 
@@ -2523,6 +2538,7 @@ public struct FfiConverterTypeReconcileSummary: FfiConverterRustBuffer {
         FfiConverterUInt32.write(value.notesDetached, into: &buf)
         FfiConverterUInt32.write(value.ideasCreated, into: &buf)
         FfiConverterUInt32.write(value.dupesCollapsed, into: &buf)
+        FfiConverterUInt32.write(value.coversResolved, into: &buf)
     }
 }
 
