@@ -57,7 +57,7 @@ jobs:
         if: steps.guard.outputs.ready == 'true'
         run: |
           git clone --depth 1 \
-            "https://x-access-token:${{ secrets.SURFC_READ_PAT }}@github.com/pentoaswordfight/surfc.git" \
+            "https://x-access-token:${{ secrets.SURFC_READ_PAT }}@github.com/braird/surfc.git" \
             /tmp/surfc
           # Install the pinned supabase CLI (surfc's package.json devDependency) — same
           # rate-limit-safe approach as surfc's db-test.yml (no setup-cli GitHub API calls).

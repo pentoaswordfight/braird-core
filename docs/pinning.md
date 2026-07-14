@@ -108,7 +108,7 @@ let package = Package(
         // The xcframework, pinned by URL + checksum. checksum = the SHA256SUMS.txt entry for the zip.
         .binaryTarget(
             name: "braird_coreFFI",
-            url: "https://github.com/pentoaswordfight/braird-core/releases/download/\(brairdCoreTag)/braird-core-0.1.0.xcframework.zip",
+            url: "https://github.com/braird/braird-core/releases/download/\(brairdCoreTag)/braird-core-0.1.0.xcframework.zip",
             checksum: "…64 hex chars from SHA256SUMS.txt…"
         ),
         // The wrapper source, fetched from the release + checksum-verified before vendoring into

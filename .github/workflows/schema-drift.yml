@@ -63,7 +63,7 @@ jobs:
         if: steps.guard.outputs.ready == 'true'
         run: |
           git clone --depth 1 \
-            "https://x-access-token:${{ secrets.SURFC_READ_PAT }}@github.com/pentoaswordfight/surfc.git" \
+            "https://x-access-token:${{ secrets.SURFC_READ_PAT }}@github.com/braird/surfc.git" \
             /tmp/surfc
 
       - name: Assert sync-schema.json has not drifted from surfc/main
