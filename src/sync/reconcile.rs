@@ -1098,11 +1098,12 @@ pub fn merge_books(
     // returned token can never half-undo:
     //   • missing / already soft-deleted (a completed-merge retry) — skipped entirely; its redirect
     //     stays recorded (step 1) so a later pull still converges;
-    //   • a RESUMED merge — a live loser ALREADY in the prior map, i.e. a crashed earlier attempt
-    //     already recorded it and may have rehomed SOME OR ALL of its notes (we can't tell which). We
-    //     complete it — rehome whatever notes are still live, then tombstone — but leave it
-    //     un-undoable: the full set of reassignments is unrecoverable, so an undo could only move
-    //     back the suffix THIS retry saw and would strand the crash-moved notes on the survivor.
+    //   • a RESUMED merge — a live loser with ANY prior mapping (to this survivor OR a different one
+    //     a crashed earlier attempt chose), meaning some of its notes may already have moved
+    //     elsewhere (we can't tell which, or where). We complete it — rehome whatever notes are still
+    //     live, then tombstone — but leave it un-undoable: the full set of reassignments is
+    //     unrecoverable, so an undo could only move back the suffix THIS retry saw and would strand
+    //     the earlier-moved notes.
     // Every loser we tombstone goes in `to_tombstone`; only faithfully-undoable ones (and their note
     // reassignments) go in `undo.loser_ids` / `undo.reassignments`. ──
     let mut to_tombstone: Vec<String> = Vec::new();
@@ -1116,9 +1117,10 @@ pub fn merge_books(
         };
         earliest = earliest.min(row_i64(&loser, "created_at"));
 
-        // A loser already in the PRIOR map is a resumed merge: complete it, but it can't be undone
-        // (partial prior progress means the reassignments aren't fully knowable here).
-        let resumed = prior_map.get(lid).map(String::as_str) == Some(survivor_id);
+        // ANY prior mapping for this loser marks a resumed merge — a crashed earlier attempt (to
+        // THIS survivor or a different one) may have already moved some of its notes. Complete it,
+        // but it can't be undone: the full reassignment set isn't knowable here.
+        let resumed = prior_map.contains_key(lid);
 
         let notes = store
             .list_live("notes", Some(("book_id", lid)), -1, 0)
@@ -2933,6 +2935,37 @@ mod tests {
         assert!(is_deleted(&store, "books", "l1"));
         assert_eq!(book_id_of(&store, "n1").as_deref(), Some("s"));
         assert_eq!(book_id_of(&store, "n2").as_deref(), Some("s"));
+    }
+
+    #[test]
+    fn resumed_merge_into_a_different_survivor_is_also_not_undoable() {
+        // A crashed attempt mapped l1→old and moved n1 to `old`. The user retries into a DIFFERENT
+        // survivor `new`, with n2 still under l1. The retry completes (n2→new, tombstone l1) but must
+        // be non-undoable: `resumed` keyed on the survivor id alone would miss this (l1 maps to `old`,
+        // not `new`) and undo would restore only n2, stranding n1 under `old`.
+        let store = Store::open_in_memory().unwrap();
+        put(&store, "books", &book_at("old", 10));
+        put(&store, "books", &book_at("new", 20));
+        put(&store, "books", &book_at("l1", 50));
+        put(&store, "notes", &note("n1", Some("old"), &["a"], 1)); // moved by the crashed attempt
+        put(&store, "notes", &note("n2", Some("l1"), &["b"], 2)); // still on the loser
+        save_merged_book_ids(&store, &BTreeMap::from([("l1".into(), "old".into())])).unwrap();
+
+        let undo = merge_books(&store, "new", &["l1".into()]).unwrap();
+        assert!(
+            is_deleted(&store, "books", "l1"),
+            "retry completes the tombstone"
+        );
+        assert_eq!(
+            book_id_of(&store, "n2").as_deref(),
+            Some("new"),
+            "remaining note rehomed to the new survivor"
+        );
+        assert!(
+            undo.loser_ids.is_empty(),
+            "any prior mapping (even to a different survivor) → not undoable"
+        );
+        assert!(undo.reassignments.is_empty());
     }
 
     #[test]
