@@ -6,6 +6,23 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+## [0.4.4] - 2026-07-14
+
+Eighth tagged release. Completes the `reconcile-content-tags` native-parity behavior: SUR-884 adds
+the content-tag **self-heal** half — re-derive a null/empty `content_tag` from a note's decrypted
+text so a note tag-nulled by a rehome/detach (SUR-820) is re-tagged and clustered on the next pull
+WITHOUT a user edit — the counterpart to SUR-835's collapse half. It's the one reconcile pass that
+holds keys (a bounded crossing of the key-less sync layer, following the `sync::read` decrypt-on-read
+precedent), and the healed tag is persisted **local-only** (`Store::apply_row`, no `updated_at`
+bump), so it can't clobber a concurrent edit under `notes`' whole-row LWW; convergence rides the
+dedup pass's propagated loser soft-delete. **No FFI/bindings change** — `reconcile()` and the
+`pull_then_flush`/`pull_and_reconcile` free functions gain a `&Vault` param, but no
+`#[uniffi::export]` signature or record changes and `ReconcileSummary` is unchanged, so this ships as
+a pure core-pin bump with no host code change. No crypto constants or ciphertext touched. Flips the
+native-parity manifest row `reconcile-content-tags` `waived` → `core` (both halves now land).
+Delivery: the `chore(core): pin braird-core v0.4.4` bump in braird-ios + braird-android
+(`docs/pinning.md`).
+
 ### Added
 
 - **SUR-884 — content-tag self-heal (the second half of `reconcileContentTags`).** A new pass,
