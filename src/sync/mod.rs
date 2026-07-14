@@ -824,9 +824,9 @@ impl SyncEngine {
     }
 
     /// Reverse a `merge_books` within the host's undo window (SUR-915). Idempotent.
-    pub fn undo_book_merge(&self, undo: BookMergeUndo) -> Result<(), SyncError> {
+    pub fn unmerge_books(&self, undo: BookMergeUndo) -> Result<(), SyncError> {
         let store = lock!(self.store);
-        reconcile::undo_book_merge(&store, &undo).map_err(SyncError::Store)
+        reconcile::unmerge_books(&store, &undo).map_err(SyncError::Store)
     }
 
     /// Manual/user-selected content-duplicate merge into an explicit `survivor_id` (SUR-915). When

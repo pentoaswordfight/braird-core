@@ -883,7 +883,7 @@ internal interface UniffiLib : Library {
     ): Unit
     fun uniffi_braird_core_fn_method_syncengine_sync(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
-    fun uniffi_braird_core_fn_method_syncengine_undo_book_merge(`ptr`: Pointer,`undo`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    fun uniffi_braird_core_fn_method_syncengine_unmerge_books(`ptr`: Pointer,`undo`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     fun uniffi_braird_core_fn_method_syncengine_untagged_notes(`ptr`: Pointer,`limit`: Int,`offset`: Int,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
@@ -1087,7 +1087,7 @@ internal interface UniffiLib : Library {
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_sync(
     ): Short
-    fun uniffi_braird_core_checksum_method_syncengine_undo_book_merge(
+    fun uniffi_braird_core_checksum_method_syncengine_unmerge_books(
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_untagged_notes(
     ): Short
@@ -1220,7 +1220,7 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_braird_core_checksum_method_syncengine_sync() != 38790.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_braird_core_checksum_method_syncengine_undo_book_merge() != 44467.toShort()) {
+    if (lib.uniffi_braird_core_checksum_method_syncengine_unmerge_books() != 15809.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_untagged_notes() != 63818.toShort()) {
@@ -1920,7 +1920,7 @@ public interface SyncEngineInterface {
     /**
      * Reverse a `merge_books` within the host's undo window (SUR-915). Idempotent.
      */
-    fun `undoBookMerge`(`undo`: BookMergeUndo)
+    fun `unmergeBooks`(`undo`: BookMergeUndo)
     
     /**
      * Live notes with NO idea tags, newest-first, decrypted in core (SUR-858) — BulkDiscovery's
@@ -2555,11 +2555,11 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
     /**
      * Reverse a `merge_books` within the host's undo window (SUR-915). Idempotent.
      */
-    @Throws(SyncException::class)override fun `undoBookMerge`(`undo`: BookMergeUndo)
+    @Throws(SyncException::class)override fun `unmergeBooks`(`undo`: BookMergeUndo)
         = 
     callWithPointer {
     uniffiRustCallWithError(SyncException) { _status ->
-    UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_undo_book_merge(
+    UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_unmerge_books(
         it, FfiConverterTypeBookMergeUndo.lower(`undo`),_status)
 }
     }
@@ -3116,7 +3116,7 @@ public object FfiConverterTypeVault: FfiConverter<Vault, Pointer> {
 
 
 /**
- * The ephemeral undo token [`merge_books`] returns and [`undo_book_merge`] consumes — the exact
+ * The ephemeral undo token [`merge_books`] returns and [`unmerge_books`] consumes — the exact
  * inverse state the PWA captures in `mergeBooks`' `undo` object. The host holds it for its
  * 10-second undo window; core does NOT persist it, so an app restart mid-window forfeits undo (the
  * timer is host UX — core guarantees only the operation).
@@ -3533,7 +3533,7 @@ public object FfiConverterTypeLensRecord: FfiConverterRustBuffer<LensRecord> {
 
 
 /**
- * One note's pre-merge home, for [`undo_book_merge`] — mirrors a PWA `undo.reassignments` entry
+ * One note's pre-merge home, for [`unmerge_books`] — mirrors a PWA `undo.reassignments` entry
  * (`{noteId, fromBookId}`). `prior_book_id` is nullable to round-trip the column faithfully,
  * though a rehomed note always had a (loser) book.
  */

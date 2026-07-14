@@ -301,7 +301,7 @@ fn load_merged_book_ids(store: &Store) -> Result<BTreeMap<String, String>, Strin
 }
 
 /// Persist the device-local `mergedBookIds` survivor map (the write side [`merge_books`] adds and
-/// [`undo_book_merge`] prunes; `reconcile_stranded_notes` reads it). `BTreeMap` so the serialized
+/// [`unmerge_books`] prunes; `reconcile_stranded_notes` reads it). `BTreeMap` so the serialized
 /// JSON is key-ordered and stable across writes.
 fn save_merged_book_ids(store: &Store, map: &BTreeMap<String, String>) -> Result<(), String> {
     let json = serde_json::to_string(map).map_err(|e| format!("serialize merged book ids: {e}"))?;
@@ -968,13 +968,13 @@ fn cover_url_from_cover_id(cover_i: i64) -> String {
 
 // ── SUR-915: duplicate-resolution merge verbs ────────────────────────────────
 // The host-invoked merge contract both native consumers (SUR-863 iOS / SUR-877 Android) build
-// against. `merge_books` + `undo_book_merge` are the byte-mirror of the PWA's `mergeBooks` /
+// against. `merge_books` + `unmerge_books` are the byte-mirror of the PWA's `mergeBooks` /
 // `unmergeBooks` (`surfc/src/db.js`); `merge_content_duplicates` is a checked, explicit-survivor
 // wrapper over the existing `merge_into_survivor` (the automatic-dedup content merge). All three
 // are KEY-FREE store-level patches — no vault, no re-seal — so a moved note's `content_tag` is
 // nulled for the existing self-heal to re-derive, never recomputed here.
 
-/// One note's pre-merge home, for [`undo_book_merge`] — mirrors a PWA `undo.reassignments` entry
+/// One note's pre-merge home, for [`unmerge_books`] — mirrors a PWA `undo.reassignments` entry
 /// (`{noteId, fromBookId}`). `prior_book_id` is nullable to round-trip the column faithfully,
 /// though a rehomed note always had a (loser) book.
 #[derive(Debug, Clone, uniffi::Record)]
@@ -983,7 +983,7 @@ pub struct NoteBookAssignment {
     pub prior_book_id: Option<String>,
 }
 
-/// The ephemeral undo token [`merge_books`] returns and [`undo_book_merge`] consumes — the exact
+/// The ephemeral undo token [`merge_books`] returns and [`unmerge_books`] consumes — the exact
 /// inverse state the PWA captures in `mergeBooks`' `undo` object. The host holds it for its
 /// 10-second undo window; core does NOT persist it, so an app restart mid-window forfeits undo (the
 /// timer is host UX — core guarantees only the operation).
@@ -1140,7 +1140,7 @@ pub fn merge_books(
 /// (`content_tag` nulled to re-derive), each loser book is un-tombstoned, the survivor's prior
 /// `created_at` is restored, and ONLY the `mergedBookIds` entries still pointing at THIS merge's
 /// survivor are removed (a later merge into the same survivor keeps its own entries). Idempotent.
-pub fn undo_book_merge(store: &Store, undo: &BookMergeUndo) -> Result<(), String> {
+pub fn unmerge_books(store: &Store, undo: &BookMergeUndo) -> Result<(), String> {
     if undo.loser_ids.is_empty() {
         return Ok(());
     }
@@ -1157,7 +1157,7 @@ pub fn undo_book_merge(store: &Store, undo: &BookMergeUndo) -> Result<(), String
         patch.insert("updated_at".into(), json!(now));
         store
             .stage_local_write("notes", &r.note_id, patch, now)
-            .map_err(|e| format!("undo_book_merge: restore note {}: {e}", r.note_id))?;
+            .map_err(|e| format!("unmerge_books: restore note {}: {e}", r.note_id))?;
     }
 
     for lid in &undo.loser_ids {
@@ -1167,7 +1167,7 @@ pub fn undo_book_merge(store: &Store, undo: &BookMergeUndo) -> Result<(), String
         patch.insert("updated_at".into(), json!(now));
         store
             .stage_local_write("books", lid, patch, now)
-            .map_err(|e| format!("undo_book_merge: un-tombstone loser {lid}: {e}"))?;
+            .map_err(|e| format!("unmerge_books: un-tombstone loser {lid}: {e}"))?;
     }
 
     let mut sp = Map::new();
@@ -1178,7 +1178,7 @@ pub fn undo_book_merge(store: &Store, undo: &BookMergeUndo) -> Result<(), String
     sp.insert("updated_at".into(), json!(now));
     store
         .stage_local_write("books", &undo.survivor_id, sp, now)
-        .map_err(|e| format!("undo_book_merge: restore survivor created_at: {e}"))?;
+        .map_err(|e| format!("unmerge_books: restore survivor created_at: {e}"))?;
 
     // Prune only redirects still pointing at THIS survivor.
     let mut map = load_merged_book_ids(store)?;
@@ -2670,7 +2670,7 @@ mod tests {
         assert_eq!(second, 2);
     }
 
-    // ── SUR-915: merge_books / undo_book_merge / merge_content_duplicates ─────
+    // ── SUR-915: merge_books / unmerge_books / merge_content_duplicates ─────
 
     fn book_at(id: &str, created_at: i64) -> Value {
         json!({ "id": id, "title": "T", "created_at": created_at, "updated_at": created_at, "deleted": false })
@@ -2848,7 +2848,7 @@ mod tests {
     }
 
     #[test]
-    fn undo_book_merge_restores_state_and_prunes_only_matching_redirects() {
+    fn unmerge_books_restores_state_and_prunes_only_matching_redirects() {
         let store = Store::open_in_memory().unwrap();
         put(&store, "books", &book_at("s", 100));
         put(&store, "books", &book_at("l1", 50));
@@ -2857,7 +2857,7 @@ mod tests {
         save_merged_book_ids(&store, &BTreeMap::from([("other".into(), "z".into())])).unwrap();
 
         let undo = merge_books(&store, "s", &["l1".into()]).unwrap();
-        undo_book_merge(&store, &undo).unwrap();
+        unmerge_books(&store, &undo).unwrap();
 
         assert_eq!(
             book_id_of(&store, "n1").as_deref(),
@@ -2880,15 +2880,15 @@ mod tests {
     }
 
     #[test]
-    fn undo_book_merge_is_idempotent() {
+    fn unmerge_books_is_idempotent() {
         let store = Store::open_in_memory().unwrap();
         put(&store, "books", &book_at("s", 100));
         put(&store, "books", &book_at("l1", 50));
         put(&store, "notes", &note("n1", Some("l1"), &["a"], 1));
 
         let undo = merge_books(&store, "s", &["l1".into()]).unwrap();
-        undo_book_merge(&store, &undo).unwrap();
-        undo_book_merge(&store, &undo).unwrap(); // second call: no panic, state unchanged.
+        unmerge_books(&store, &undo).unwrap();
+        unmerge_books(&store, &undo).unwrap(); // second call: no panic, state unchanged.
 
         assert_eq!(book_id_of(&store, "n1").as_deref(), Some("l1"));
         assert!(!is_deleted(&store, "books", "l1"));

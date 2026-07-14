@@ -49,7 +49,7 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
     transaction): redirects recorded FIRST (an interrupted merge still converges), then notes rehomed,
     then losers tombstoned LAST — only after every rehome staged (fail-fast via `?`). A completed-merge
     re-run is a no-op. Returns the `BookMergeUndo` token for the host's 10-second window.
-  - `undo_book_merge(undo)` — the inverse: restore each note's prior book, un-tombstone the losers,
+  - `unmerge_books(undo)` — the inverse: restore each note's prior book, un-tombstone the losers,
     restore the survivor's prior `created_at`, and prune ONLY the redirects still pointing at this
     merge's survivor. Idempotent. The token is ephemeral (not persisted) — the 10s window is host UX.
   - `merge_content_duplicates(survivor_id, loser_ids, allow_cross_cluster) -> u32` — a checked,

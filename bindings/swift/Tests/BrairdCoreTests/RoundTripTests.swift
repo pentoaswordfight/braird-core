@@ -322,7 +322,7 @@ final class RoundTripTests: XCTestCase {
         XCTAssertTrue(undo.reassignments.allSatisfy { $0.priorBookId == "l1" })
 
         // undo restores the merge.
-        try engine.undoBookMerge(undo: undo)
+        try engine.unmergeBooks(undo: undo)
         XCTAssertEqual(try engine.listNotes(bookId: "l1", limit: 50, offset: 0).map { $0.id }, ["n1"])
         XCTAssertEqual(try engine.getBook(id: "s")?.createdAt, 100)
         XCTAssertEqual(try engine.getBook(id: "l1")?.title, "T-l1")

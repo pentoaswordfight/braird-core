@@ -798,7 +798,7 @@ public protocol SyncEngineProtocol : AnyObject {
     /**
      * Reverse a `merge_books` within the host's undo window (SUR-915). Idempotent.
      */
-    func undoBookMerge(undo: BookMergeUndo) throws 
+    func unmergeBooks(undo: BookMergeUndo) throws 
     
     /**
      * Live notes with NO idea tags, newest-first, decrypted in core (SUR-858) — BulkDiscovery's
@@ -1321,8 +1321,8 @@ open func sync()throws  -> SyncSummary {
     /**
      * Reverse a `merge_books` within the host's undo window (SUR-915). Idempotent.
      */
-open func undoBookMerge(undo: BookMergeUndo)throws  {try rustCallWithError(FfiConverterTypeSyncError.lift) {
-    uniffi_braird_core_fn_method_syncengine_undo_book_merge(self.uniffiClonePointer(),
+open func unmergeBooks(undo: BookMergeUndo)throws  {try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_braird_core_fn_method_syncengine_unmerge_books(self.uniffiClonePointer(),
         FfiConverterTypeBookMergeUndo.lower(undo),$0
     )
 }
@@ -1718,7 +1718,7 @@ public func FfiConverterTypeVault_lower(_ value: Vault) -> UnsafeMutableRawPoint
 
 
 /**
- * The ephemeral undo token [`merge_books`] returns and [`undo_book_merge`] consumes — the exact
+ * The ephemeral undo token [`merge_books`] returns and [`unmerge_books`] consumes — the exact
  * inverse state the PWA captures in `mergeBooks`' `undo` object. The host holds it for its
  * 10-second undo window; core does NOT persist it, so an app restart mid-window forfeits undo (the
  * timer is host UX — core guarantees only the operation).
@@ -2519,7 +2519,7 @@ public func FfiConverterTypeLensRecord_lower(_ value: LensRecord) -> RustBuffer 
 
 
 /**
- * One note's pre-merge home, for [`undo_book_merge`] — mirrors a PWA `undo.reassignments` entry
+ * One note's pre-merge home, for [`unmerge_books`] — mirrors a PWA `undo.reassignments` entry
  * (`{noteId, fromBookId}`). `prior_book_id` is nullable to round-trip the column faithfully,
  * though a rehomed note always had a (loser) book.
  */
@@ -4265,7 +4265,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_braird_core_checksum_method_syncengine_sync() != 38790) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_braird_core_checksum_method_syncengine_undo_book_merge() != 44467) {
+    if (uniffi_braird_core_checksum_method_syncengine_unmerge_books() != 15809) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_untagged_notes() != 63818) {

@@ -116,7 +116,7 @@ class SelfContainedRoundTripTest {
         assertEquals(null, engine.getBook("l1"))
         assertEquals(50L, engine.getBook("s")?.createdAt)
 
-        engine.undoBookMerge(undo)
+        engine.unmergeBooks(undo)
         assertEquals(listOf("n1"), engine.listNotes("l1", 50u, 0u).map { it.id })
         assertEquals(100L, engine.getBook("s")?.createdAt)
     }

@@ -350,7 +350,7 @@ class RoundTripTest {
         assertEquals(true, undo.reassignments.all { it.priorBookId == "l1" })
 
         // ── undo restores the merge (both notes go back to l1; id-desc tiebreak on equal createdAt).
-        engine.undoBookMerge(undo)
+        engine.unmergeBooks(undo)
         assertEquals(listOf("n2", "n1"), engine.listNotes("l1", 50u, 0u).map { it.id })
         assertEquals(100L, engine.getBook("s")?.createdAt)
         assertEquals("T-l1", engine.getBook("l1")?.title, "loser un-tombstoned")
