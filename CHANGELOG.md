@@ -6,6 +6,21 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-14
+
+Ninth tagged release. Two native-platformization surfaces land over the FFI, batched into one cut:
+**SUR-858** — the Phase 2b "organise" read API (notes-by-idea, per-idea counts, collections + lenses
+lists, the untagged queue), and **SUR-915** — the duplicate-resolution merge contract
+(`merge_books` + `unmerge_books` with an ephemeral undo token, `merge_content_duplicates`, and the
+device-local `mergedBookIds` write that feeds the existing stranded-note convergence). All reads are
+decrypt-in-core (plaintext-only across the FFI); all merge verbs are key-free store-level patches.
+New `uniffi::Record` types (`IdeaCount`, `CollectionRecord`, `LensRecord`, `BookMergeUndo`,
+`NoteBookAssignment`); Swift + Kotlin bindings regenerated; every verb clears the SUR-843 arm64
+arg-slot guard. Also repoints the surfc-clone CI + the pinning doc at the `braird` org. Delivery: the
+`chore(core): pin braird-core v0.5.0` bump in braird-ios + braird-android (`docs/pinning.md`). Full
+always-to-survivor convergence of book-merge stragglers a device never saw is deferred to SUR-916
+(PWA-parity residual).
+
 ### Added
 
 - **SUR-858 — organise reads over the FFI (Phase 2b read-API extension #2).** Six additive,
