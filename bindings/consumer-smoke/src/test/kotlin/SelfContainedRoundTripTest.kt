@@ -52,4 +52,39 @@ class SelfContainedRoundTripTest {
         assertEquals("surfaced this week", engine.recentNote(now, 0uL)?.text)
         assertEquals(1u, engine.counts().activeIdeas)
     }
+
+    /**
+     * SUR-858 AC #3: the desktop-jar round-trip covers the organise reads — notes-by-idea, the
+     * per-idea tally, the untagged queue, and the collections/lenses lists — jar-only, exercising
+     * decrypt-in-core end-to-end (enqueueNote seals; notesByIdea/untaggedNotes decrypt).
+     */
+    @Test
+    fun organiseReadsFromJarOnly() {
+        val db = File.createTempFile("braird-org", ".sqlite").apply { deleteOnExit() }
+        val engine = SyncEngine.open(db.absolutePath, "https://x.supabase.co", "anon", Vault.generate())
+        engine.enqueueNote(NoteUpsert(
+            id = "n1", bookId = null, plaintext = "the unexamined life", page = null,
+            tags = listOf("philosophy"), source = null, sourceId = null, sourceMetaJson = null,
+            chapter = null, imagePath = null, inkCropPath = null, createdAt = 10L,
+            deleted = false, clearNullableFields = emptyList(),
+        ))
+        engine.enqueueNote(NoteUpsert(
+            id = "loose", bookId = null, plaintext = "untagged thought", page = null,
+            tags = emptyList(), source = null, sourceId = null, sourceMetaJson = null,
+            chapter = null, imagePath = null, inkCropPath = null, createdAt = 20L,
+            deleted = false, clearNullableFields = emptyList(),
+        ))
+        engine.enqueueCollection(id = "c1", name = "Reading list", createdAt = 5L, deleted = false)
+        engine.enqueueLens(
+            id = "l1", name = "Stoic core", leafIds = listOf("philosophy"), combinator = "AND",
+            threshold = 100L, createdAt = 6L, deleted = false,
+        )
+
+        assertEquals("the unexamined life", engine.notesByIdea("philosophy", 50u, 0u).single().text)
+        assertEquals(listOf("philosophy" to 1u), engine.ideaCounts().map { it.idea to it.count })
+        assertEquals("untagged thought", engine.untaggedNotes(50u, 0u).single().text)
+        assertEquals(1u, engine.untaggedNotesCount())
+        assertEquals(listOf("Reading list"), engine.listCollections(50u, 0u).map { it.name })
+        assertEquals(listOf("Stoic core"), engine.listLenses(50u, 0u).map { it.name })
+    }
 }

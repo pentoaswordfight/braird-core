@@ -228,4 +228,57 @@ final class RoundTripTests: XCTestCase {
         // active_ideas = distinct tags over ALL live notes (window-independent): philosophy, ethics.
         XCTAssertEqual(try engine.counts().activeIdeas, 2)
     }
+
+    /// SUR-858: the organise reads over the FFI — notes-by-idea, per-idea counts, the
+    /// collections/lenses lists, and the untagged work queue. Proves notes decrypt to plaintext
+    /// across the binding (notesByIdea/untaggedNotes), the ideaCounts tally matches the PWA oracle,
+    /// and the two new stores' first read paths map their rows, as an iOS host consumes them.
+    func testOrganiseReadsOverFfi() throws {
+        let db = FileManager.default.temporaryDirectory
+            .appendingPathComponent("braird-org-\(UUID().uuidString).sqlite")
+        let engine = try SyncEngine.open(
+            dbPath: db.path, supabaseUrl: "https://x.supabase.co", anonKey: "anon",
+            vault: Vault.generate())
+
+        try engine.enqueueNote(draft: NoteUpsert(
+            id: "n1", bookId: nil, plaintext: "the unexamined life", page: nil,
+            tags: ["philosophy", "ethics"], source: nil, sourceId: nil, sourceMetaJson: nil,
+            chapter: nil, imagePath: nil, inkCropPath: nil, createdAt: 10, deleted: false,
+            clearNullableFields: []))
+        try engine.enqueueNote(draft: NoteUpsert(
+            id: "n2", bookId: nil, plaintext: "on stoicism", page: nil, tags: ["philosophy"],
+            source: nil, sourceId: nil, sourceMetaJson: nil, chapter: nil, imagePath: nil,
+            inkCropPath: nil, createdAt: 20, deleted: false, clearNullableFields: []))
+        try engine.enqueueNote(draft: NoteUpsert(
+            id: "loose", bookId: nil, plaintext: "untagged thought", page: nil, tags: [],
+            source: nil, sourceId: nil, sourceMetaJson: nil, chapter: nil, imagePath: nil,
+            inkCropPath: nil, createdAt: 30, deleted: false, clearNullableFields: []))
+        try engine.enqueueCollection(id: "c1", name: "Reading list", createdAt: 5, deleted: false)
+        try engine.enqueueLens(
+            id: "l1", name: "Stoic core", leafIds: ["philosophy", "ethics"], combinator: "OR",
+            threshold: 75, createdAt: 6, deleted: false)
+
+        // notes-by-idea: newest-first, decrypted plaintext, never an enc: sentinel.
+        let philosophy = try engine.notesByIdea(idea: "philosophy", limit: 50, offset: 0)
+        XCTAssertEqual(philosophy.map { $0.id }, ["n2", "n1"])
+        XCTAssertEqual(philosophy[0].text, "on stoicism")
+        for n in philosophy { XCTAssertFalse((n.text ?? "").hasPrefix("enc:v")) }
+
+        // idea_counts: per-occurrence tally, idea-asc, present-tags-only.
+        let counts = try engine.ideaCounts().map { [$0.idea: $0.count] }
+        XCTAssertEqual(counts, [["ethics": 1], ["philosophy": 2]])
+
+        // untagged queue + badge count.
+        XCTAssertEqual(try engine.untaggedNotes(limit: 50, offset: 0).map { $0.id }, ["loose"])
+        XCTAssertEqual(try engine.untaggedNotes(limit: 50, offset: 0)[0].text, "untagged thought")
+        XCTAssertEqual(try engine.untaggedNotesCount(), 1)
+
+        // collections + lenses first read paths.
+        XCTAssertEqual(try engine.listCollections(limit: 50, offset: 0).map { $0.name }, ["Reading list"])
+        let lens = try engine.listLenses(limit: 50, offset: 0)[0]
+        XCTAssertEqual(lens.name, "Stoic core")
+        XCTAssertEqual(lens.leafIds, ["philosophy", "ethics"])
+        XCTAssertEqual(lens.combinator, "OR")
+        XCTAssertEqual(lens.threshold, 75)
+    }
 }

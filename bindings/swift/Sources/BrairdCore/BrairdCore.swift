@@ -677,9 +677,20 @@ public protocol SyncEngineProtocol : AnyObject {
     func getNote(id: String) throws  -> NoteRecord?
     
     /**
+     * Per-idea live-note counts (SUR-858) — the tree's counts, `{idea, count}` sorted by idea name,
+     * only for tags on ≥1 live note (the client overlays these onto its generated canon structure).
+     */
+    func ideaCounts() throws  -> [IdeaCount]
+    
+    /**
      * Books for the Library / Sources grid, newest-first, each with its live `note_count`.
      */
     func listBooks(limit: UInt32, offset: UInt32) throws  -> [BookRecord]
+    
+    /**
+     * Collections for the Lexicon list (SUR-858), newest-first. Bare metadata rows, no crypto.
+     */
+    func listCollections(limit: UInt32, offset: UInt32) throws  -> [CollectionRecord]
     
     /**
      * Custom ideas for the AddIdeaSheet "Your Ideas" section, newest-first.
@@ -687,10 +698,22 @@ public protocol SyncEngineProtocol : AnyObject {
     func listCustomIdeas(limit: UInt32, offset: UInt32) throws  -> [CustomIdeaRecord]
     
     /**
+     * Lenses (authored saved-queries) for the Lexicon list (SUR-858), newest-first. No crypto.
+     */
+    func listLenses(limit: UInt32, offset: UInt32) throws  -> [LensRecord]
+    
+    /**
      * Notes newest-first. `book_id = None` → the Commonplace flat list (all notes); `Some` →
      * that book's notes. `text` is decrypted plaintext, or `None` with `decrypt_failed = true`.
      */
     func listNotes(bookId: String?, limit: UInt32, offset: UInt32) throws  -> [NoteRecord]
+    
+    /**
+     * Live notes carrying `idea` as an idea tag, newest-first, decrypted in core (SUR-858) — the
+     * Commonplace idea filter / IdeaDetail / RelatedNotes. `idea` is the raw tag string (== a
+     * `CustomIdeaRecord.name`, == an `IdeaCount.idea`); the match is exact.
+     */
+    func notesByIdea(idea: String, limit: UInt32, offset: UInt32) throws  -> [NoteRecord]
     
     /**
      * Home "this week" count (SUR-806) — live notes created within the last 7 days whose decrypted
@@ -757,6 +780,17 @@ public protocol SyncEngineProtocol : AnyObject {
      * SERVER row before this pull could see it is the server's job, PR-3.)
      */
     func sync() throws  -> SyncSummary
+    
+    /**
+     * Live notes with NO idea tags, newest-first, decrypted in core (SUR-858) — BulkDiscovery's
+     * work queue.
+     */
+    func untaggedNotes(limit: UInt32, offset: UInt32) throws  -> [NoteRecord]
+    
+    /**
+     * Count of the whole untagged-notes queue (SUR-858) — BulkDiscovery's badge. No decryption.
+     */
+    func untaggedNotesCount() throws  -> UInt32
     
 }
 
@@ -1048,11 +1082,34 @@ open func getNote(id: String)throws  -> NoteRecord? {
 }
     
     /**
+     * Per-idea live-note counts (SUR-858) — the tree's counts, `{idea, count}` sorted by idea name,
+     * only for tags on ≥1 live note (the client overlays these onto its generated canon structure).
+     */
+open func ideaCounts()throws  -> [IdeaCount] {
+    return try  FfiConverterSequenceTypeIdeaCount.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_braird_core_fn_method_syncengine_idea_counts(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
      * Books for the Library / Sources grid, newest-first, each with its live `note_count`.
      */
 open func listBooks(limit: UInt32, offset: UInt32)throws  -> [BookRecord] {
     return try  FfiConverterSequenceTypeBookRecord.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
     uniffi_braird_core_fn_method_syncengine_list_books(self.uniffiClonePointer(),
+        FfiConverterUInt32.lower(limit),
+        FfiConverterUInt32.lower(offset),$0
+    )
+})
+}
+    
+    /**
+     * Collections for the Lexicon list (SUR-858), newest-first. Bare metadata rows, no crypto.
+     */
+open func listCollections(limit: UInt32, offset: UInt32)throws  -> [CollectionRecord] {
+    return try  FfiConverterSequenceTypeCollectionRecord.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_braird_core_fn_method_syncengine_list_collections(self.uniffiClonePointer(),
         FfiConverterUInt32.lower(limit),
         FfiConverterUInt32.lower(offset),$0
     )
@@ -1072,6 +1129,18 @@ open func listCustomIdeas(limit: UInt32, offset: UInt32)throws  -> [CustomIdeaRe
 }
     
     /**
+     * Lenses (authored saved-queries) for the Lexicon list (SUR-858), newest-first. No crypto.
+     */
+open func listLenses(limit: UInt32, offset: UInt32)throws  -> [LensRecord] {
+    return try  FfiConverterSequenceTypeLensRecord.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_braird_core_fn_method_syncengine_list_lenses(self.uniffiClonePointer(),
+        FfiConverterUInt32.lower(limit),
+        FfiConverterUInt32.lower(offset),$0
+    )
+})
+}
+    
+    /**
      * Notes newest-first. `book_id = None` → the Commonplace flat list (all notes); `Some` →
      * that book's notes. `text` is decrypted plaintext, or `None` with `decrypt_failed = true`.
      */
@@ -1079,6 +1148,21 @@ open func listNotes(bookId: String?, limit: UInt32, offset: UInt32)throws  -> [N
     return try  FfiConverterSequenceTypeNoteRecord.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
     uniffi_braird_core_fn_method_syncengine_list_notes(self.uniffiClonePointer(),
         FfiConverterOptionString.lower(bookId),
+        FfiConverterUInt32.lower(limit),
+        FfiConverterUInt32.lower(offset),$0
+    )
+})
+}
+    
+    /**
+     * Live notes carrying `idea` as an idea tag, newest-first, decrypted in core (SUR-858) — the
+     * Commonplace idea filter / IdeaDetail / RelatedNotes. `idea` is the raw tag string (== a
+     * `CustomIdeaRecord.name`, == an `IdeaCount.idea`); the match is exact.
+     */
+open func notesByIdea(idea: String, limit: UInt32, offset: UInt32)throws  -> [NoteRecord] {
+    return try  FfiConverterSequenceTypeNoteRecord.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_braird_core_fn_method_syncengine_notes_by_idea(self.uniffiClonePointer(),
+        FfiConverterString.lower(idea),
         FfiConverterUInt32.lower(limit),
         FfiConverterUInt32.lower(offset),$0
     )
@@ -1182,6 +1266,29 @@ open func setAccessToken(jwt: String) {try! rustCall() {
 open func sync()throws  -> SyncSummary {
     return try  FfiConverterTypeSyncSummary.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
     uniffi_braird_core_fn_method_syncengine_sync(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * Live notes with NO idea tags, newest-first, decrypted in core (SUR-858) — BulkDiscovery's
+     * work queue.
+     */
+open func untaggedNotes(limit: UInt32, offset: UInt32)throws  -> [NoteRecord] {
+    return try  FfiConverterSequenceTypeNoteRecord.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_braird_core_fn_method_syncengine_untagged_notes(self.uniffiClonePointer(),
+        FfiConverterUInt32.lower(limit),
+        FfiConverterUInt32.lower(offset),$0
+    )
+})
+}
+    
+    /**
+     * Count of the whole untagged-notes queue (SUR-858) — BulkDiscovery's badge. No decryption.
+     */
+open func untaggedNotesCount()throws  -> UInt32 {
+    return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_braird_core_fn_method_syncengine_untagged_notes_count(self.uniffiClonePointer(),$0
     )
 })
 }
@@ -1833,6 +1940,93 @@ public func FfiConverterTypeBookUpsert_lower(_ value: BookUpsert) -> RustBuffer 
 
 
 /**
+ * A collection for the Lexicon list (SUR-858). A **bare** descriptor row — no membership count
+ * (the consuming screen doesn't render one yet; add it only when it does). No crypto: every column
+ * is plaintext metadata.
+ */
+public struct CollectionRecord {
+    public var id: String
+    public var name: String?
+    public var createdAt: Int64
+    public var updatedAt: Int64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(id: String, name: String?, createdAt: Int64, updatedAt: Int64) {
+        self.id = id
+        self.name = name
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+    }
+}
+
+
+
+extension CollectionRecord: Equatable, Hashable {
+    public static func ==(lhs: CollectionRecord, rhs: CollectionRecord) -> Bool {
+        if lhs.id != rhs.id {
+            return false
+        }
+        if lhs.name != rhs.name {
+            return false
+        }
+        if lhs.createdAt != rhs.createdAt {
+            return false
+        }
+        if lhs.updatedAt != rhs.updatedAt {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(id)
+        hasher.combine(name)
+        hasher.combine(createdAt)
+        hasher.combine(updatedAt)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCollectionRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CollectionRecord {
+        return
+            try CollectionRecord(
+                id: FfiConverterString.read(from: &buf), 
+                name: FfiConverterOptionString.read(from: &buf), 
+                createdAt: FfiConverterInt64.read(from: &buf), 
+                updatedAt: FfiConverterInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CollectionRecord, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.id, into: &buf)
+        FfiConverterOptionString.write(value.name, into: &buf)
+        FfiConverterInt64.write(value.createdAt, into: &buf)
+        FfiConverterInt64.write(value.updatedAt, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCollectionRecord_lift(_ buf: RustBuffer) throws -> CollectionRecord {
+    return try FfiConverterTypeCollectionRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCollectionRecord_lower(_ value: CollectionRecord) -> RustBuffer {
+    return FfiConverterTypeCollectionRecord.lower(value)
+}
+
+
+/**
  * A custom idea for the AddIdeaSheet "Your Ideas" section.
  */
 public struct CustomIdeaRecord {
@@ -1991,6 +2185,190 @@ public func FfiConverterTypeFlushSummary_lift(_ buf: RustBuffer) throws -> Flush
 #endif
 public func FfiConverterTypeFlushSummary_lower(_ value: FlushSummary) -> RustBuffer {
     return FfiConverterTypeFlushSummary.lower(value)
+}
+
+
+/**
+ * One row of the per-idea tally (SUR-858): a distinct idea tag and the number of live notes that
+ * carry it. The Commonplace tree / Lexicon overlays these onto the client-generated **canon
+ * structure** (which stays a host constant), so only tags actually present on ≥1 live note appear
+ * here (`count ≥ 1`). Tags are plaintext, so building this never decrypts.
+ */
+public struct IdeaCount {
+    public var idea: String
+    public var count: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(idea: String, count: UInt32) {
+        self.idea = idea
+        self.count = count
+    }
+}
+
+
+
+extension IdeaCount: Equatable, Hashable {
+    public static func ==(lhs: IdeaCount, rhs: IdeaCount) -> Bool {
+        if lhs.idea != rhs.idea {
+            return false
+        }
+        if lhs.count != rhs.count {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(idea)
+        hasher.combine(count)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeIdeaCount: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> IdeaCount {
+        return
+            try IdeaCount(
+                idea: FfiConverterString.read(from: &buf), 
+                count: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: IdeaCount, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.idea, into: &buf)
+        FfiConverterUInt32.write(value.count, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeIdeaCount_lift(_ buf: RustBuffer) throws -> IdeaCount {
+    return try FfiConverterTypeIdeaCount.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeIdeaCount_lower(_ value: IdeaCount) -> RustBuffer {
+    return FfiConverterTypeIdeaCount.lower(value)
+}
+
+
+/**
+ * A lens — one authored saved-query — for the Lexicon list (SUR-858). `leaf_ids` is the query's
+ * leaf set (SUR-737 whole-row LWW: a lens is ONE authored query, so no leaf union). `combinator` /
+ * `threshold` are the query's combine rule; both are always written by `enqueue_lens` (defaults
+ * `AND` / `100`) but read defensively as `Option`. No crypto: plaintext metadata.
+ */
+public struct LensRecord {
+    public var id: String
+    public var name: String?
+    public var leafIds: [String]
+    public var combinator: String?
+    public var threshold: Int64?
+    public var createdAt: Int64
+    public var updatedAt: Int64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(id: String, name: String?, leafIds: [String], combinator: String?, threshold: Int64?, createdAt: Int64, updatedAt: Int64) {
+        self.id = id
+        self.name = name
+        self.leafIds = leafIds
+        self.combinator = combinator
+        self.threshold = threshold
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+    }
+}
+
+
+
+extension LensRecord: Equatable, Hashable {
+    public static func ==(lhs: LensRecord, rhs: LensRecord) -> Bool {
+        if lhs.id != rhs.id {
+            return false
+        }
+        if lhs.name != rhs.name {
+            return false
+        }
+        if lhs.leafIds != rhs.leafIds {
+            return false
+        }
+        if lhs.combinator != rhs.combinator {
+            return false
+        }
+        if lhs.threshold != rhs.threshold {
+            return false
+        }
+        if lhs.createdAt != rhs.createdAt {
+            return false
+        }
+        if lhs.updatedAt != rhs.updatedAt {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(id)
+        hasher.combine(name)
+        hasher.combine(leafIds)
+        hasher.combine(combinator)
+        hasher.combine(threshold)
+        hasher.combine(createdAt)
+        hasher.combine(updatedAt)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeLensRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> LensRecord {
+        return
+            try LensRecord(
+                id: FfiConverterString.read(from: &buf), 
+                name: FfiConverterOptionString.read(from: &buf), 
+                leafIds: FfiConverterSequenceString.read(from: &buf), 
+                combinator: FfiConverterOptionString.read(from: &buf), 
+                threshold: FfiConverterOptionInt64.read(from: &buf), 
+                createdAt: FfiConverterInt64.read(from: &buf), 
+                updatedAt: FfiConverterInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: LensRecord, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.id, into: &buf)
+        FfiConverterOptionString.write(value.name, into: &buf)
+        FfiConverterSequenceString.write(value.leafIds, into: &buf)
+        FfiConverterOptionString.write(value.combinator, into: &buf)
+        FfiConverterOptionInt64.write(value.threshold, into: &buf)
+        FfiConverterInt64.write(value.createdAt, into: &buf)
+        FfiConverterInt64.write(value.updatedAt, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLensRecord_lift(_ buf: RustBuffer) throws -> LensRecord {
+    return try FfiConverterTypeLensRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLensRecord_lower(_ value: LensRecord) -> RustBuffer {
+    return FfiConverterTypeLensRecord.lower(value)
 }
 
 
@@ -3335,6 +3713,31 @@ fileprivate struct FfiConverterSequenceTypeBookRecord: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeCollectionRecord: FfiConverterRustBuffer {
+    typealias SwiftType = [CollectionRecord]
+
+    public static func write(_ value: [CollectionRecord], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeCollectionRecord.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [CollectionRecord] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [CollectionRecord]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeCollectionRecord.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeCustomIdeaRecord: FfiConverterRustBuffer {
     typealias SwiftType = [CustomIdeaRecord]
 
@@ -3352,6 +3755,56 @@ fileprivate struct FfiConverterSequenceTypeCustomIdeaRecord: FfiConverterRustBuf
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeCustomIdeaRecord.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeIdeaCount: FfiConverterRustBuffer {
+    typealias SwiftType = [IdeaCount]
+
+    public static func write(_ value: [IdeaCount], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeIdeaCount.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [IdeaCount] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [IdeaCount]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeIdeaCount.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeLensRecord: FfiConverterRustBuffer {
+    typealias SwiftType = [LensRecord]
+
+    public static func write(_ value: [LensRecord], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeLensRecord.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [LensRecord] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [LensRecord]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeLensRecord.read(from: &buf))
         }
         return seq
     }
@@ -3525,13 +3978,25 @@ private var initializationResult: InitializationResult = {
     if (uniffi_braird_core_checksum_method_syncengine_get_note() != 41812) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_braird_core_checksum_method_syncengine_idea_counts() != 10262) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_braird_core_checksum_method_syncengine_list_books() != 22597) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_braird_core_checksum_method_syncengine_list_collections() != 50990) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_list_custom_ideas() != 63630) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_braird_core_checksum_method_syncengine_list_lenses() != 34774) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_braird_core_checksum_method_syncengine_list_notes() != 26133) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_braird_core_checksum_method_syncengine_notes_by_idea() != 21049) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_notes_this_week() != 50990) {
@@ -3550,6 +4015,12 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_sync() != 38790) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_braird_core_checksum_method_syncengine_untagged_notes() != 63818) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_braird_core_checksum_method_syncengine_untagged_notes_count() != 26700) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_vault_content_tag() != 23104) {

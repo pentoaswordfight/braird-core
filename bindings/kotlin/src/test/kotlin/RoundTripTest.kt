@@ -253,4 +253,63 @@ class RoundTripTest {
         // active_ideas = distinct tags over ALL live notes (window-independent): philosophy, ethics.
         assertEquals(2u, engine.counts().activeIdeas)
     }
+
+    /** SUR-858: the organise reads over the FFI — notes-by-idea, per-idea counts, the
+     * collections/lenses lists, and the untagged work queue. Proves notes decrypt to plaintext
+     * across the binding (notesByIdea/untaggedNotes), the ideaCounts tally matches the PWA oracle,
+     * and the two new stores' first read paths map their rows, as an Android host consumes them. */
+    @Test
+    fun organiseReadsOverFfi() {
+        val db = File.createTempFile("braird-org", ".sqlite").apply { deleteOnExit() }
+        val engine = SyncEngine.open(db.absolutePath, "https://x.supabase.co", "anon", Vault.generate())
+
+        engine.enqueueNote(NoteUpsert(
+            id = "n1", bookId = null, plaintext = "the unexamined life", page = null,
+            tags = listOf("philosophy", "ethics"), source = null, sourceId = null,
+            sourceMetaJson = null, chapter = null, imagePath = null, inkCropPath = null,
+            createdAt = 10L, deleted = false, clearNullableFields = emptyList(),
+        ))
+        engine.enqueueNote(NoteUpsert(
+            id = "n2", bookId = null, plaintext = "on stoicism", page = null,
+            tags = listOf("philosophy"), source = null, sourceId = null, sourceMetaJson = null,
+            chapter = null, imagePath = null, inkCropPath = null, createdAt = 20L, deleted = false,
+            clearNullableFields = emptyList(),
+        ))
+        engine.enqueueNote(NoteUpsert(
+            id = "loose", bookId = null, plaintext = "untagged thought", page = null,
+            tags = emptyList(), source = null, sourceId = null, sourceMetaJson = null,
+            chapter = null, imagePath = null, inkCropPath = null, createdAt = 30L, deleted = false,
+            clearNullableFields = emptyList(),
+        ))
+        engine.enqueueCollection(id = "c1", name = "Reading list", createdAt = 5L, deleted = false)
+        engine.enqueueLens(
+            id = "l1", name = "Stoic core", leafIds = listOf("philosophy", "ethics"),
+            combinator = "OR", threshold = 75L, createdAt = 6L, deleted = false,
+        )
+
+        // notes-by-idea: newest-first, decrypted plaintext, never an enc: sentinel.
+        val philosophy = engine.notesByIdea("philosophy", 50u, 0u)
+        assertEquals(listOf("n2", "n1"), philosophy.map { it.id })
+        assertEquals("on stoicism", philosophy[0].text)
+        for (n in philosophy) assertEquals(false, n.text?.startsWith("enc:v") ?: false)
+
+        // idea_counts: per-occurrence tally, idea-asc, present-tags-only.
+        assertEquals(
+            listOf("ethics" to 1u, "philosophy" to 2u),
+            engine.ideaCounts().map { it.idea to it.count },
+        )
+
+        // untagged queue + badge count.
+        assertEquals(listOf("loose"), engine.untaggedNotes(50u, 0u).map { it.id })
+        assertEquals("untagged thought", engine.untaggedNotes(50u, 0u)[0].text)
+        assertEquals(1u, engine.untaggedNotesCount())
+
+        // collections + lenses first read paths.
+        assertEquals(listOf("Reading list"), engine.listCollections(50u, 0u).map { it.name })
+        val lens = engine.listLenses(50u, 0u).single()
+        assertEquals("Stoic core", lens.name)
+        assertEquals(listOf("philosophy", "ethics"), lens.leafIds)
+        assertEquals("OR", lens.combinator)
+        assertEquals(75L, lens.threshold)
+    }
 }

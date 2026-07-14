@@ -34,7 +34,9 @@ use crate::search::SearchHit;
 use crate::store::{synced_table_names, Store};
 use crate::vault::Vault;
 use http::{user_id_from_jwt, PostgrestClient};
-use read::{BookRecord, CustomIdeaRecord, NoteRecord, StoreCounts};
+use read::{
+    BookRecord, CollectionRecord, CustomIdeaRecord, IdeaCount, LensRecord, NoteRecord, StoreCounts,
+};
 
 /// Errors that cross the FFI from the sync engine. Coarse like [`crate::CryptoError`]: enough
 /// for a host to distinguish "couldn't open the store" from "the flush hit the network", never
@@ -747,6 +749,61 @@ impl SyncEngine {
         let store = lock!(self.store);
         let docs = read::build_search_docs(&store, &self.vault).map_err(store_err)?;
         Ok(crate::search::search(&docs, &query, limit as usize))
+    }
+
+    // ── organise reads (SUR-858) ─────────────────────────────────────────────
+    // Extension #2 of the read surface (after SUR-744/806) for the native browse/organise
+    // screens: notes-by-idea, per-idea counts, the collections/lenses lists, and the untagged
+    // work queue. Same decrypt-in-core + soft-delete-excluding + newest-first contract.
+
+    /// Live notes carrying `idea` as an idea tag, newest-first, decrypted in core (SUR-858) — the
+    /// Commonplace idea filter / IdeaDetail / RelatedNotes. `idea` is the raw tag string (== a
+    /// `CustomIdeaRecord.name`, == an `IdeaCount.idea`); the match is exact.
+    pub fn notes_by_idea(
+        &self,
+        idea: String,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<NoteRecord>, SyncError> {
+        let store = lock!(self.store);
+        read::notes_by_idea(&store, &self.vault, &idea, limit as i64, offset as i64)
+            .map_err(store_err)
+    }
+
+    /// Per-idea live-note counts (SUR-858) — the tree's counts, `{idea, count}` sorted by idea name,
+    /// only for tags on ≥1 live note (the client overlays these onto its generated canon structure).
+    pub fn idea_counts(&self) -> Result<Vec<IdeaCount>, SyncError> {
+        let store = lock!(self.store);
+        read::idea_counts(&store).map_err(store_err)
+    }
+
+    /// Collections for the Lexicon list (SUR-858), newest-first. Bare metadata rows, no crypto.
+    pub fn list_collections(
+        &self,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<CollectionRecord>, SyncError> {
+        let store = lock!(self.store);
+        read::list_collections(&store, limit as i64, offset as i64).map_err(store_err)
+    }
+
+    /// Lenses (authored saved-queries) for the Lexicon list (SUR-858), newest-first. No crypto.
+    pub fn list_lenses(&self, limit: u32, offset: u32) -> Result<Vec<LensRecord>, SyncError> {
+        let store = lock!(self.store);
+        read::list_lenses(&store, limit as i64, offset as i64).map_err(store_err)
+    }
+
+    /// Live notes with NO idea tags, newest-first, decrypted in core (SUR-858) — BulkDiscovery's
+    /// work queue.
+    pub fn untagged_notes(&self, limit: u32, offset: u32) -> Result<Vec<NoteRecord>, SyncError> {
+        let store = lock!(self.store);
+        read::untagged_notes(&store, &self.vault, limit as i64, offset as i64).map_err(store_err)
+    }
+
+    /// Count of the whole untagged-notes queue (SUR-858) — BulkDiscovery's badge. No decryption.
+    pub fn untagged_notes_count(&self) -> Result<u32, SyncError> {
+        let store = lock!(self.store);
+        read::untagged_notes_count(&store).map_err(store_err)
     }
 }
 

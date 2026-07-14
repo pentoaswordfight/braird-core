@@ -13,7 +13,7 @@
 //! 2. **Plaintext never reaches disk.** Decryption happens per-read into the returned DTO / the
 //!    in-memory `SearchDoc`; nothing is written back to the store (ADR 0003 preserved).
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use serde_json::{Map, Value};
 
@@ -88,6 +88,42 @@ pub struct StoreCounts {
     pub active_ideas: u32,
 }
 
+/// One row of the per-idea tally (SUR-858): a distinct idea tag and the number of live notes that
+/// carry it. The Commonplace tree / Lexicon overlays these onto the client-generated **canon
+/// structure** (which stays a host constant), so only tags actually present on ≥1 live note appear
+/// here (`count ≥ 1`). Tags are plaintext, so building this never decrypts.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct IdeaCount {
+    pub idea: String,
+    pub count: u32,
+}
+
+/// A collection for the Lexicon list (SUR-858). A **bare** descriptor row — no membership count
+/// (the consuming screen doesn't render one yet; add it only when it does). No crypto: every column
+/// is plaintext metadata.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct CollectionRecord {
+    pub id: String,
+    pub name: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// A lens — one authored saved-query — for the Lexicon list (SUR-858). `leaf_ids` is the query's
+/// leaf set (SUR-737 whole-row LWW: a lens is ONE authored query, so no leaf union). `combinator` /
+/// `threshold` are the query's combine rule; both are always written by `enqueue_lens` (defaults
+/// `AND` / `100`) but read defensively as `Option`. No crypto: plaintext metadata.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct LensRecord {
+    pub id: String,
+    pub name: Option<String>,
+    pub leaf_ids: Vec<String>,
+    pub combinator: Option<String>,
+    pub threshold: Option<i64>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
 // ── store reads → DTOs ───────────────────────────────────────────────────────
 
 /// Library grid page: books newest-first, each with its live note count. N+1 counts, one per
@@ -132,6 +168,61 @@ pub fn get_note(store: &Store, vault: &Vault, id: &str) -> rusqlite::Result<Opti
     }
 }
 
+/// Live notes carrying `idea` as an idea tag, newest-first, decrypted in core (SUR-858) — the
+/// Commonplace idea filter / IdeaDetail / RelatedNotes. `idea` is the raw tag string as stored in
+/// `notes.tags` (== a [`CustomIdeaRecord`]'s `name`, == an [`IdeaCount`] key); the match is
+/// **exact**, so a tag the client got from [`idea_counts`] round-trips straight back here without
+/// any tag↔id resolution (the internal `cidea_…` id is never in `tags`, and this read never sees
+/// it). `tags` is a JSON array, so the store's scalar filter can't push this into SQL —
+/// **scan-then-filter**, filtering on the plaintext `tags` column BEFORE decrypting so only the
+/// page's notes pay the decrypt cost. ponytail: full scan; a tag index only if note counts ever
+/// make it matter.
+pub fn notes_by_idea(
+    store: &Store,
+    vault: &Vault,
+    idea: &str,
+    limit: i64,
+    offset: i64,
+) -> rusqlite::Result<Vec<NoteRecord>> {
+    Ok(store
+        .list_live("notes", None, -1, 0)?
+        .into_iter()
+        .filter(|row| string_array_field(row, "tags").iter().any(|t| t == idea))
+        .skip(offset.max(0) as usize)
+        .take(page_take(limit))
+        .map(|row| note_record(&row, vault))
+        .collect())
+}
+
+/// Live notes with NO idea tags, newest-first, decrypted in core (SUR-858) — BulkDiscovery's work
+/// queue. Same scan-then-filter / window-before-decrypt shape as [`notes_by_idea`]. ponytail: full
+/// scan; a "has no tags" index only if it ever matters.
+pub fn untagged_notes(
+    store: &Store,
+    vault: &Vault,
+    limit: i64,
+    offset: i64,
+) -> rusqlite::Result<Vec<NoteRecord>> {
+    Ok(store
+        .list_live("notes", None, -1, 0)?
+        .into_iter()
+        .filter(|row| string_array_field(row, "tags").is_empty())
+        .skip(offset.max(0) as usize)
+        .take(page_take(limit))
+        .map(|row| note_record(&row, vault))
+        .collect())
+}
+
+/// Count of the whole [`untagged_notes`] set (SUR-858) — BulkDiscovery's queue badge. Tags are
+/// plaintext, so this counts without decrypting (and ignores pagination — it's the full queue size).
+pub fn untagged_notes_count(store: &Store) -> rusqlite::Result<u32> {
+    Ok(store
+        .list_live("notes", None, -1, 0)?
+        .iter()
+        .filter(|row| string_array_field(row, "tags").is_empty())
+        .count() as u32)
+}
+
 pub fn list_custom_ideas(
     store: &Store,
     limit: i64,
@@ -144,6 +235,31 @@ pub fn list_custom_ideas(
         .collect())
 }
 
+/// Collections for the Lexicon list (SUR-858), newest-first — the `collections` store's first read
+/// path (it had a write path since SUR-726, no read). Scalar metadata, no crypto, so this is a
+/// straight `list_live` map like [`list_custom_ideas`].
+pub fn list_collections(
+    store: &Store,
+    limit: i64,
+    offset: i64,
+) -> rusqlite::Result<Vec<CollectionRecord>> {
+    Ok(store
+        .list_live("collections", None, limit, offset)?
+        .iter()
+        .map(collection_record)
+        .collect())
+}
+
+/// Lenses (authored saved-queries) for the Lexicon list (SUR-858), newest-first — the `lenses`
+/// store's first read path. Plaintext metadata, no crypto.
+pub fn list_lenses(store: &Store, limit: i64, offset: i64) -> rusqlite::Result<Vec<LensRecord>> {
+    Ok(store
+        .list_live("lenses", None, limit, offset)?
+        .iter()
+        .map(lens_record)
+        .collect())
+}
+
 pub fn counts(store: &Store) -> rusqlite::Result<StoreCounts> {
     Ok(StoreCounts {
         books: store.count_live("books", None)? as u32,
@@ -153,18 +269,41 @@ pub fn counts(store: &Store) -> rusqlite::Result<StoreCounts> {
     })
 }
 
-/// Distinct idea tags across all live notes — the PWA Home's `activeIdeasCount`. The oracle is
-/// `ideaCountsFor(notes)` (a `{tag: count}` tally) filtered to `count > 0`; since a key is only
-/// ever created by an increment, that filter is a no-op, so the result is exactly the count of
-/// distinct tag names appearing on ≥1 live note. Tags are a plaintext `Json` column, so this scans
-/// without touching the `Vault`. ponytail: full `tags` scan; a tag index only if note counts ever
-/// make it matter.
-fn active_ideas(store: &Store) -> rusqlite::Result<u32> {
-    let mut seen: HashSet<String> = HashSet::new();
+/// The `{tag: live-note count}` tally over every live note — the PWA's `ideaCountsFor(notes)`
+/// (`src/lib/scope.js`), byte-for-byte: iterate each note's `tags` and increment, **no within-note
+/// dedup** (a note tagged `["logic","logic"]` contributes 2 to `logic`). The single scan behind both
+/// [`active_ideas`] (its key count) and [`idea_counts`] (the tally itself). Tags are a plaintext
+/// `Json` column, so this never touches the `Vault`. ponytail: full `tags` scan; a tag index only if
+/// note counts ever make it matter.
+fn tag_tally(store: &Store) -> rusqlite::Result<HashMap<String, u32>> {
+    let mut tally: HashMap<String, u32> = HashMap::new();
     for row in store.list_live("notes", None, -1, 0)? {
-        seen.extend(string_array_field(&row, "tags"));
+        for tag in string_array_field(&row, "tags") {
+            *tally.entry(tag).or_insert(0) += 1;
+        }
     }
-    Ok(seen.len() as u32)
+    Ok(tally)
+}
+
+/// Distinct idea tags across all live notes — the PWA Home's `activeIdeasCount`, which is
+/// `Object.entries(ideaCounts).filter(([, c]) => c > 0).length`. A tally key exists only via an
+/// increment, so that filter is a no-op: the answer is exactly the number of distinct tag names on
+/// ≥1 live note — the key count of [`tag_tally`].
+fn active_ideas(store: &Store) -> rusqlite::Result<u32> {
+    Ok(tag_tally(store)?.len() as u32)
+}
+
+/// Per-idea live-note counts (SUR-858) — the PWA's `ideaCountsFor` tally as a list, sorted by idea
+/// name **ascending** for a stable order across reads. Present-tags-only (every entry has
+/// `count ≥ 1`): a canon idea on no live note is absent, because the client overlays these onto its
+/// own generated canon structure. No decryption (tags are plaintext).
+pub fn idea_counts(store: &Store) -> rusqlite::Result<Vec<IdeaCount>> {
+    let mut out: Vec<IdeaCount> = tag_tally(store)?
+        .into_iter()
+        .map(|(idea, count)| IdeaCount { idea, count })
+        .collect();
+    out.sort_by(|a, b| a.idea.cmp(&b.idea));
+    Ok(out)
 }
 
 /// The PWA Home "this week" set (`App.jsx` `useMemo`): live notes created within the last
@@ -312,6 +451,38 @@ fn custom_idea_record(row: &Map<String, Value>) -> CustomIdeaRecord {
         description: string_field(row, "description"),
         created_at: int_field(row, "created_at"),
         updated_at: int_field(row, "updated_at"),
+    }
+}
+
+fn collection_record(row: &Map<String, Value>) -> CollectionRecord {
+    CollectionRecord {
+        id: string_field(row, "id").unwrap_or_default(),
+        name: string_field(row, "name"),
+        created_at: int_field(row, "created_at"),
+        updated_at: int_field(row, "updated_at"),
+    }
+}
+
+fn lens_record(row: &Map<String, Value>) -> LensRecord {
+    LensRecord {
+        id: string_field(row, "id").unwrap_or_default(),
+        name: string_field(row, "name"),
+        leaf_ids: string_array_field(row, "leaf_ids"),
+        combinator: string_field(row, "combinator"),
+        threshold: opt_int_field(row, "threshold"),
+        created_at: int_field(row, "created_at"),
+        updated_at: int_field(row, "updated_at"),
+    }
+}
+
+/// `take(n)` count for a Rust-side page slice, mirroring [`Store::list_live`]'s convention that a
+/// negative `limit` means "no limit". The FFI reads pass a `u32` (always ≥ 0); this only guards the
+/// internal contract so a `-1` scans the whole filtered set instead of taking none.
+fn page_take(limit: i64) -> usize {
+    if limit < 0 {
+        usize::MAX
+    } else {
+        limit as usize
     }
 }
 
@@ -684,5 +855,238 @@ mod tests {
                 "blank"
             );
         }
+    }
+
+    // ── SUR-858: organise reads ──────────────────────────────────────────────
+
+    #[test]
+    fn notes_by_idea_filters_newest_first_excludes_deleted_and_paginates() {
+        let store = Store::open_in_memory().unwrap();
+        let vault = Vault::generate();
+        let seal = |id: &str| seal(&vault, id, "t");
+        // three live "philosophy" notes + one other-tag + one deleted "philosophy".
+        store
+            .apply_row(
+                "notes",
+                &note_row_tagged("p1", &seal("p1"), 100, &["philosophy"]),
+            )
+            .unwrap();
+        store
+            .apply_row(
+                "notes",
+                &note_row_tagged("p2", &seal("p2"), 300, &["philosophy", "ethics"]),
+            )
+            .unwrap();
+        store
+            .apply_row(
+                "notes",
+                &note_row_tagged("p3", &seal("p3"), 200, &["philosophy"]),
+            )
+            .unwrap();
+        store
+            .apply_row(
+                "notes",
+                &note_row_tagged("other", &seal("other"), 400, &["ethics"]),
+            )
+            .unwrap();
+        let mut del = note_row_tagged("pdel", &seal("pdel"), 500, &["philosophy"]);
+        del.insert("deleted".into(), json!(true));
+        store.apply_row("notes", &del).unwrap();
+
+        // newest-first, deleted excluded, only the tag's notes.
+        let all = notes_by_idea(&store, &vault, "philosophy", 50, 0).unwrap();
+        assert_eq!(
+            all.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(),
+            vec!["p2", "p3", "p1"]
+        );
+        // pagination: limit/offset slice the newest-first set.
+        let page = notes_by_idea(&store, &vault, "philosophy", 1, 1).unwrap();
+        assert_eq!(
+            page.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(),
+            vec!["p3"]
+        );
+        // a tag no note carries → empty.
+        assert!(notes_by_idea(&store, &vault, "stoicism", 50, 0)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn notes_by_idea_decrypts_in_core_without_failing_the_page() {
+        // A foreign-sealed matching note surfaces decrypt_failed=true, text=None, but stays in the page.
+        let store = Store::open_in_memory().unwrap();
+        let mine = Vault::generate();
+        let foreign = Vault::generate();
+        store
+            .apply_row(
+                "notes",
+                &note_row_tagged(
+                    "good",
+                    &seal(&mine, "good", "readable"),
+                    200,
+                    &["philosophy"],
+                ),
+            )
+            .unwrap();
+        store
+            .apply_row(
+                "notes",
+                &note_row_tagged("bad", &seal(&foreign, "bad", "nope"), 100, &["philosophy"]),
+            )
+            .unwrap();
+
+        let notes = notes_by_idea(&store, &mine, "philosophy", 50, 0).unwrap();
+        assert_eq!(notes.len(), 2);
+        let good = notes.iter().find(|n| n.id == "good").unwrap();
+        assert_eq!(good.text.as_deref(), Some("readable"));
+        assert!(!good.text.clone().unwrap().starts_with("enc:v"));
+        let bad = notes.iter().find(|n| n.id == "bad").unwrap();
+        assert!(bad.text.is_none());
+        assert!(bad.decrypt_failed);
+    }
+
+    #[test]
+    fn idea_counts_matches_the_pwa_ideacountsfor_tally() {
+        // Byte-match `ideaCountsFor`: increment per tag OCCURRENCE (no within-note dedup), skip
+        // untagged, drop deleted. Sorted idea-asc; keys line up with active_ideas.
+        let store = Store::open_in_memory().unwrap();
+        let vault = Vault::generate();
+        let seal = |id: &str| seal(&vault, id, "t");
+        store
+            .apply_row(
+                "notes",
+                &note_row_tagged("n1", &seal("n1"), 1, &["philosophy", "ethics"]),
+            )
+            .unwrap();
+        store
+            .apply_row(
+                "notes",
+                &note_row_tagged("n2", &seal("n2"), 2, &["ethics", "stoicism"]),
+            )
+            .unwrap();
+        store
+            .apply_row("notes", &note_row_tagged("n3", &seal("n3"), 3, &[]))
+            .unwrap(); // untagged → contributes nothing
+        store
+            .apply_row(
+                "notes",
+                &note_row_tagged("n4", &seal("n4"), 4, &["logic", "logic"]),
+            )
+            .unwrap(); // within-note dup → counts TWICE (oracle parity)
+        let mut del = note_row_tagged("n5", &seal("n5"), 5, &["ghost"]);
+        del.insert("deleted".into(), json!(true));
+        store.apply_row("notes", &del).unwrap(); // deleted → excluded
+
+        let counts = idea_counts(&store).unwrap();
+        let as_pairs: Vec<(&str, u32)> =
+            counts.iter().map(|c| (c.idea.as_str(), c.count)).collect();
+        assert_eq!(
+            as_pairs,
+            vec![
+                ("ethics", 2),
+                ("logic", 2),
+                ("philosophy", 1),
+                ("stoicism", 1)
+            ],
+            "idea-asc order, per-occurrence counts, ghost excluded"
+        );
+        // key count == active_ideas / StoreCounts.active_ideas.
+        assert_eq!(counts.len() as u32, counts_active_ideas(&store));
+    }
+
+    // active_ideas is private; reach it via the public StoreCounts for the cross-check above.
+    fn counts_active_ideas(store: &Store) -> u32 {
+        counts(store).unwrap().active_ideas
+    }
+
+    #[test]
+    fn untagged_notes_and_count_exclude_tagged_and_deleted() {
+        let store = Store::open_in_memory().unwrap();
+        let vault = Vault::generate();
+        let seal = |id: &str| seal(&vault, id, "t");
+        store
+            .apply_row("notes", &note_row_tagged("u1", &seal("u1"), 100, &[]))
+            .unwrap();
+        store
+            .apply_row("notes", &note_row_tagged("u2", &seal("u2"), 300, &[]))
+            .unwrap();
+        store
+            .apply_row(
+                "notes",
+                &note_row_tagged("tagged", &seal("tagged"), 200, &["philosophy"]),
+            )
+            .unwrap();
+        let mut del = note_row_tagged("udel", &seal("udel"), 400, &[]);
+        del.insert("deleted".into(), json!(true));
+        store.apply_row("notes", &del).unwrap();
+
+        // newest-first, only untagged live notes; text decrypted in core.
+        let notes = untagged_notes(&store, &vault, 50, 0).unwrap();
+        assert_eq!(
+            notes.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(),
+            vec!["u2", "u1"]
+        );
+        assert_eq!(notes[0].text.as_deref(), Some("t"));
+        // count is the full untagged set, not a page.
+        assert_eq!(untagged_notes_count(&store).unwrap(), 2);
+        // pagination slices the same order.
+        assert_eq!(
+            untagged_notes(&store, &vault, 1, 1)
+                .unwrap()
+                .iter()
+                .map(|n| n.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["u1"]
+        );
+    }
+
+    #[test]
+    fn list_collections_and_lenses_exclude_deleted_and_map_fields() {
+        let store = Store::open_in_memory().unwrap();
+
+        let mut c1 = Map::new();
+        c1.insert("id".into(), json!("c1"));
+        c1.insert("name".into(), json!("Reading list"));
+        c1.insert("created_at".into(), json!(100));
+        c1.insert("updated_at".into(), json!(150));
+        c1.insert("deleted".into(), json!(false));
+        store.apply_row("collections", &c1).unwrap();
+        let mut cdel = c1.clone();
+        cdel.insert("id".into(), json!("cdel"));
+        cdel.insert("created_at".into(), json!(200));
+        cdel.insert("deleted".into(), json!(true));
+        store.apply_row("collections", &cdel).unwrap();
+
+        let cols = list_collections(&store, 50, 0).unwrap();
+        assert_eq!(
+            cols.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            vec!["c1"]
+        );
+        assert_eq!(cols[0].name.as_deref(), Some("Reading list"));
+        assert_eq!((cols[0].created_at, cols[0].updated_at), (100, 150));
+
+        let mut l1 = Map::new();
+        l1.insert("id".into(), json!("l1"));
+        l1.insert("name".into(), json!("Stoic core"));
+        l1.insert("leaf_ids".into(), json!(["philosophy", "ethics"]));
+        l1.insert("combinator".into(), json!("OR"));
+        l1.insert("threshold".into(), json!(75));
+        l1.insert("created_at".into(), json!(10));
+        l1.insert("updated_at".into(), json!(20));
+        l1.insert("deleted".into(), json!(false));
+        store.apply_row("lenses", &l1).unwrap();
+
+        let lenses = list_lenses(&store, 50, 0).unwrap();
+        assert_eq!(lenses.len(), 1);
+        let l = &lenses[0];
+        assert_eq!(l.name.as_deref(), Some("Stoic core"));
+        assert_eq!(l.leaf_ids, vec!["philosophy", "ethics"]);
+        assert_eq!(l.combinator.as_deref(), Some("OR"));
+        assert_eq!(l.threshold, Some(75));
+
+        // empty stores → empty vecs (no panic).
+        let empty = Store::open_in_memory().unwrap();
+        assert!(list_collections(&empty, 50, 0).unwrap().is_empty());
+        assert!(list_lenses(&empty, 50, 0).unwrap().is_empty());
     }
 }

@@ -6,6 +6,36 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+### Added
+
+- **SUR-858 — organise reads over the FFI (Phase 2b read-API extension #2).** Six additive,
+  decrypt-in-core read methods on `SyncEngine` for the native browse/organise screens (the iOS
+  tree/IdeaDetail/RelatedNotes/BulkDiscovery/Lexicon set + the Android siblings), following the
+  SUR-744/806 read-surface pattern (soft-delete-excluding, newest-first, plaintext-only across the
+  FFI — no `enc:` sentinel):
+  - `notes_by_idea(idea, limit, offset)` — live notes carrying a given idea tag, decrypted in core.
+    `idea` is the raw tag string as stored in `notes.tags` (== a `CustomIdeaRecord.name`, == an
+    `IdeaCount.idea`), matched exactly, so a tag from `idea_counts` round-trips straight back with no
+    tag↔id resolution and the internal `cidea_…` id is never exposed. `tags` is a JSON array, so this
+    scan-then-filters and windows on the plaintext tag column BEFORE decrypting (only the page pays
+    the decrypt cost).
+  - `idea_counts()` — the per-idea live-note tally, byte-matching the PWA's `ideaCountsFor`
+    (`src/lib/scope.js`): increment per tag occurrence, present-tags-only (`count ≥ 1`), sorted by
+    idea name ascending. The Commonplace tree overlays these onto its client-generated canon
+    structure (which stays a host constant). Refactored the shared `tag_tally` scan behind both this
+    and `counts().active_ideas` (its key count) — one scan, one oracle.
+  - `list_collections(limit, offset)` + `list_lenses(limit, offset)` — the first read paths for the
+    `collections` and `lenses` stores (write paths since SUR-726). Bare metadata rows, no crypto;
+    `LensRecord` carries `leaf_ids` / `combinator` / `threshold`.
+  - `untagged_notes(limit, offset)` + `untagged_notes_count()` — notes with no idea tags (the
+    BulkDiscovery work queue + its badge), same decrypt-in-core / scan-then-filter shape.
+  - New `uniffi::Record` types: `IdeaCount`, `CollectionRecord`, `LensRecord`. Swift + Kotlin
+    bindings regenerated via `scripts/gen-bindings.sh`; all six methods are ≤3 FFI args (clear of the
+    SUR-843 arm64 arg-slot guard). Round-trips added in Kotlin + Swift and the desktop-jar
+    consumer-smoke (AC #3). Decrypt-in-core routes through the existing `decrypt_note_text` gate — no
+    second decrypt path, no crypto constants or ciphertext touched. Delivery: cut in the v0.5.0
+    release, then the `chore(core): pin braird-core v0.5.0` bump in braird-ios + braird-android.
+
 ## [0.4.4] - 2026-07-14
 
 Eighth tagged release. Completes the `reconcile-content-tags` native-parity behavior: SUR-884 adds
