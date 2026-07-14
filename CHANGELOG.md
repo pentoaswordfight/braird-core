@@ -53,10 +53,17 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
     device never saw is deferred to **SUR-916** (native equivalent of the PWA's deferred server-side
     merge) — native ships at parity here, not behind the web.
   - `unmerge_books(undo)` — the inverse: restore each note's prior book, un-tombstone the losers,
-    restore the survivor's prior `created_at`, and prune ONLY the redirects still pointing at this
-    merge's survivor. Idempotent. The token is ephemeral (not persisted) — the 10s window is host UX.
-    Un-merging BEFORE the merge's outbox flush drops the loser's pending tombstone first (the outbox
-    collapse makes `deleted` sticky), so the resurrection reaches the server instead of a stale delete.
+    prune ONLY the redirects still pointing at this merge's survivor, and restore the survivor's
+    `created_at` to the **earliest of its pre-merge value and any loser STILL merged into it** (a
+    later merge into the same survivor must not be clobbered when an older merge is undone).
+    Idempotent. The token is ephemeral (not persisted) — the 10s window is host UX. Un-merging BEFORE
+    the merge's outbox flush resurrects the loser atomically (drop pending tombstone + stage
+    `deleted:false` in one transaction; the outbox collapse makes `deleted` sticky).
+  - Undo-token fidelity: `merge_books` never returns an *undoable* token for a loser it didn't
+    faithfully rehome this call — a completed-merge retry (loser already deleted) is skipped, and a
+    resumed partial merge (a crashed attempt already moved the notes) is completed but left
+    un-undoable, so `unmerge_books` on such a token can't resurrect an empty duplicate or strand the
+    already-moved notes.
   - `merge_content_duplicates(survivor_id, loser_ids, allow_cross_cluster) -> u32` — a checked,
     explicit-survivor wrapper over the existing `merge_into_survivor` (union tags, adopt image,
     re-point `note_links` + `collection_memberships`, tombstone loser notes last). The exact path
