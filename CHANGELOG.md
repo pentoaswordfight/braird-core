@@ -74,6 +74,13 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
     Kotlin + Swift + the desktop-jar consumer-smoke. Batched into the v0.5.0 release with SUR-858 (no
     dedicated cut); pins in braird-ios + braird-android follow the tag.
 
+### Changed
+
+- **CI: point the surfc-clone jobs + the pinning doc at the `braird` org** (`pentoaswordfight` →
+  `braird`, after the repo transfer). The five drift/parity/supabase workflows and
+  `docs/pinning.md` now use canonical `braird/*` URLs instead of relying on GitHub's transfer
+  redirect (the rotated `SURFC_READ_PAT` already resolves either way). No crate change.
+
 ## [0.4.4] - 2026-07-14
 
 Eighth tagged release. Completes the `reconcile-content-tags` native-parity behavior: SUR-884 adds

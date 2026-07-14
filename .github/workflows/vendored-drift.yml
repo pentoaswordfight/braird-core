@@ -38,7 +38,7 @@ jobs:
           for f in inputs.json vectors.json; do
             curl -fsSL \
               -H "Authorization: token ${{ secrets.SURFC_READ_PAT }}" \
-              "https://raw.githubusercontent.com/pentoaswordfight/surfc/main/test/fixtures/crypto-parity/${f}" \
+              "https://raw.githubusercontent.com/braird/surfc/main/test/fixtures/crypto-parity/${f}" \
               -o "/tmp/${f}"
           done
 
