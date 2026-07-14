@@ -35,6 +35,37 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
     consumer-smoke (AC #3). Decrypt-in-core routes through the existing `decrypt_note_text` gate — no
     second decrypt path, no crypto constants or ciphertext touched. Delivery: cut in the v0.5.0
     release, then the `chore(core): pin braird-core v0.5.0` bump in braird-ios + braird-android.
+- **SUR-915 — duplicate-resolution merge contract over the FFI.** Three host-invoked merge verbs on
+  `SyncEngine` for the native duplicate-resolution surfaces (iOS SUR-863 / Android SUR-877), the
+  byte-mirror of the PWA's `mergeBooks` / `unmergeBooks` / `mergeNotes` (`surfc/src/db.js`). All three
+  are **key-free store-level patches** — no vault, no re-seal; a moved note's `content_tag` is nulled
+  for the existing self-heal to re-derive, never recomputed here:
+  - `merge_books(survivor_id, loser_ids) -> BookMergeUndo` — rehome every live note off each loser
+    onto the survivor (narrow `book_id` + `content_tag=null` patch, so decrypt-failed notes rehome too),
+    keep the earliest `created_at`, tombstone the losers, and record the loser→survivor redirects in
+    the device-local `mergedBookIds` map so the fleet + decrypt-failed stragglers converge via the
+    existing `reconcile_stranded_notes` on their next pull. Replay-safe and ordered for crash-safety
+    (the core can't span one SQLite transaction across the outbox writes the oracle does in one Dexie
+    transaction): redirects recorded FIRST (an interrupted merge still converges), then notes rehomed,
+    then losers tombstoned LAST — only after every rehome staged (fail-fast via `?`). A completed-merge
+    re-run is a no-op. Returns the `BookMergeUndo` token for the host's 10-second window. The map is
+    device-local (PWA parity), so full always-to-survivor convergence of a straggler note the merging
+    device never saw is deferred to **SUR-916** (native equivalent of the PWA's deferred server-side
+    merge) — native ships at parity here, not behind the web.
+  - `unmerge_books(undo)` — the inverse: restore each note's prior book, un-tombstone the losers,
+    restore the survivor's prior `created_at`, and prune ONLY the redirects still pointing at this
+    merge's survivor. Idempotent. The token is ephemeral (not persisted) — the 10s window is host UX.
+    Un-merging BEFORE the merge's outbox flush drops the loser's pending tombstone first (the outbox
+    collapse makes `deleted` sticky), so the resurrection reaches the server instead of a stale delete.
+  - `merge_content_duplicates(survivor_id, loser_ids, allow_cross_cluster) -> u32` — a checked,
+    explicit-survivor wrapper over the existing `merge_into_survivor` (union tags, adopt image,
+    re-point `note_links` + `collection_memberships`, tombstone loser notes last). The exact path
+    (`allow_cross_cluster=false`) requires all selected live notes in one non-empty `content_tag`
+    cluster; the host's fuzzy (0.92) path sets the flag to span clusters.
+  - New `uniffi::Record` types `BookMergeUndo` + `NoteBookAssignment`; Swift + Kotlin bindings
+    regenerated; all verbs ≤3 FFI args (clear of the SUR-843 arg-slot guard). Round-trips added in
+    Kotlin + Swift + the desktop-jar consumer-smoke. Batched into the v0.5.0 release with SUR-858 (no
+    dedicated cut); pins in braird-ios + braird-android follow the tag.
 
 ## [0.4.4] - 2026-07-14
 

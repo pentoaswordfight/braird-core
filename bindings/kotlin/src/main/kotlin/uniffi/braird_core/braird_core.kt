@@ -798,6 +798,12 @@ internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
 
 
 
+
+
+
+
+
+
 // A JNA Library to expose the extern-C FFI definitions.
 // This is an implementation detail which will be called internally by the public API.
 
@@ -859,6 +865,10 @@ internal interface UniffiLib : Library {
     ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_syncengine_list_notes(`ptr`: Pointer,`bookId`: RustBuffer.ByValue,`limit`: Int,`offset`: Int,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
+    fun uniffi_braird_core_fn_method_syncengine_merge_books(`ptr`: Pointer,`survivorId`: RustBuffer.ByValue,`loserIds`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_braird_core_fn_method_syncengine_merge_content_duplicates(`ptr`: Pointer,`survivorId`: RustBuffer.ByValue,`loserIds`: RustBuffer.ByValue,`allowCrossCluster`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+    ): Int
     fun uniffi_braird_core_fn_method_syncengine_notes_by_idea(`ptr`: Pointer,`idea`: RustBuffer.ByValue,`limit`: Int,`offset`: Int,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_syncengine_notes_this_week(`ptr`: Pointer,`nowMs`: Long,uniffi_out_err: UniffiRustCallStatus, 
@@ -873,6 +883,8 @@ internal interface UniffiLib : Library {
     ): Unit
     fun uniffi_braird_core_fn_method_syncengine_sync(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
+    fun uniffi_braird_core_fn_method_syncengine_unmerge_books(`ptr`: Pointer,`undo`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
     fun uniffi_braird_core_fn_method_syncengine_untagged_notes(`ptr`: Pointer,`limit`: Int,`offset`: Int,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_syncengine_untagged_notes_count(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
@@ -1057,6 +1069,10 @@ internal interface UniffiLib : Library {
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_list_notes(
     ): Short
+    fun uniffi_braird_core_checksum_method_syncengine_merge_books(
+    ): Short
+    fun uniffi_braird_core_checksum_method_syncengine_merge_content_duplicates(
+    ): Short
     fun uniffi_braird_core_checksum_method_syncengine_notes_by_idea(
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_notes_this_week(
@@ -1070,6 +1086,8 @@ internal interface UniffiLib : Library {
     fun uniffi_braird_core_checksum_method_syncengine_set_access_token(
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_sync(
+    ): Short
+    fun uniffi_braird_core_checksum_method_syncengine_unmerge_books(
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_untagged_notes(
     ): Short
@@ -1175,6 +1193,12 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_braird_core_checksum_method_syncengine_list_notes() != 26133.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_braird_core_checksum_method_syncengine_merge_books() != 55148.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_braird_core_checksum_method_syncengine_merge_content_duplicates() != 26022.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_braird_core_checksum_method_syncengine_notes_by_idea() != 21049.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1194,6 +1218,9 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_sync() != 38790.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_braird_core_checksum_method_syncengine_unmerge_books() != 15809.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_untagged_notes() != 63818.toShort()) {
@@ -1804,6 +1831,20 @@ public interface SyncEngineInterface {
     fun `listNotes`(`bookId`: kotlin.String?, `limit`: kotlin.UInt, `offset`: kotlin.UInt): List<NoteRecord>
     
     /**
+     * Merge duplicate source books into `survivor_id` (SUR-915): rehome the losers' notes, keep the
+     * earliest `created_at`, tombstone the losers, and record the redirects so the fleet converges.
+     * Returns the undo token for the host's 10-second window.
+     */
+    fun `mergeBooks`(`survivorId`: kotlin.String, `loserIds`: List<kotlin.String>): BookMergeUndo
+    
+    /**
+     * Manual/user-selected content-duplicate merge into an explicit `survivor_id` (SUR-915). When
+     * `allow_cross_cluster` is false, every selected note must share one non-empty `content_tag`;
+     * set it for the host's fuzzy (0.92) path, which spans clusters. Returns the losers collapsed.
+     */
+    fun `mergeContentDuplicates`(`survivorId`: kotlin.String, `loserIds`: List<kotlin.String>, `allowCrossCluster`: kotlin.Boolean): kotlin.UInt
+    
+    /**
      * Live notes carrying `idea` as an idea tag, newest-first, decrypted in core (SUR-858) — the
      * Commonplace idea filter / IdeaDetail / RelatedNotes. `idea` is the raw tag string (== a
      * `CustomIdeaRecord.name`, == an `IdeaCount.idea`); the match is exact.
@@ -1875,6 +1916,11 @@ public interface SyncEngineInterface {
      * SERVER row before this pull could see it is the server's job, PR-3.)
      */
     fun `sync`(): SyncSummary
+    
+    /**
+     * Reverse a `merge_books` within the host's undo window (SUR-915). Idempotent.
+     */
+    fun `unmergeBooks`(`undo`: BookMergeUndo)
     
     /**
      * Live notes with NO idea tags, newest-first, decrypted in core (SUR-858) — BulkDiscovery's
@@ -2323,6 +2369,42 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
 
     
     /**
+     * Merge duplicate source books into `survivor_id` (SUR-915): rehome the losers' notes, keep the
+     * earliest `created_at`, tombstone the losers, and record the redirects so the fleet converges.
+     * Returns the undo token for the host's 10-second window.
+     */
+    @Throws(SyncException::class)override fun `mergeBooks`(`survivorId`: kotlin.String, `loserIds`: List<kotlin.String>): BookMergeUndo {
+            return FfiConverterTypeBookMergeUndo.lift(
+    callWithPointer {
+    uniffiRustCallWithError(SyncException) { _status ->
+    UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_merge_books(
+        it, FfiConverterString.lower(`survivorId`),FfiConverterSequenceString.lower(`loserIds`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * Manual/user-selected content-duplicate merge into an explicit `survivor_id` (SUR-915). When
+     * `allow_cross_cluster` is false, every selected note must share one non-empty `content_tag`;
+     * set it for the host's fuzzy (0.92) path, which spans clusters. Returns the losers collapsed.
+     */
+    @Throws(SyncException::class)override fun `mergeContentDuplicates`(`survivorId`: kotlin.String, `loserIds`: List<kotlin.String>, `allowCrossCluster`: kotlin.Boolean): kotlin.UInt {
+            return FfiConverterUInt.lift(
+    callWithPointer {
+    uniffiRustCallWithError(SyncException) { _status ->
+    UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_merge_content_duplicates(
+        it, FfiConverterString.lower(`survivorId`),FfiConverterSequenceString.lower(`loserIds`),FfiConverterBoolean.lower(`allowCrossCluster`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
      * Live notes carrying `idea` as an idea tag, newest-first, decrypted in core (SUR-858) — the
      * Commonplace idea filter / IdeaDetail / RelatedNotes. `idea` is the raw tag string (== a
      * `CustomIdeaRecord.name`, == an `IdeaCount.idea`); the match is exact.
@@ -2467,6 +2549,21 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
     }
     )
     }
+    
+
+    
+    /**
+     * Reverse a `merge_books` within the host's undo window (SUR-915). Idempotent.
+     */
+    @Throws(SyncException::class)override fun `unmergeBooks`(`undo`: BookMergeUndo)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(SyncException) { _status ->
+    UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_unmerge_books(
+        it, FfiConverterTypeBookMergeUndo.lower(`undo`),_status)
+}
+    }
+    
     
 
     
@@ -3019,6 +3116,52 @@ public object FfiConverterTypeVault: FfiConverter<Vault, Pointer> {
 
 
 /**
+ * The ephemeral undo token [`merge_books`] returns and [`unmerge_books`] consumes — the exact
+ * inverse state the PWA captures in `mergeBooks`' `undo` object. The host holds it for its
+ * 10-second undo window; core does NOT persist it, so an app restart mid-window forfeits undo (the
+ * timer is host UX — core guarantees only the operation).
+ */
+data class BookMergeUndo (
+    var `survivorId`: kotlin.String, 
+    var `loserIds`: List<kotlin.String>, 
+    var `survivorPriorCreatedAt`: kotlin.Long?, 
+    var `reassignments`: List<NoteBookAssignment>
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeBookMergeUndo: FfiConverterRustBuffer<BookMergeUndo> {
+    override fun read(buf: ByteBuffer): BookMergeUndo {
+        return BookMergeUndo(
+            FfiConverterString.read(buf),
+            FfiConverterSequenceString.read(buf),
+            FfiConverterOptionalLong.read(buf),
+            FfiConverterSequenceTypeNoteBookAssignment.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: BookMergeUndo) = (
+            FfiConverterString.allocationSize(value.`survivorId`) +
+            FfiConverterSequenceString.allocationSize(value.`loserIds`) +
+            FfiConverterOptionalLong.allocationSize(value.`survivorPriorCreatedAt`) +
+            FfiConverterSequenceTypeNoteBookAssignment.allocationSize(value.`reassignments`)
+    )
+
+    override fun write(value: BookMergeUndo, buf: ByteBuffer) {
+            FfiConverterString.write(value.`survivorId`, buf)
+            FfiConverterSequenceString.write(value.`loserIds`, buf)
+            FfiConverterOptionalLong.write(value.`survivorPriorCreatedAt`, buf)
+            FfiConverterSequenceTypeNoteBookAssignment.write(value.`reassignments`, buf)
+    }
+}
+
+
+
+/**
  * A book for the Library / Sources grid: the descriptor column set (minus `deleted`, which is
  * always `0` for a returned row) plus `note_count` — live notes filed under this book, for the
  * grid's count badge.
@@ -3384,6 +3527,43 @@ public object FfiConverterTypeLensRecord: FfiConverterRustBuffer<LensRecord> {
             FfiConverterOptionalLong.write(value.`threshold`, buf)
             FfiConverterLong.write(value.`createdAt`, buf)
             FfiConverterLong.write(value.`updatedAt`, buf)
+    }
+}
+
+
+
+/**
+ * One note's pre-merge home, for [`unmerge_books`] — mirrors a PWA `undo.reassignments` entry
+ * (`{noteId, fromBookId}`). `prior_book_id` is nullable to round-trip the column faithfully,
+ * though a rehomed note always had a (loser) book.
+ */
+data class NoteBookAssignment (
+    var `noteId`: kotlin.String, 
+    var `priorBookId`: kotlin.String?
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeNoteBookAssignment: FfiConverterRustBuffer<NoteBookAssignment> {
+    override fun read(buf: ByteBuffer): NoteBookAssignment {
+        return NoteBookAssignment(
+            FfiConverterString.read(buf),
+            FfiConverterOptionalString.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: NoteBookAssignment) = (
+            FfiConverterString.allocationSize(value.`noteId`) +
+            FfiConverterOptionalString.allocationSize(value.`priorBookId`)
+    )
+
+    override fun write(value: NoteBookAssignment, buf: ByteBuffer) {
+            FfiConverterString.write(value.`noteId`, buf)
+            FfiConverterOptionalString.write(value.`priorBookId`, buf)
     }
 }
 
@@ -4395,6 +4575,34 @@ public object FfiConverterSequenceTypeLensRecord: FfiConverterRustBuffer<List<Le
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterTypeLensRecord.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeNoteBookAssignment: FfiConverterRustBuffer<List<NoteBookAssignment>> {
+    override fun read(buf: ByteBuffer): List<NoteBookAssignment> {
+        val len = buf.getInt()
+        return List<NoteBookAssignment>(len) {
+            FfiConverterTypeNoteBookAssignment.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<NoteBookAssignment>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeNoteBookAssignment.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<NoteBookAssignment>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeNoteBookAssignment.write(it, buf)
         }
     }
 }

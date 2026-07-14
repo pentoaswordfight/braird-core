@@ -462,6 +462,44 @@ impl Store {
         rows.collect()
     }
 
+    /// Delete un-flushed outbox tombstones (`deleted` truthy) for `record_id` in `table`, returning
+    /// the count. **Non-transactional** — the caller owns the transaction (see
+    /// [`Store::stage_local_write_resurrecting`]), so the drop and the resurrection that follows
+    /// commit as one unit and a crash between them can't diverge the store.
+    fn drop_pending_deletes_inner(&self, table: &str, record_id: &str) -> rusqlite::Result<usize> {
+        let entries: Vec<(i64, String)> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, payload FROM outbox WHERE table_name = ?1 AND record_id = ?2",
+            )?;
+            let rows = stmt
+                .query_map(rusqlite::params![table, record_id], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        let mut dropped = 0;
+        for (id, payload) in entries {
+            // Match the collapse's `truthy` semantics (Bool true / non-zero number / non-empty
+            // string other than "false"/"0"); the enqueue paths write a JSON bool, but be liberal.
+            let is_delete = serde_json::from_str::<Value>(&payload)
+                .ok()
+                .map(|v| match v.get("deleted") {
+                    Some(Value::Bool(b)) => *b,
+                    Some(Value::Number(n)) => n.as_f64().map(|f| f != 0.0).unwrap_or(false),
+                    Some(Value::String(s)) => !s.is_empty() && s != "false" && s != "0",
+                    _ => false,
+                })
+                .unwrap_or(false);
+            if is_delete {
+                self.conn
+                    .execute("DELETE FROM outbox WHERE id = ?1", [id])?;
+                dropped += 1;
+            }
+        }
+        Ok(dropped)
+    }
+
     /// Clear the given outbox ids (a collapsed group that flushed successfully). Failed
     /// groups are simply NOT passed here, so they stay queued for the next flush.
     pub fn clear_outbox(&self, ids: &[i64]) -> rusqlite::Result<()> {
@@ -715,6 +753,19 @@ impl Store {
         // so there is no concurrent use of this connection. On any early `?` the `Transaction` drops
         // and rolls back (its default drop behaviour); only `commit()` persists the pair.
         let tx = self.conn.unchecked_transaction()?;
+        self.stage_write_inner(table, record_id, partial, created_at)?;
+        tx.commit()
+    }
+
+    /// Non-transactional core of [`stage_local_write`]: merge `partial` onto the existing row,
+    /// upsert the merged row, and enqueue the partial payload. The caller owns the transaction.
+    fn stage_write_inner(
+        &self,
+        table: &str,
+        record_id: &str,
+        partial: Map<String, Value>,
+        created_at: i64,
+    ) -> rusqlite::Result<()> {
         let mut merged = self.get_row(table, record_id)?.unwrap_or_default();
         for (k, v) in &partial {
             merged.insert(k.clone(), v.clone());
@@ -722,6 +773,28 @@ impl Store {
         self.apply_row(table, &merged)?;
         let payload = Value::Object(partial).to_string();
         self.enqueue(table, record_id, &payload, created_at)?;
+        Ok(())
+    }
+
+    /// Like [`stage_local_write`], but atomically drops any un-flushed tombstone for `record_id`
+    /// FIRST, in the SAME transaction. For RESURRECTION / undo paths (SUR-915 `unmerge_books`): the
+    /// outbox collapse makes `deleted` sticky (a queued delete is never un-set by a later edit in
+    /// the same batch — the SUR-724 "delete wins, never resurrect" hardening), so a resurrection
+    /// must remove the queued tombstone. Doing both in one transaction means a crash can't leave the
+    /// row soft-deleted with the tombstone dropped but the `deleted:false` resurrection never
+    /// enqueued — a divergence a restart couldn't retry, since the undo token is ephemeral. Either
+    /// the whole resurrection commits or none of it does. If no tombstone is queued (it already
+    /// flushed) the drop is a no-op and the staged `deleted:false` un-deletes via the server's LWW.
+    pub fn stage_local_write_resurrecting(
+        &self,
+        table: &str,
+        record_id: &str,
+        partial: Map<String, Value>,
+        created_at: i64,
+    ) -> rusqlite::Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        self.drop_pending_deletes_inner(table, record_id)?;
+        self.stage_write_inner(table, record_id, partial, created_at)?;
         tx.commit()
     }
 

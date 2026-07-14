@@ -281,4 +281,68 @@ final class RoundTripTests: XCTestCase {
         XCTAssertEqual(lens.combinator, "OR")
         XCTAssertEqual(lens.threshold, 75)
     }
+
+    /// SUR-915: the duplicate-resolution merge verbs over the FFI — merge_books (+ undo) and the
+    /// content-merge wrapper. Proves the undo token round-trips as a record, book merge rehomes
+    /// notes + tombstones the loser, undo restores, and merge_content_duplicates collapses into a
+    /// host-picked survivor, as an iOS host drives them.
+    func testMergeContractOverFfi() throws {
+        let db = FileManager.default.temporaryDirectory
+            .appendingPathComponent("braird-merge-\(UUID().uuidString).sqlite")
+        let engine = try SyncEngine.open(
+            dbPath: db.path, supabaseUrl: "https://x.supabase.co", anonKey: "anon",
+            vault: Vault.generate())
+
+        func book(_ id: String, _ createdAt: Int64) -> BookUpsert {
+            BookUpsert(
+                id: id, title: "T-\(id)", author: nil, isbn: nil, coverUrl: nil, coverSource: nil,
+                coverResolvedAt: nil, createdAt: createdAt, deleted: false, clearNullableFields: [])
+        }
+        func note(_ id: String, _ bookId: String?) -> NoteUpsert {
+            NoteUpsert(
+                id: id, bookId: bookId, plaintext: "text-\(id)", page: nil, tags: [], source: nil,
+                sourceId: nil, sourceMetaJson: nil, chapter: nil, imagePath: nil, inkCropPath: nil,
+                createdAt: 1, deleted: false, clearNullableFields: [])
+        }
+
+        try engine.enqueueBook(draft: book("s", 100))
+        try engine.enqueueBook(draft: book("l1", 50))
+        try engine.enqueueNote(draft: note("n1", "l1"))
+        try engine.enqueueNote(draft: note("n2", "l1"))
+
+        // book merge: notes rehome onto the survivor, loser tombstoned, earliest createdAt kept.
+        let undo = try engine.mergeBooks(survivorId: "s", loserIds: ["l1"])
+        XCTAssertEqual(try engine.listNotes(bookId: "s", limit: 50, offset: 0).map { $0.id }, ["n2", "n1"])
+        XCTAssertNil(try engine.getBook(id: "l1"))
+        XCTAssertEqual(try engine.getBook(id: "s")?.createdAt, 50)
+        XCTAssertEqual(undo.survivorId, "s")
+        XCTAssertEqual(undo.loserIds, ["l1"])
+        XCTAssertEqual(undo.survivorPriorCreatedAt, 100)
+        XCTAssertEqual(Set(undo.reassignments.map { $0.noteId }), ["n1", "n2"])
+        XCTAssertTrue(undo.reassignments.allSatisfy { $0.priorBookId == "l1" })
+
+        // undo restores the merge (both notes go back to l1; id-desc tiebreak on equal createdAt).
+        try engine.unmergeBooks(undo: undo)
+        XCTAssertEqual(try engine.listNotes(bookId: "l1", limit: 50, offset: 0).map { $0.id }, ["n2", "n1"])
+        XCTAssertEqual(try engine.getBook(id: "s")?.createdAt, 100)
+        XCTAssertEqual(try engine.getBook(id: "l1")?.title, "T-l1")
+
+        // content merge into a host-picked survivor (exact path: same content_tag cluster).
+        let db2 = FileManager.default.temporaryDirectory
+            .appendingPathComponent("braird-merge2-\(UUID().uuidString).sqlite")
+        let e2 = try SyncEngine.open(
+            dbPath: db2.path, supabaseUrl: "https://x.supabase.co", anonKey: "anon",
+            vault: Vault.generate())
+        try e2.enqueueNote(draft: NoteUpsert(
+            id: "keep", bookId: nil, plaintext: "same words", page: nil, tags: ["a"], source: nil,
+            sourceId: nil, sourceMetaJson: nil, chapter: nil, imagePath: nil, inkCropPath: nil,
+            createdAt: 1, deleted: false, clearNullableFields: []))
+        try e2.enqueueNote(draft: NoteUpsert(
+            id: "dup", bookId: nil, plaintext: "same words", page: nil, tags: ["b"], source: nil,
+            sourceId: nil, sourceMetaJson: nil, chapter: nil, imagePath: nil, inkCropPath: nil,
+            createdAt: 2, deleted: false, clearNullableFields: []))
+        XCTAssertEqual(try e2.mergeContentDuplicates(survivorId: "keep", loserIds: ["dup"], allowCrossCluster: false), 1)
+        XCTAssertEqual(try e2.listNotes(bookId: nil, limit: 50, offset: 0).map { $0.id }, ["keep"])
+        XCTAssertEqual(try e2.getNote(id: "keep")?.tags, ["a", "b"])
+    }
 }

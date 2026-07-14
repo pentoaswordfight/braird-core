@@ -37,6 +37,7 @@ use http::{user_id_from_jwt, PostgrestClient};
 use read::{
     BookRecord, CollectionRecord, CustomIdeaRecord, IdeaCount, LensRecord, NoteRecord, StoreCounts,
 };
+use reconcile::BookMergeUndo;
 
 /// Errors that cross the FFI from the sync engine. Coarse like [`crate::CryptoError`]: enough
 /// for a host to distinguish "couldn't open the store" from "the flush hit the network", never
@@ -804,6 +805,43 @@ impl SyncEngine {
     pub fn untagged_notes_count(&self) -> Result<u32, SyncError> {
         let store = lock!(self.store);
         read::untagged_notes_count(&store).map_err(store_err)
+    }
+
+    // ── duplicate-resolution merge contract (SUR-915) ─────────────────────────
+    // Host-invoked merge verbs (consumers SUR-863 iOS / SUR-877 Android). Key-free store-level
+    // patches under the store lock; the shape + replay-safety live in `sync::reconcile`.
+
+    /// Merge duplicate source books into `survivor_id` (SUR-915): rehome the losers' notes, keep the
+    /// earliest `created_at`, tombstone the losers, and record the redirects so the fleet converges.
+    /// Returns the undo token for the host's 10-second window.
+    pub fn merge_books(
+        &self,
+        survivor_id: String,
+        loser_ids: Vec<String>,
+    ) -> Result<BookMergeUndo, SyncError> {
+        let store = lock!(self.store);
+        reconcile::merge_books(&store, &survivor_id, &loser_ids).map_err(SyncError::Store)
+    }
+
+    /// Reverse a `merge_books` within the host's undo window (SUR-915). Idempotent.
+    pub fn unmerge_books(&self, undo: BookMergeUndo) -> Result<(), SyncError> {
+        let store = lock!(self.store);
+        reconcile::unmerge_books(&store, &undo).map_err(SyncError::Store)
+    }
+
+    /// Manual/user-selected content-duplicate merge into an explicit `survivor_id` (SUR-915). When
+    /// `allow_cross_cluster` is false, every selected note must share one non-empty `content_tag`;
+    /// set it for the host's fuzzy (0.92) path, which spans clusters. Returns the losers collapsed.
+    pub fn merge_content_duplicates(
+        &self,
+        survivor_id: String,
+        loser_ids: Vec<String>,
+        allow_cross_cluster: bool,
+    ) -> Result<u32, SyncError> {
+        let store = lock!(self.store);
+        reconcile::merge_content_duplicates(&store, &survivor_id, &loser_ids, allow_cross_cluster)
+            .map(|n| n as u32)
+            .map_err(SyncError::Store)
     }
 }
 

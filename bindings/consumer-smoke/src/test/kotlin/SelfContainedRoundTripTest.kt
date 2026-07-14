@@ -1,6 +1,7 @@
 import java.io.File
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Test
+import uniffi.braird_core.BookUpsert
 import uniffi.braird_core.NoteUpsert
 import uniffi.braird_core.SyncEngine
 import uniffi.braird_core.Vault
@@ -86,5 +87,37 @@ class SelfContainedRoundTripTest {
         assertEquals(1u, engine.untaggedNotesCount())
         assertEquals(listOf("Reading list"), engine.listCollections(50u, 0u).map { it.name })
         assertEquals(listOf("Stoic core"), engine.listLenses(50u, 0u).map { it.name })
+    }
+
+    /**
+     * SUR-915: the merge verbs run jar-only — book merge rehomes a note + tombstones the loser and
+     * the undo token round-trips to restore it; content merge collapses a same-cluster duplicate.
+     */
+    @Test
+    fun mergeContractFromJarOnly() {
+        val db = File.createTempFile("braird-merge", ".sqlite").apply { deleteOnExit() }
+        val engine = SyncEngine.open(db.absolutePath, "https://x.supabase.co", "anon", Vault.generate())
+        engine.enqueueBook(BookUpsert(
+            id = "s", title = "S", author = null, isbn = null, coverUrl = null, coverSource = null,
+            coverResolvedAt = null, createdAt = 100L, deleted = false, clearNullableFields = emptyList(),
+        ))
+        engine.enqueueBook(BookUpsert(
+            id = "l1", title = "L", author = null, isbn = null, coverUrl = null, coverSource = null,
+            coverResolvedAt = null, createdAt = 50L, deleted = false, clearNullableFields = emptyList(),
+        ))
+        engine.enqueueNote(NoteUpsert(
+            id = "n1", bookId = "l1", plaintext = "note", page = null, tags = emptyList(),
+            source = null, sourceId = null, sourceMetaJson = null, chapter = null, imagePath = null,
+            inkCropPath = null, createdAt = 1L, deleted = false, clearNullableFields = emptyList(),
+        ))
+
+        val undo = engine.mergeBooks("s", listOf("l1"))
+        assertEquals(listOf("n1"), engine.listNotes("s", 50u, 0u).map { it.id })
+        assertEquals(null, engine.getBook("l1"))
+        assertEquals(50L, engine.getBook("s")?.createdAt)
+
+        engine.unmergeBooks(undo)
+        assertEquals(listOf("n1"), engine.listNotes("l1", 50u, 0u).map { it.id })
+        assertEquals(100L, engine.getBook("s")?.createdAt)
     }
 }

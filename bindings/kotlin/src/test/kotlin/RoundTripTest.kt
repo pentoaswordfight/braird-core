@@ -312,4 +312,65 @@ class RoundTripTest {
         assertEquals("OR", lens.combinator)
         assertEquals(75L, lens.threshold)
     }
+
+    /** SUR-915: the duplicate-resolution merge verbs over the FFI — merge_books (+ undo) and the
+     * content-merge wrapper. Proves the undo token round-trips as a record, book merge rehomes notes
+     * + tombstones the loser, undo restores, and merge_content_duplicates collapses into a
+     * host-picked survivor, as a native host drives them. */
+    @Test
+    fun mergeContractOverFfi() {
+        val db = File.createTempFile("braird-merge", ".sqlite").apply { deleteOnExit() }
+        val engine = SyncEngine.open(db.absolutePath, "https://x.supabase.co", "anon", Vault.generate())
+
+        fun book(id: String, createdAt: Long) = BookUpsert(
+            id = id, title = "T-$id", author = null, isbn = null, coverUrl = null,
+            coverSource = null, coverResolvedAt = null, createdAt = createdAt, deleted = false,
+            clearNullableFields = emptyList(),
+        )
+        fun note(id: String, bookId: String?) = NoteUpsert(
+            id = id, bookId = bookId, plaintext = "text-$id", page = null, tags = emptyList(),
+            source = null, sourceId = null, sourceMetaJson = null, chapter = null, imagePath = null,
+            inkCropPath = null, createdAt = 1L, deleted = false, clearNullableFields = emptyList(),
+        )
+
+        engine.enqueueBook(book("s", 100L))
+        engine.enqueueBook(book("l1", 50L))
+        engine.enqueueNote(note("n1", "l1"))
+        engine.enqueueNote(note("n2", "l1"))
+
+        // ── book merge: notes rehome onto the survivor, loser tombstoned, earliest createdAt kept.
+        val undo = engine.mergeBooks("s", listOf("l1"))
+        assertEquals(listOf("n2", "n1"), engine.listNotes("s", 50u, 0u).map { it.id })
+        assertEquals(null, engine.getBook("l1"), "loser tombstoned")
+        assertEquals(50L, engine.getBook("s")?.createdAt)
+        assertEquals("s", undo.survivorId)
+        assertEquals(listOf("l1"), undo.loserIds)
+        assertEquals(100L, undo.survivorPriorCreatedAt)
+        assertEquals(setOf("n1", "n2"), undo.reassignments.map { it.noteId }.toSet())
+        assertEquals(true, undo.reassignments.all { it.priorBookId == "l1" })
+
+        // ── undo restores the merge (both notes go back to l1; id-desc tiebreak on equal createdAt).
+        engine.unmergeBooks(undo)
+        assertEquals(listOf("n2", "n1"), engine.listNotes("l1", 50u, 0u).map { it.id })
+        assertEquals(100L, engine.getBook("s")?.createdAt)
+        assertEquals("T-l1", engine.getBook("l1")?.title, "loser un-tombstoned")
+
+        // ── content merge into a host-picked survivor (exact path: shared cluster required).
+        val db2 = File.createTempFile("braird-merge2", ".sqlite").apply { deleteOnExit() }
+        val e2 = SyncEngine.open(db2.absolutePath, "https://x.supabase.co", "anon", Vault.generate())
+        // Two notes that seal to the SAME content_tag (same plaintext + null book) → one cluster.
+        e2.enqueueNote(NoteUpsert(
+            id = "keep", bookId = null, plaintext = "same words", page = null, tags = listOf("a"),
+            source = null, sourceId = null, sourceMetaJson = null, chapter = null, imagePath = null,
+            inkCropPath = null, createdAt = 1L, deleted = false, clearNullableFields = emptyList(),
+        ))
+        e2.enqueueNote(NoteUpsert(
+            id = "dup", bookId = null, plaintext = "same words", page = null, tags = listOf("b"),
+            source = null, sourceId = null, sourceMetaJson = null, chapter = null, imagePath = null,
+            inkCropPath = null, createdAt = 2L, deleted = false, clearNullableFields = emptyList(),
+        ))
+        assertEquals(1u, e2.mergeContentDuplicates("keep", listOf("dup"), false))
+        assertEquals(listOf("keep"), e2.listNotes(null, 50u, 0u).map { it.id })
+        assertEquals(listOf("a", "b"), e2.getNote("keep")?.tags)
+    }
 }

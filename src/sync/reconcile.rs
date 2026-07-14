@@ -300,6 +300,16 @@ fn load_merged_book_ids(store: &Store) -> Result<BTreeMap<String, String>, Strin
     }
 }
 
+/// Persist the device-local `mergedBookIds` survivor map (the write side [`merge_books`] adds and
+/// [`unmerge_books`] prunes; `reconcile_stranded_notes` reads it). `BTreeMap` so the serialized
+/// JSON is key-ordered and stable across writes.
+fn save_merged_book_ids(store: &Store, map: &BTreeMap<String, String>) -> Result<(), String> {
+    let json = serde_json::to_string(map).map_err(|e| format!("serialize merged book ids: {e}"))?;
+    store
+        .meta_set(MERGED_BOOK_IDS_KEY, &json)
+        .map_err(|e| format!("write merged book ids: {e}"))
+}
+
 /// Step 2d, generalized (founder decision, SUR-820 decomposition) — any live note tag that
 /// matches neither the vendored canon nor an existing local custom idea (case-insensitive)
 /// becomes a custom idea. Idempotent: a name already present (as canon, an existing custom idea,
@@ -954,6 +964,337 @@ fn cover_url_from_isbn(isbn: &str) -> String {
 /// `covers.openlibrary.org/b/id/<cover_i>-M.jpg?default=false` — the PWA's `coverUrlFromCoverId`.
 fn cover_url_from_cover_id(cover_i: i64) -> String {
     format!("{COVERS_BASE}/id/{cover_i}-M.jpg?default=false")
+}
+
+// ── SUR-915: duplicate-resolution merge verbs ────────────────────────────────
+// The host-invoked merge contract both native consumers (SUR-863 iOS / SUR-877 Android) build
+// against. `merge_books` + `unmerge_books` are the byte-mirror of the PWA's `mergeBooks` /
+// `unmergeBooks` (`surfc/src/db.js`); `merge_content_duplicates` is a checked, explicit-survivor
+// wrapper over the existing `merge_into_survivor` (the automatic-dedup content merge). All three
+// are KEY-FREE store-level patches — no vault, no re-seal — so a moved note's `content_tag` is
+// nulled for the existing self-heal to re-derive, never recomputed here.
+
+/// One note's pre-merge home, for [`unmerge_books`] — mirrors a PWA `undo.reassignments` entry
+/// (`{noteId, fromBookId}`). `prior_book_id` is nullable to round-trip the column faithfully,
+/// though a rehomed note always had a (loser) book.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct NoteBookAssignment {
+    pub note_id: String,
+    pub prior_book_id: Option<String>,
+}
+
+/// The ephemeral undo token [`merge_books`] returns and [`unmerge_books`] consumes — the exact
+/// inverse state the PWA captures in `mergeBooks`' `undo` object. The host holds it for its
+/// 10-second undo window; core does NOT persist it, so an app restart mid-window forfeits undo (the
+/// timer is host UX — core guarantees only the operation).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct BookMergeUndo {
+    pub survivor_id: String,
+    pub loser_ids: Vec<String>,
+    pub survivor_prior_created_at: Option<i64>,
+    pub reassignments: Vec<NoteBookAssignment>,
+}
+
+/// Filter+dedupe a loser-id list, dropping empties and the survivor (mirrors the oracle's
+/// `.filter(id => id && id !== survivorId)`), preserving first-seen order.
+fn clean_loser_ids(survivor_id: &str, loser_ids: &[String]) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    loser_ids
+        .iter()
+        .filter(|id| !id.is_empty() && id.as_str() != survivor_id && seen.insert((*id).clone()))
+        .cloned()
+        .collect()
+}
+
+/// Merge duplicate source BOOKS into `survivor_id` (SUR-915) — the byte-mirror of the PWA's
+/// `mergeBooks`. Rehomes every live note off each loser onto the survivor (narrow `book_id` +
+/// `content_tag=null` patch, so decrypt-failed notes rehome too — no re-seal), keeps the earliest
+/// `created_at` on the survivor, tombstones the losers, and records the loser→survivor redirects in
+/// the device-local `mergedBookIds` map so the fleet + decrypt-failed stragglers converge via
+/// [`reconcile_stranded_notes`] on their next pull. Returns the [`BookMergeUndo`] snapshot.
+///
+/// **Known residual (SUR-916, matches the PWA's own deferral).** The redirect map is device-local,
+/// so a note that lives on a device which never received the map AND that this device never saw
+/// (created offline elsewhere, or not-yet-pulled here at merge time) can't be resolved by that
+/// device: it pulls the loser tombstone with an empty map and `reconcile_stranded_notes` DETACHES
+/// it (`book_id=null`) rather than rehoming it to the survivor. Full always-to-survivor convergence
+/// (a synced redirect or a server-side rehome) is tracked in SUR-916 — the native equivalent of the
+/// PWA's deferred server-side merge; native ships at parity with the web here, not behind it.
+///
+/// **Replay-safe, ordered for crash-safety.** The core can't span one SQLite transaction across the
+/// separate outbox writes the oracle does in one Dexie transaction, so it ORDERS the writes and
+/// fail-fasts (like [`merge_into_survivor`]):
+/// 1. redirects are recorded FIRST — an interrupted merge still converges (a stranded note resolves
+///    to the survivor through the map even if the tombstone never landed), and the insert is
+///    idempotent (preserves existing entries);
+/// 2. notes are rehomed next, each capturing its prior book into the undo token;
+/// 3. losers are tombstoned LAST — only after every rehome staged (a stage failure propagates via
+///    `?`, so no loser is ever tombstoned with a note still stranded on it).
+///
+/// A re-run of a completed merge is a no-op: a tombstoned loser contributes no LIVE notes to rehome
+/// and its redirect is already present.
+pub fn merge_books(
+    store: &Store,
+    survivor_id: &str,
+    loser_ids: &[String],
+) -> Result<BookMergeUndo, String> {
+    let now = epoch_ms();
+    if survivor_id.is_empty() {
+        return Err("merge_books: empty survivor id".into());
+    }
+    let losers = clean_loser_ids(survivor_id, loser_ids);
+
+    let mut undo = BookMergeUndo {
+        survivor_id: survivor_id.to_string(),
+        loser_ids: Vec::new(),
+        survivor_prior_created_at: None,
+        reassignments: Vec::new(),
+    };
+    if losers.is_empty() {
+        return Ok(undo); // nothing to merge (mirrors the oracle's early return)
+    }
+
+    // Survivor must exist and be live — it's the merge target.
+    let survivor = match store
+        .get_row("books", survivor_id)
+        .map_err(|e| format!("merge_books: get survivor {survivor_id}: {e}"))?
+    {
+        Some(b) if !matches!(b.get("deleted"), Some(Value::Bool(true))) => b,
+        _ => {
+            return Err(format!(
+                "merge_books: survivor {survivor_id} not found or deleted"
+            ))
+        }
+    };
+
+    // Reject a redirect cycle: if the survivor already resolves (transitively) to one of the
+    // losers, merging would make the map point in a loop and strand every note in it.
+    let mut map = load_merged_book_ids(store)?;
+    for lid in &losers {
+        if resolve_book_id(survivor_id, &map) == *lid {
+            return Err(format!(
+                "merge_books: redirect cycle — survivor {survivor_id} already resolves to loser {lid}"
+            ));
+        }
+    }
+
+    let survivor_created = row_i64(&survivor, "created_at");
+    undo.survivor_prior_created_at = Some(survivor_created);
+    let mut earliest = survivor_created;
+
+    // ── 1. Record redirects FIRST (idempotent, preserves existing). ──
+    for lid in &losers {
+        map.insert(lid.clone(), survivor_id.to_string());
+    }
+    save_merged_book_ids(store, &map)?;
+
+    // ── 2. Rehome each LIVE loser's notes; capture undo; track earliest created_at. A loser that's
+    // missing locally OR already soft-deleted (e.g. a completed-merge retry) is NOT something this
+    // invocation tombstones, so it's skipped — never added to the undo token or the tombstone loop.
+    // Its redirect stays recorded (step 1) so a later pull still converges. This keeps a retry a
+    // true no-op and stops `unmerge_books` on a retry token from resurrecting an empty duplicate. ──
+    for lid in &losers {
+        let loser = match store
+            .get_row("books", lid)
+            .map_err(|e| format!("merge_books: get loser {lid}: {e}"))?
+        {
+            Some(b) if !matches!(b.get("deleted"), Some(Value::Bool(true))) => b,
+            _ => continue, // missing or already-deleted — nothing for this invocation to merge
+        };
+        earliest = earliest.min(row_i64(&loser, "created_at"));
+
+        let notes = store
+            .list_live("notes", Some(("book_id", lid)), -1, 0)
+            .map_err(|e| format!("merge_books: list notes for {lid}: {e}"))?;
+        for note in &notes {
+            let note_id = row_str(note, "id").to_string();
+            let mut patch = Map::new();
+            patch.insert("id".into(), json!(note_id));
+            patch.insert("book_id".into(), json!(survivor_id));
+            patch.insert("content_tag".into(), Value::Null); // SUR-638: stale on book change
+            patch.insert("updated_at".into(), json!(now));
+            store
+                .stage_local_write("notes", &note_id, patch, now)
+                .map_err(|e| format!("merge_books: rehome note {note_id}: {e}"))?;
+            undo.reassignments.push(NoteBookAssignment {
+                note_id,
+                prior_book_id: Some(lid.clone()),
+            });
+        }
+        undo.loser_ids.push(lid.clone());
+    }
+
+    // No live loser was merged this invocation (a completed-merge retry, or an all-missing/deleted
+    // loser set): skip the survivor bump + tombstone loop and return an empty undo token, which
+    // `unmerge_books` treats as a no-op. The redirect map was still (idempotently) recorded above.
+    if undo.loser_ids.is_empty() {
+        return Ok(undo);
+    }
+
+    // ── 3. Survivor keeps the earliest created_at across the cluster (mirrors the oracle, which
+    // always writes it — LWW-safe even when unchanged). ──
+    let mut sp = Map::new();
+    sp.insert("id".into(), json!(survivor_id));
+    sp.insert("created_at".into(), json!(earliest));
+    sp.insert("updated_at".into(), json!(now));
+    store
+        .stage_local_write("books", survivor_id, sp, now)
+        .map_err(|e| format!("merge_books: stage survivor created_at: {e}"))?;
+
+    // ── 4. Tombstone the losers — only now that every rehome has staged. ──
+    for lid in &undo.loser_ids {
+        let mut patch = Map::new();
+        patch.insert("id".into(), json!(lid));
+        patch.insert("deleted".into(), json!(true));
+        patch.insert("updated_at".into(), json!(now));
+        store
+            .stage_local_write("books", lid, patch, now)
+            .map_err(|e| format!("merge_books: tombstone loser {lid}: {e}"))?;
+    }
+
+    Ok(undo)
+}
+
+/// Reverse a [`merge_books`] within the host's undo window — the inverse of the PWA's
+/// `unmergeBooks`. Narrow restores only: each reassignment's note returns to its `prior_book_id`
+/// (`content_tag` nulled to re-derive), each loser book is un-tombstoned, the survivor's prior
+/// `created_at` is restored, and ONLY the `mergedBookIds` entries still pointing at THIS merge's
+/// survivor are removed (a later merge into the same survivor keeps its own entries). Idempotent.
+pub fn unmerge_books(store: &Store, undo: &BookMergeUndo) -> Result<(), String> {
+    if undo.loser_ids.is_empty() {
+        return Ok(());
+    }
+    let now = epoch_ms();
+
+    for r in &undo.reassignments {
+        let mut patch = Map::new();
+        patch.insert("id".into(), json!(r.note_id));
+        patch.insert(
+            "book_id".into(),
+            r.prior_book_id.clone().map_or(Value::Null, Value::String),
+        );
+        patch.insert("content_tag".into(), Value::Null);
+        patch.insert("updated_at".into(), json!(now));
+        store
+            .stage_local_write("notes", &r.note_id, patch, now)
+            .map_err(|e| format!("unmerge_books: restore note {}: {e}", r.note_id))?;
+    }
+
+    for lid in &undo.loser_ids {
+        // Resurrect the loser ATOMICALLY: the outbox collapse makes `deleted` sticky ("delete wins"
+        // — SUR-724), so a resurrection staged behind an un-flushed merge tombstone would flush as
+        // `deleted:true`. `stage_local_write_resurrecting` drops the pending tombstone and stages the
+        // `deleted:false` write in ONE transaction — a crash can't leave the row soft-deleted with
+        // the tombstone gone but the resurrection unqueued (the ephemeral undo token can't retry).
+        let mut patch = Map::new();
+        patch.insert("id".into(), json!(lid));
+        patch.insert("deleted".into(), json!(false));
+        patch.insert("updated_at".into(), json!(now));
+        store
+            .stage_local_write_resurrecting("books", lid, patch, now)
+            .map_err(|e| format!("unmerge_books: resurrect loser {lid}: {e}"))?;
+    }
+
+    let mut sp = Map::new();
+    sp.insert("id".into(), json!(undo.survivor_id));
+    if let Some(prev) = undo.survivor_prior_created_at {
+        sp.insert("created_at".into(), json!(prev));
+    }
+    sp.insert("updated_at".into(), json!(now));
+    store
+        .stage_local_write("books", &undo.survivor_id, sp, now)
+        .map_err(|e| format!("unmerge_books: restore survivor created_at: {e}"))?;
+
+    // Prune only redirects still pointing at THIS survivor.
+    let mut map = load_merged_book_ids(store)?;
+    for lid in &undo.loser_ids {
+        if map.get(lid).map(String::as_str) == Some(undo.survivor_id.as_str()) {
+            map.remove(lid);
+        }
+    }
+    save_merged_book_ids(store, &map)?;
+
+    Ok(())
+}
+
+/// The manual/user-selected content merge (SUR-915): collapse the `loser_ids` note duplicates into
+/// `survivor_id` via [`merge_into_survivor`], with the survivor chosen by the HOST rather than the
+/// dedup pass's deterministic pick. A checked wrapper — it loads the LIVE rows and validates them.
+///
+/// `allow_cross_cluster` gates the host's two detection modes (SUR-877): the EXACT path (`false`)
+/// requires every selected note to share one non-empty `content_tag` — the same invariant the
+/// automatic [`reconcile_content_dupes`] relies on; the FUZZY path (`true`, a 0.92 title-similarity
+/// match the host surfaced) crosses `content_tag` clusters by definition, so the cluster check is
+/// skipped. Returns the number of losers collapsed.
+///
+/// Inherits [`merge_into_survivor`]'s best-effort atomicity: it can't span one SQLite transaction
+/// across the separate outbox writes, so a mid-merge stage failure leaves the survivor patched but a
+/// loser un-tombstoned. That's convergent, not corrupt — the automatic dedup pass re-collapses the
+/// still-live cluster on the next pull. The host treats a returned error as "retry / saved locally,
+/// sync pending" (the SUR-915 sync-integration contract).
+pub fn merge_content_duplicates(
+    store: &Store,
+    survivor_id: &str,
+    loser_ids: &[String],
+    allow_cross_cluster: bool,
+) -> Result<usize, String> {
+    if survivor_id.is_empty() {
+        return Err("merge_content_duplicates: empty survivor id".into());
+    }
+    let loser_ids = clean_loser_ids(survivor_id, loser_ids);
+    if loser_ids.is_empty() {
+        return Ok(0);
+    }
+
+    let survivor = match store
+        .get_row("notes", survivor_id)
+        .map_err(|e| format!("merge_content_duplicates: get survivor {survivor_id}: {e}"))?
+    {
+        Some(n) if !matches!(n.get("deleted"), Some(Value::Bool(true))) => n,
+        _ => {
+            return Err(format!(
+                "merge_content_duplicates: survivor note {survivor_id} not found or deleted"
+            ))
+        }
+    };
+
+    let mut losers = Vec::with_capacity(loser_ids.len());
+    for lid in &loser_ids {
+        match store
+            .get_row("notes", lid)
+            .map_err(|e| format!("merge_content_duplicates: get loser {lid}: {e}"))?
+        {
+            Some(n) if !matches!(n.get("deleted"), Some(Value::Bool(true))) => losers.push(n),
+            _ => {
+                return Err(format!(
+                    "merge_content_duplicates: loser note {lid} not found or deleted"
+                ))
+            }
+        }
+    }
+
+    if !allow_cross_cluster {
+        // EXACT path: every selected note must share ONE non-empty content_tag (the fuzzy path sets
+        // allow_cross_cluster and skips this — a fuzzy match legitimately spans clusters).
+        let tag = row_str(&survivor, "content_tag");
+        if tag.is_empty() {
+            return Err(format!(
+                "merge_content_duplicates: survivor note {survivor_id} has no content_tag \
+                 (an exact merge requires a shared cluster; set allow_cross_cluster for a fuzzy merge)"
+            ));
+        }
+        for l in &losers {
+            if row_str(l, "content_tag") != tag {
+                return Err(format!(
+                    "merge_content_duplicates: loser note {} is not in the survivor's content_tag \
+                     cluster (set allow_cross_cluster for a fuzzy merge)",
+                    row_str(l, "id")
+                ));
+            }
+        }
+    }
+
+    merge_into_survivor(store, &survivor, &losers)
 }
 
 #[cfg(test)]
@@ -2352,5 +2693,386 @@ mod tests {
         // The 2 that missed the budget are still unstamped → resolved on the next pass.
         let second = block(reconcile_covers(&store, &sink)).unwrap();
         assert_eq!(second, 2);
+    }
+
+    // ── SUR-915: merge_books / unmerge_books / merge_content_duplicates ─────
+
+    fn book_at(id: &str, created_at: i64) -> Value {
+        json!({ "id": id, "title": "T", "created_at": created_at, "updated_at": created_at, "deleted": false })
+    }
+
+    fn note_ct(id: &str, book_id: Option<&str>, content_tag: &str, tags: &[&str]) -> Value {
+        json!({ "id": id, "book_id": book_id, "text": "enc:v2:x", "tags": tags,
+                "content_tag": content_tag, "created_at": 1, "updated_at": 1, "deleted": false })
+    }
+
+    fn book_id_of(store: &Store, note_id: &str) -> Option<String> {
+        store
+            .get_row("notes", note_id)
+            .unwrap()
+            .unwrap()
+            .get("book_id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    }
+
+    #[test]
+    fn merge_books_rehomes_notes_records_map_keeps_earliest_and_captures_undo() {
+        let store = Store::open_in_memory().unwrap();
+        put(&store, "books", &book_at("s", 100));
+        put(&store, "books", &book_at("l1", 50));
+        put(&store, "notes", &note("n1", Some("l1"), &["a"], 1));
+        put(&store, "notes", &note("n2", Some("l1"), &["b"], 2));
+        put(&store, "notes", &note("keep", Some("s"), &["c"], 3));
+
+        let undo = merge_books(&store, "s", &["l1".into()]).unwrap();
+
+        // notes rehomed onto the survivor, content_tag nulled for re-derive.
+        assert_eq!(book_id_of(&store, "n1").as_deref(), Some("s"));
+        assert_eq!(book_id_of(&store, "n2").as_deref(), Some("s"));
+        assert!(store.get_row("notes", "n1").unwrap().unwrap()["content_tag"].is_null());
+        // loser tombstoned; survivor inherits the earliest created_at across the cluster.
+        assert!(is_deleted(&store, "books", "l1"));
+        assert_eq!(
+            store.get_row("books", "s").unwrap().unwrap()["created_at"].as_i64(),
+            Some(50)
+        );
+        // redirect recorded.
+        assert_eq!(
+            load_merged_book_ids(&store)
+                .unwrap()
+                .get("l1")
+                .map(String::as_str),
+            Some("s")
+        );
+        // undo token captures the inverse state.
+        assert_eq!(undo.survivor_id, "s");
+        assert_eq!(undo.loser_ids, vec!["l1"]);
+        assert_eq!(undo.survivor_prior_created_at, Some(100));
+        let mut moved: Vec<_> = undo
+            .reassignments
+            .iter()
+            .map(|r| r.note_id.as_str())
+            .collect();
+        moved.sort();
+        assert_eq!(moved, vec!["n1", "n2"]);
+        assert!(undo
+            .reassignments
+            .iter()
+            .all(|r| r.prior_book_id.as_deref() == Some("l1")));
+    }
+
+    #[test]
+    fn merge_books_validates_dedupes_and_rejects_cycle() {
+        let store = Store::open_in_memory().unwrap();
+        put(&store, "books", &book_at("s", 1));
+        put(&store, "books", &book_at("l1", 1));
+
+        assert!(merge_books(&store, "", &["l1".into()]).is_err()); // empty survivor
+                                                                   // empty / self-only losers → no-op (survivor filtered out).
+        assert!(merge_books(&store, "s", &["s".into(), "".into()])
+            .unwrap()
+            .loser_ids
+            .is_empty());
+        // missing survivor row.
+        assert!(merge_books(&store, "ghost", &["l1".into()]).is_err());
+
+        // cycle: the map already resolves s → l1, so merging l1 into s would loop.
+        save_merged_book_ids(&store, &BTreeMap::from([("s".into(), "l1".into())])).unwrap();
+        assert!(merge_books(&store, "s", &["l1".into()]).is_err());
+    }
+
+    #[test]
+    fn merge_books_preserves_existing_redirects_and_dedupes_losers() {
+        let store = Store::open_in_memory().unwrap();
+        put(&store, "books", &book_at("s", 1));
+        put(&store, "books", &book_at("l1", 1));
+        save_merged_book_ids(&store, &BTreeMap::from([("x".into(), "y".into())])).unwrap();
+
+        // duplicate loser id collapses to one entry; existing x→y untouched.
+        merge_books(&store, "s", &["l1".into(), "l1".into()]).unwrap();
+        let map = load_merged_book_ids(&store).unwrap();
+        assert_eq!(map.get("x").map(String::as_str), Some("y"));
+        assert_eq!(map.get("l1").map(String::as_str), Some("s"));
+    }
+
+    #[test]
+    fn merge_books_completed_rerun_is_a_noop() {
+        let store = Store::open_in_memory().unwrap();
+        put(&store, "books", &book_at("s", 100));
+        put(&store, "books", &book_at("l1", 50));
+        put(&store, "notes", &note("n1", Some("l1"), &["a"], 1));
+
+        let first = merge_books(&store, "s", &["l1".into()]).unwrap();
+        assert_eq!(first.reassignments.len(), 1);
+
+        // Second run: l1 is already tombstoned — it's skipped entirely, so the retry token is EMPTY
+        // (no losers, no reassignments), not a token that would resurrect an empty duplicate on undo.
+        let second = merge_books(&store, "s", &["l1".into()]).unwrap();
+        assert!(
+            second.loser_ids.is_empty(),
+            "an already-merged loser is not re-recorded"
+        );
+        assert!(
+            second.reassignments.is_empty(),
+            "no notes to rehome on a completed re-run"
+        );
+        assert_eq!(book_id_of(&store, "n1").as_deref(), Some("s"));
+        assert!(is_deleted(&store, "books", "l1"));
+    }
+
+    #[test]
+    fn unmerge_of_a_completed_rerun_token_does_not_resurrect_a_duplicate() {
+        // The founder's case: merge, then a completed-merge RETRY, then undo the RETRY's token. The
+        // retry merged nothing live, so its token is empty and undo is a no-op — the loser must NOT
+        // come back as an empty live duplicate, and the survivor keeps the merged created_at.
+        let store = Store::open_in_memory().unwrap();
+        put(&store, "books", &book_at("s", 100));
+        put(&store, "books", &book_at("l1", 50));
+        put(&store, "notes", &note("n1", Some("l1"), &["a"], 1));
+
+        merge_books(&store, "s", &["l1".into()]).unwrap();
+        let retry = merge_books(&store, "s", &["l1".into()]).unwrap();
+
+        unmerge_books(&store, &retry).unwrap();
+
+        assert!(
+            is_deleted(&store, "books", "l1"),
+            "loser stays merged away — no duplicate resurrected"
+        );
+        assert_eq!(
+            book_id_of(&store, "n1").as_deref(),
+            Some("s"),
+            "note stays on the survivor"
+        );
+        assert_eq!(
+            store.get_row("books", "s").unwrap().unwrap()["created_at"].as_i64(),
+            Some(50),
+            "survivor keeps the merged created_at"
+        );
+    }
+
+    #[test]
+    fn merge_books_resumes_after_interruption_before_tombstone() {
+        // Simulate a crash AFTER the map write + note rehome but BEFORE the loser tombstone:
+        // the map has l1→s and the note lives on s, but l1 is still live. A re-run must complete.
+        let store = Store::open_in_memory().unwrap();
+        put(&store, "books", &book_at("s", 100));
+        put(&store, "books", &book_at("l1", 50));
+        put(&store, "notes", &note("n1", Some("s"), &["a"], 1)); // already rehomed
+        save_merged_book_ids(&store, &BTreeMap::from([("l1".into(), "s".into())])).unwrap();
+        assert!(
+            !is_deleted(&store, "books", "l1"),
+            "precondition: loser still live"
+        );
+
+        merge_books(&store, "s", &["l1".into()]).unwrap();
+
+        assert!(
+            is_deleted(&store, "books", "l1"),
+            "re-run completes the tombstone"
+        );
+        assert_eq!(book_id_of(&store, "n1").as_deref(), Some("s"));
+    }
+
+    #[test]
+    fn merge_books_rehomes_decrypt_failed_and_stranded_notes_converge_via_map() {
+        // A live note whose text can't decrypt is still rehomed (merge is store-level, no keys),
+        // and a SECOND device that only has the map (not the local rehome) converges the same note
+        // through reconcile_stranded_notes.
+        let store = Store::open_in_memory().unwrap();
+        put(&store, "books", &book_at("s", 10));
+        put(&store, "books", &book_at("l1", 5));
+        // foreign/undecryptable ciphertext — merge_books never touches it.
+        put(
+            &store,
+            "notes",
+            &json!({ "id": "bad", "book_id": "l1", "text": "enc:v2:FOREIGN",
+            "tags": [], "created_at": 1, "updated_at": 1, "deleted": false }),
+        );
+        merge_books(&store, "s", &["l1".into()]).unwrap();
+        assert_eq!(book_id_of(&store, "bad").as_deref(), Some("s"));
+
+        // Device B: note still on the (now soft-deleted) loser, map copied over → converges on pull.
+        let dev_b = Store::open_in_memory().unwrap();
+        put(&dev_b, "books", &book_at("s", 5));
+        put(
+            &dev_b,
+            "books",
+            &json!({ "id": "l1", "title": "T", "created_at": 5, "updated_at": 9, "deleted": true }),
+        );
+        put(&dev_b, "notes", &note("bad", Some("l1"), &[], 1));
+        save_merged_book_ids(&dev_b, &BTreeMap::from([("l1".into(), "s".into())])).unwrap();
+        let (rehomed, _) = reconcile_stranded_notes(&dev_b).unwrap();
+        assert_eq!(rehomed, 1);
+        assert_eq!(book_id_of(&dev_b, "bad").as_deref(), Some("s"));
+    }
+
+    #[test]
+    fn unmerge_books_restores_state_and_prunes_only_matching_redirects() {
+        let store = Store::open_in_memory().unwrap();
+        put(&store, "books", &book_at("s", 100));
+        put(&store, "books", &book_at("l1", 50));
+        put(&store, "notes", &note("n1", Some("l1"), &["a"], 1));
+        // an UNRELATED redirect into a different survivor must survive the undo.
+        save_merged_book_ids(&store, &BTreeMap::from([("other".into(), "z".into())])).unwrap();
+
+        let undo = merge_books(&store, "s", &["l1".into()]).unwrap();
+        unmerge_books(&store, &undo).unwrap();
+
+        assert_eq!(
+            book_id_of(&store, "n1").as_deref(),
+            Some("l1"),
+            "note restored to its loser"
+        );
+        assert!(!is_deleted(&store, "books", "l1"), "loser un-tombstoned");
+        assert_eq!(
+            store.get_row("books", "s").unwrap().unwrap()["created_at"].as_i64(),
+            Some(100),
+            "survivor created_at restored"
+        );
+        let map = load_merged_book_ids(&store).unwrap();
+        assert!(!map.contains_key("l1"), "this merge's redirect pruned");
+        assert_eq!(
+            map.get("other").map(String::as_str),
+            Some("z"),
+            "unrelated redirect kept"
+        );
+    }
+
+    /// The `deleted` field a flush would push for `book_id`, collapsing the CURRENT outbox exactly
+    /// as `flush` does (`Some(true)` = tombstone on the wire, `Some(false)` = live, `None` = no
+    /// queued write for that book).
+    fn collapsed_book_deleted(store: &Store, book_id: &str) -> Option<bool> {
+        let items: Vec<crate::sync::outbox::OutboxItem> = store
+            .outbox_items()
+            .unwrap()
+            .into_iter()
+            .map(|(id, table_name, record_id, payload, created_at)| {
+                crate::sync::outbox::OutboxItem {
+                    id,
+                    table_name,
+                    record_id,
+                    payload: serde_json::from_str(&payload).unwrap(),
+                    created_at,
+                }
+            })
+            .collect();
+        crate::sync::outbox::collapse(items, &BTreeMap::new())
+            .into_iter()
+            .find(|g| {
+                g.table == "books" && g.payload.get("id").and_then(Value::as_str) == Some(book_id)
+            })
+            .map(|g| matches!(g.payload.get("deleted"), Some(Value::Bool(true))))
+    }
+
+    #[test]
+    fn unmerge_before_flush_resurrects_loser_on_the_wire_not_a_sticky_tombstone() {
+        // Merge then undo BEFORE any flush. The outbox collapse makes `deleted` sticky, so without
+        // neutralizing the queued tombstone the loser would flush as deleted:true and the undo would
+        // never reach the server — this asserts the flush now pushes it LIVE.
+        let store = Store::open_in_memory().unwrap();
+        put(&store, "books", &book_at("s", 100));
+        put(&store, "books", &book_at("l1", 50));
+        put(&store, "notes", &note("n1", Some("l1"), &["a"], 1));
+
+        let undo = merge_books(&store, "s", &["l1".into()]).unwrap();
+        assert_eq!(
+            collapsed_book_deleted(&store, "l1"),
+            Some(true),
+            "merge queues the tombstone"
+        );
+
+        unmerge_books(&store, &undo).unwrap();
+        assert_eq!(
+            collapsed_book_deleted(&store, "l1"),
+            Some(false),
+            "undo-before-flush must resurrect the loser on the wire, not a sticky tombstone"
+        );
+    }
+
+    #[test]
+    fn unmerge_books_is_idempotent() {
+        let store = Store::open_in_memory().unwrap();
+        put(&store, "books", &book_at("s", 100));
+        put(&store, "books", &book_at("l1", 50));
+        put(&store, "notes", &note("n1", Some("l1"), &["a"], 1));
+
+        let undo = merge_books(&store, "s", &["l1".into()]).unwrap();
+        unmerge_books(&store, &undo).unwrap();
+        unmerge_books(&store, &undo).unwrap(); // second call: no panic, state unchanged.
+
+        assert_eq!(book_id_of(&store, "n1").as_deref(), Some("l1"));
+        assert!(!is_deleted(&store, "books", "l1"));
+    }
+
+    #[test]
+    fn merge_content_duplicates_collapses_into_explicit_survivor() {
+        let store = Store::open_in_memory().unwrap();
+        // Three notes in ONE content_tag cluster; the host picks the middle one as survivor
+        // (NOT the deterministic most-tags/earliest pick the auto-dedup would choose).
+        put(
+            &store,
+            "notes",
+            &note_ct("rich", None, "TAG", &["a", "b", "c"]),
+        );
+        put(&store, "notes", &note_ct("pick", None, "TAG", &["b"]));
+        put(&store, "notes", &note_ct("dup", None, "TAG", &["d"]));
+
+        let collapsed =
+            merge_content_duplicates(&store, "pick", &["rich".into(), "dup".into()], false)
+                .unwrap();
+
+        assert_eq!(collapsed, 2);
+        assert!(
+            !is_deleted(&store, "notes", "pick"),
+            "host-picked survivor kept"
+        );
+        assert!(is_deleted(&store, "notes", "rich"));
+        assert!(is_deleted(&store, "notes", "dup"));
+        // survivor unions all cluster tags (survivor-first order).
+        let tags: Vec<String> = store.get_row("notes", "pick").unwrap().unwrap()["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(tags, vec!["b", "a", "c", "d"]);
+    }
+
+    #[test]
+    fn merge_content_duplicates_exact_rejects_cross_cluster_but_fuzzy_allows() {
+        let store = Store::open_in_memory().unwrap();
+        put(&store, "notes", &note_ct("s", None, "TAG_A", &["a"]));
+        put(&store, "notes", &note_ct("l", None, "TAG_B", &["b"])); // different cluster
+
+        // exact path refuses the cross-cluster loser.
+        assert!(merge_content_duplicates(&store, "s", &["l".into()], false).is_err());
+        assert!(
+            !is_deleted(&store, "notes", "l"),
+            "rejected merge changed nothing"
+        );
+
+        // fuzzy path (allow_cross_cluster) collapses across clusters.
+        let collapsed = merge_content_duplicates(&store, "s", &["l".into()], true).unwrap();
+        assert_eq!(collapsed, 1);
+        assert!(is_deleted(&store, "notes", "l"));
+    }
+
+    #[test]
+    fn merge_content_duplicates_validates_inputs() {
+        let store = Store::open_in_memory().unwrap();
+        put(&store, "notes", &note_ct("s", None, "TAG", &["a"]));
+        put(&store, "notes", &note_ct("live", None, "TAG", &["b"]));
+
+        assert!(merge_content_duplicates(&store, "", &["live".into()], false).is_err()); // empty survivor
+        assert_eq!(
+            merge_content_duplicates(&store, "s", &[], false).unwrap(),
+            0
+        ); // no losers
+        assert!(merge_content_duplicates(&store, "s", &["ghost".into()], false).is_err()); // missing loser
+                                                                                           // survivor with no content_tag can't anchor an exact cluster.
+        put(&store, "notes", &note("untagged", None, &["x"], 1));
+        assert!(merge_content_duplicates(&store, "untagged", &["live".into()], false).is_err());
     }
 }
