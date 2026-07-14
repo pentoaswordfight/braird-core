@@ -462,16 +462,11 @@ impl Store {
         rows.collect()
     }
 
-    /// Drop un-flushed outbox entries for `record_id` in `table` that carry a truthy `deleted` — a
-    /// pending tombstone. Returns the count dropped. For RESURRECTION paths (SUR-915
-    /// `unmerge_books` undoing a merge's loser tombstone before it flushes): the outbox collapse
-    /// treats `deleted` as **sticky** (a queued delete is never un-set by a later edit in the same
-    /// batch — the SUR-724 "delete wins, never resurrect" hardening), so a pending tombstone would
-    /// force `deleted:true` onto the collapsed upsert and defeat a resurrection staged after it.
-    /// Dropping the pending tombstone first lets the resurrection flush clean; if the tombstone
-    /// already flushed there is nothing here to drop and the resurrection un-deletes via the
-    /// server's own LWW (the queued `deleted:false` carries the later `updated_at`).
-    pub fn drop_pending_deletes(&self, table: &str, record_id: &str) -> rusqlite::Result<usize> {
+    /// Delete un-flushed outbox tombstones (`deleted` truthy) for `record_id` in `table`, returning
+    /// the count. **Non-transactional** — the caller owns the transaction (see
+    /// [`Store::stage_local_write_resurrecting`]), so the drop and the resurrection that follows
+    /// commit as one unit and a crash between them can't diverge the store.
+    fn drop_pending_deletes_inner(&self, table: &str, record_id: &str) -> rusqlite::Result<usize> {
         let entries: Vec<(i64, String)> = {
             let mut stmt = self.conn.prepare(
                 "SELECT id, payload FROM outbox WHERE table_name = ?1 AND record_id = ?2",
@@ -758,6 +753,19 @@ impl Store {
         // so there is no concurrent use of this connection. On any early `?` the `Transaction` drops
         // and rolls back (its default drop behaviour); only `commit()` persists the pair.
         let tx = self.conn.unchecked_transaction()?;
+        self.stage_write_inner(table, record_id, partial, created_at)?;
+        tx.commit()
+    }
+
+    /// Non-transactional core of [`stage_local_write`]: merge `partial` onto the existing row,
+    /// upsert the merged row, and enqueue the partial payload. The caller owns the transaction.
+    fn stage_write_inner(
+        &self,
+        table: &str,
+        record_id: &str,
+        partial: Map<String, Value>,
+        created_at: i64,
+    ) -> rusqlite::Result<()> {
         let mut merged = self.get_row(table, record_id)?.unwrap_or_default();
         for (k, v) in &partial {
             merged.insert(k.clone(), v.clone());
@@ -765,6 +773,28 @@ impl Store {
         self.apply_row(table, &merged)?;
         let payload = Value::Object(partial).to_string();
         self.enqueue(table, record_id, &payload, created_at)?;
+        Ok(())
+    }
+
+    /// Like [`stage_local_write`], but atomically drops any un-flushed tombstone for `record_id`
+    /// FIRST, in the SAME transaction. For RESURRECTION / undo paths (SUR-915 `unmerge_books`): the
+    /// outbox collapse makes `deleted` sticky (a queued delete is never un-set by a later edit in
+    /// the same batch — the SUR-724 "delete wins, never resurrect" hardening), so a resurrection
+    /// must remove the queued tombstone. Doing both in one transaction means a crash can't leave the
+    /// row soft-deleted with the tombstone dropped but the `deleted:false` resurrection never
+    /// enqueued — a divergence a restart couldn't retry, since the undo token is ephemeral. Either
+    /// the whole resurrection commits or none of it does. If no tombstone is queued (it already
+    /// flushed) the drop is a no-op and the staged `deleted:false` un-deletes via the server's LWW.
+    pub fn stage_local_write_resurrecting(
+        &self,
+        table: &str,
+        record_id: &str,
+        partial: Map<String, Value>,
+        created_at: i64,
+    ) -> rusqlite::Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        self.drop_pending_deletes_inner(table, record_id)?;
+        self.stage_write_inner(table, record_id, partial, created_at)?;
         tx.commit()
     }
 

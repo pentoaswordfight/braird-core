@@ -1088,15 +1088,20 @@ pub fn merge_books(
     }
     save_merged_book_ids(store, &map)?;
 
-    // ── 2. Rehome each loser's live notes; capture undo; track earliest created_at. ──
+    // ── 2. Rehome each LIVE loser's notes; capture undo; track earliest created_at. A loser that's
+    // missing locally OR already soft-deleted (e.g. a completed-merge retry) is NOT something this
+    // invocation tombstones, so it's skipped — never added to the undo token or the tombstone loop.
+    // Its redirect stays recorded (step 1) so a later pull still converges. This keeps a retry a
+    // true no-op and stops `unmerge_books` on a retry token from resurrecting an empty duplicate. ──
     for lid in &losers {
-        if let Some(loser) = store
+        let loser = match store
             .get_row("books", lid)
             .map_err(|e| format!("merge_books: get loser {lid}: {e}"))?
         {
-            earliest = earliest.min(row_i64(&loser, "created_at"));
-        }
-        // absent-locally losers keep their recorded redirect; a later pull backfills + reconciles.
+            Some(b) if !matches!(b.get("deleted"), Some(Value::Bool(true))) => b,
+            _ => continue, // missing or already-deleted — nothing for this invocation to merge
+        };
+        earliest = earliest.min(row_i64(&loser, "created_at"));
 
         let notes = store
             .list_live("notes", Some(("book_id", lid)), -1, 0)
@@ -1117,6 +1122,13 @@ pub fn merge_books(
             });
         }
         undo.loser_ids.push(lid.clone());
+    }
+
+    // No live loser was merged this invocation (a completed-merge retry, or an all-missing/deleted
+    // loser set): skip the survivor bump + tombstone loop and return an empty undo token, which
+    // `unmerge_books` treats as a no-op. The redirect map was still (idempotently) recorded above.
+    if undo.loser_ids.is_empty() {
+        return Ok(undo);
     }
 
     // ── 3. Survivor keeps the earliest created_at across the cluster (mirrors the oracle, which
@@ -1169,21 +1181,18 @@ pub fn unmerge_books(store: &Store, undo: &BookMergeUndo) -> Result<(), String> 
     }
 
     for lid in &undo.loser_ids {
-        // Neutralize an un-flushed merge tombstone FIRST: the outbox collapse makes `deleted`
-        // sticky ("delete wins" — SUR-724), so a resurrection staged behind a queued tombstone
-        // would flush as `deleted:true` and leave the undo ineffective on the server. If the
-        // tombstone already flushed there's nothing to drop and the resurrection un-deletes via
-        // the server's LWW.
-        store
-            .drop_pending_deletes("books", lid)
-            .map_err(|e| format!("unmerge_books: drop pending tombstone {lid}: {e}"))?;
+        // Resurrect the loser ATOMICALLY: the outbox collapse makes `deleted` sticky ("delete wins"
+        // — SUR-724), so a resurrection staged behind an un-flushed merge tombstone would flush as
+        // `deleted:true`. `stage_local_write_resurrecting` drops the pending tombstone and stages the
+        // `deleted:false` write in ONE transaction — a crash can't leave the row soft-deleted with
+        // the tombstone gone but the resurrection unqueued (the ephemeral undo token can't retry).
         let mut patch = Map::new();
         patch.insert("id".into(), json!(lid));
         patch.insert("deleted".into(), json!(false));
         patch.insert("updated_at".into(), json!(now));
         store
-            .stage_local_write("books", lid, patch, now)
-            .map_err(|e| format!("unmerge_books: un-tombstone loser {lid}: {e}"))?;
+            .stage_local_write_resurrecting("books", lid, patch, now)
+            .map_err(|e| format!("unmerge_books: resurrect loser {lid}: {e}"))?;
     }
 
     let mut sp = Map::new();
@@ -2797,14 +2806,50 @@ mod tests {
         let first = merge_books(&store, "s", &["l1".into()]).unwrap();
         assert_eq!(first.reassignments.len(), 1);
 
-        // Second run: l1 is tombstoned and its notes already live on s — nothing left to move.
+        // Second run: l1 is already tombstoned — it's skipped entirely, so the retry token is EMPTY
+        // (no losers, no reassignments), not a token that would resurrect an empty duplicate on undo.
         let second = merge_books(&store, "s", &["l1".into()]).unwrap();
+        assert!(
+            second.loser_ids.is_empty(),
+            "an already-merged loser is not re-recorded"
+        );
         assert!(
             second.reassignments.is_empty(),
             "no notes to rehome on a completed re-run"
         );
         assert_eq!(book_id_of(&store, "n1").as_deref(), Some("s"));
         assert!(is_deleted(&store, "books", "l1"));
+    }
+
+    #[test]
+    fn unmerge_of_a_completed_rerun_token_does_not_resurrect_a_duplicate() {
+        // The founder's case: merge, then a completed-merge RETRY, then undo the RETRY's token. The
+        // retry merged nothing live, so its token is empty and undo is a no-op — the loser must NOT
+        // come back as an empty live duplicate, and the survivor keeps the merged created_at.
+        let store = Store::open_in_memory().unwrap();
+        put(&store, "books", &book_at("s", 100));
+        put(&store, "books", &book_at("l1", 50));
+        put(&store, "notes", &note("n1", Some("l1"), &["a"], 1));
+
+        merge_books(&store, "s", &["l1".into()]).unwrap();
+        let retry = merge_books(&store, "s", &["l1".into()]).unwrap();
+
+        unmerge_books(&store, &retry).unwrap();
+
+        assert!(
+            is_deleted(&store, "books", "l1"),
+            "loser stays merged away — no duplicate resurrected"
+        );
+        assert_eq!(
+            book_id_of(&store, "n1").as_deref(),
+            Some("s"),
+            "note stays on the survivor"
+        );
+        assert_eq!(
+            store.get_row("books", "s").unwrap().unwrap()["created_at"].as_i64(),
+            Some(50),
+            "survivor keeps the merged created_at"
+        );
     }
 
     #[test]
