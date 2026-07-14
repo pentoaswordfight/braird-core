@@ -13,6 +13,7 @@ use base64::Engine;
 use braird_core::store::Store;
 use braird_core::sync::http::{CoverEgress, PostgrestSink};
 use braird_core::sync::{pull, pull_and_reconcile, pull_then_flush, push};
+use braird_core::Vault;
 use serde_json::{json, Value};
 
 /// An unverified test JWT carrying `sub: <user_id>` — `pull_and_reconcile`/`user_id_from_jwt`
@@ -228,6 +229,7 @@ fn partial_pull_failure_aborts_the_flush() {
         &sink,
         "user-1",
         &["books", "notes"],
+        &Vault::generate(),
     ));
 
     assert!(outcome.is_err(), "a failed table must abort the flush");
@@ -263,8 +265,14 @@ fn pull_then_flush_pulls_then_flushes_on_a_clean_pull() {
         .unwrap();
     let sink = RecordingSink::new(one("books", vec![]));
 
-    let (pulled, _reconcile, flushed) =
-        block(pull_then_flush(&store, &sink, "user-1", &["books"])).expect("clean sync");
+    let (pulled, _reconcile, flushed) = block(pull_then_flush(
+        &store,
+        &sink,
+        "user-1",
+        &["books"],
+        &Vault::generate(),
+    ))
+    .expect("clean sync");
 
     assert!(pulled.failed_tables.is_empty());
     assert_eq!(flushed.ok.len(), 1, "the local edit flushed");
@@ -296,8 +304,14 @@ fn reconciliation_failure_does_not_abort_an_otherwise_clean_pull_then_flush() {
         .unwrap();
     let sink = RecordingSink::new(one("books", vec![]));
 
-    let (pulled, reconcile, flushed) = block(pull_then_flush(&store, &sink, "user-1", &["books"]))
-        .expect("reconciliation failure must not fail pull_then_flush");
+    let (pulled, reconcile, flushed) = block(pull_then_flush(
+        &store,
+        &sink,
+        "user-1",
+        &["books"],
+        &Vault::generate(),
+    ))
+    .expect("reconciliation failure must not fail pull_then_flush");
 
     assert!(
         pulled.failed_tables.is_empty(),
@@ -345,6 +359,7 @@ fn pull_and_reconcile_skips_reconciliation_on_a_partial_pull_failure() {
         &sink,
         &test_jwt("user-1"),
         &["notes", "custom_ideas"],
+        &Vault::generate(),
     ))
     .expect("a partial failure must not error the whole call");
 
@@ -394,6 +409,7 @@ fn pull_and_reconcile_runs_normally_on_a_fully_clean_pull() {
         &sink,
         &test_jwt("user-1"),
         &["notes", "custom_ideas"],
+        &Vault::generate(),
     ))
     .unwrap();
 

@@ -29,12 +29,17 @@
 //!    (`cidea_sur597_{userId}_{slug}`) is kept byte-identical to the oracle's
 //!    `preservedCustomIdeaId` for every orphaned tag (not just the 26 classical names), so a
 //!    core-created row converges with one the PWA already created for the same user+tag.
-//! 4. **`reconcile_content_dupes`** (SUR-835; `reconcileContentTags` + `mergeNotes` in `db.js`) —
-//!    live notes sharing a `content_tag` (the SUR-638 per-user HMAC content fingerprint) are
-//!    collapsed into one survivor, picked deterministically (most tags, then earliest `created_at`,
-//!    then lowest `id`) so two devices reconciling independently converge on the SAME keeper. The
-//!    losers' tags, image, `note_links` edges and `collection_memberships` are merged onto the
-//!    survivor and the losers soft-deleted — all through the outbox (LWW-safe).
+//! 4. **`reconcile_heal_content_tags`** (SUR-884; the self-heal half of `reconcileContentTags`)
+//!    then **`reconcile_content_dupes`** (SUR-835; `reconcileContentTags` + `mergeNotes` in
+//!    `db.js`). Self-heal first re-derives a null/empty `content_tag` from the note's decrypted
+//!    text (so a note whose tag was nulled by pass 2 above is re-tagged before dedup, not left for
+//!    its next edit) — the tag is written LOCAL-ONLY (no `updated_at` bump, mirroring the oracle),
+//!    never propagated. Then dedup collapses live notes sharing a `content_tag` (the SUR-638
+//!    per-user HMAC content fingerprint) into one survivor, picked deterministically (most tags,
+//!    then earliest `created_at`, then lowest `id`) so two devices reconciling independently
+//!    converge on the SAME keeper. The losers' tags, image, `note_links` edges and
+//!    `collection_memberships` are merged onto the survivor and the losers soft-deleted — all
+//!    through the outbox (LWW-safe).
 //! 5. **`reconcile_covers`** (SUR-828; `resolveCover` in `surfc/src/lib/coverResolver.js`) —
 //!    a coverless book gets its cover resolved via Open Library (ISBN → a deterministic
 //!    `covers.openlibrary.org` URL by pure construction, no egress; no-ISBN → the Search API for a
@@ -65,7 +70,9 @@ use serde_json::{json, Map, Value};
 use super::epoch_ms;
 use super::http::{CoverEgress, PostgrestSink};
 use super::outbox::resolve_book_id;
+use super::read::decrypt_note_text;
 use crate::store::Store;
+use crate::vault::Vault;
 
 /// The vendored canon (SUR-820 Canon-102 awareness) — baked into the binary at compile time
 /// (the vendored file does not exist on a host's filesystem at runtime). Drift-guarded against
@@ -106,14 +113,18 @@ const MERGED_BOOK_IDS_KEY: &str = "mergedBookIds";
 
 /// Run the full post-pull reconciliation pass. Order: books-backfill first (so a book fetched
 /// this pass is visible to the stranded-notes check that follows), then stranded-notes, then
-/// dropped-tags, then content-dedup, then cover-resolution (independent of the others).
-/// Content-dedup runs after stranded-notes because that pass nulls a rehomed note's now-stale
-/// `content_tag`, and a null-tagged note is (correctly) skipped by dedup. `user_id` is the token's
-/// `sub` — needed only for the dropped-tag pass's user-scoped custom-idea id.
+/// dropped-tags, then content-tag self-heal, then content-dedup, then cover-resolution
+/// (independent of the others). Self-heal runs AFTER stranded-notes (which nulls a rehomed note's
+/// now-stale `content_tag`) and immediately BEFORE content-dedup, so a note that lost its tag this
+/// pass is re-tagged in time to be clustered this same pass instead of waiting for its next edit.
+/// `user_id` is the token's `sub` — needed only for the dropped-tag pass's user-scoped custom-idea
+/// id. `vault` decrypts each tagless note to re-derive its tag (SUR-884) — the ONLY pass that needs
+/// keys; every other pass works on stored fields alone.
 pub async fn reconcile<S: PostgrestSink + CoverEgress>(
     store: &Store,
     sink: &S,
     user_id: &str,
+    vault: &Vault,
 ) -> Result<ReconcileResult, String> {
     let books_backfilled = reconcile_books(store, sink).await?;
     let (notes_rehomed, notes_detached) = reconcile_stranded_notes(store)?;
@@ -123,6 +134,21 @@ pub async fn reconcile<S: PostgrestSink + CoverEgress>(
         eprintln!("reconcile: dropped-tag pass failed (non-fatal, retries next pull): {e}");
         0
     });
+    // Best-effort, same posture: re-derive missing content_tags so the dedup pass below can see
+    // them. A heal hiccup must never fail the pull — it retries next pull (idempotent). The count
+    // is logged, not surfaced across the FFI (no `ReconcileSummary` field), to keep the binding
+    // frozen — this whole ticket ships as a core-pin bump with no host change.
+    match reconcile_heal_content_tags(store, vault) {
+        Ok(0) => {}
+        Ok(healed) => {
+            eprintln!("reconcile: content-tag self-heal re-derived {healed} missing tag(s)")
+        }
+        Err(e) => {
+            eprintln!(
+                "reconcile: content-tag self-heal pass failed (non-fatal, retries next pull): {e}"
+            )
+        }
+    }
     // Best-effort, same posture as the dropped-tag pass: a content-dedup hiccup must never fail
     // the pull it follows — it simply retries next pull (the pass is idempotent).
     let dupes_collapsed = reconcile_content_dupes(store).unwrap_or_else(|e| {
@@ -363,6 +389,106 @@ fn preserved_custom_idea_id(user_id: &str, name: &str) -> String {
         .collect::<Vec<_>>()
         .join("_");
     format!("cidea_sur597_{user_id}_{slug}")
+}
+
+/// Step 2e-pre (SUR-884) — content-tag SELF-HEAL, the second half of the PWA's
+/// `reconcileContentTags` (`surfc/src/db.js`). For every LIVE note with a null/empty `content_tag`
+/// but decryptable text, re-derive the tag (`Vault::content_tag` = the SUR-638 per-user HMAC over
+/// `normalize(plaintext)` + `book_id`) and persist it, so the [`reconcile_content_dupes`] pass that
+/// follows — which keys on the STORED tag and never decrypts — can cluster it. Without this, a note
+/// whose tag was nulled by [`reconcile_stranded_notes`] (a rehome/detach makes the old tag stale,
+/// since `book_id` is HMAC input) stays tagless and un-clustered on native until its next user edit
+/// re-seals it; the PWA heals it at load, so this closes the parity gap.
+///
+/// **Local-only, never propagated — matches the oracle byte-for-byte and is the safe choice.** The
+/// PWA persists the healed tag with NO `updatedAt` bump (`db.notes.update(id, { contentTag })`), so
+/// it never enters the sync/LWW path; each device re-derives the SAME tag independently (the
+/// derivation is deterministic in MK + plaintext + book_id). We mirror that with [`Store::apply_row`]
+/// — the same local-only primitive the map-less detach in [`reconcile_stranded_notes`] uses — NOT
+/// `stage_local_write`. Propagating instead would be actively wrong: `notes` is **whole-row LWW**
+/// (`store.rs`), so a heal write bumping `updated_at` would let this tag-only version WIN THE WHOLE
+/// ROW and clobber a concurrent field edit another device hasn't pushed yet. Convergence still holds:
+/// the dedup pass's loser soft-delete DOES propagate (SUR-835, LWW-safe), and two devices that
+/// re-derive identical tags pick the same survivor. Cost: the tagless note is re-derived every pull
+/// (its stored/server tag stays null), which is cheap — one decrypt + one HMAC per null note, and
+/// null tags are rare (only rehome/detach produce them).
+///
+/// **Decrypt-failure gate (mirrors the oracle's `decryptError` skip).** Plaintext is read through
+/// [`decrypt_note_text`] — the exact gate the display path uses — so a note that fails to decrypt
+/// (foreign/corrupt ciphertext, wrong key) is left tagless, never fingerprinted from unreadable
+/// bytes. A note with genuinely no text (an ABSENT `text` column → `None`) is skipped too. This
+/// matches the oracle's `n.text == null` guard EXACTLY, including the empty-string case: `"" == null`
+/// is false in JS, so the PWA fingerprints empty text, and so do we (`decrypt_note_text` yields
+/// `Some("")`, which is tagged). Two empty-text notes in one book therefore share a tag and the
+/// dedup pass collapses them — the same effect `enqueue_note` already produces by tagging empty text
+/// at write (pre-existing SUR-835); whether dedup should exclude empty/image-only notes is a SUR-835
+/// question, not this pass's. Per-note isolation: one unreadable/unwritable row is logged and
+/// skipped, never aborting the pass. Idempotent: a second pass finds every note already tagged and
+/// heals nothing.
+///
+/// **Detach-window convergence (self-correcting).** [`reconcile_stranded_notes`]'s map-less DETACH
+/// arm is local-only (`book_id` → null, never pushed), so a device without the merge map briefly
+/// heals a note to `content_tag(text, None)` while a map-holding device heals it to
+/// `content_tag(text, survivor)` and may collapse it. This is transient, not a lost write: the
+/// collapse's loser soft-delete propagates as an `id`-keyed, idempotent tombstone (so both devices
+/// converge on the same deleted row), and the rehomed `book_id=survivor` propagates too, so the
+/// lagging device re-derives the identical tag on a later pull. Steady state is identical on every
+/// device (SUR-820 invariant).
+///
+/// This is the ONE reconcile pass that holds keys. That's a deliberate, bounded crossing of the
+/// otherwise key-less sync layer (ADR 0003), and it follows the exact precedent the SUR-744 read
+/// surface already set — `sync::read` takes `&Vault` to decrypt on the way out. Plaintext here is
+/// transient (never persisted; only the opaque HMAC tag is written), same invariant as the read
+/// path. Flagged for `crypto-reviewer`.
+fn reconcile_heal_content_tags(store: &Store, vault: &Vault) -> Result<usize, String> {
+    let notes = store
+        .list_live("notes", None, -1, 0)
+        .map_err(|e| format!("list notes: {e}"))?;
+
+    let mut healed = 0;
+    for row in &notes {
+        // Only tagless notes need healing — a present, non-empty tag is left untouched (and makes
+        // the pass idempotent). Same emptiness test as `reconcile_content_dupes`' grouping.
+        let has_tag = row
+            .get("content_tag")
+            .and_then(Value::as_str)
+            .is_some_and(|t| !t.is_empty());
+        if has_tag {
+            continue;
+        }
+
+        let note_id = row
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+
+        // Re-derive from plaintext, gated exactly like the display path.
+        let (text, decrypt_failed) = decrypt_note_text(row, &note_id, vault);
+        if decrypt_failed {
+            continue; // never fingerprint unreadable ciphertext (oracle's decryptError skip)
+        }
+        let Some(plaintext) = text else {
+            continue; // no text — nothing to fingerprint (oracle's `n.text == null` skip)
+        };
+        let book_id = row
+            .get("book_id")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let tag = vault.content_tag(plaintext, book_id);
+
+        // Persist LOCAL-ONLY: clone the stored row, set the tag, leave `updated_at` as-is, write
+        // via `apply_row` (no outbox, no LWW bump — see the doc comment on why propagation is wrong).
+        let mut patched = row.clone();
+        patched.insert("content_tag".into(), json!(tag));
+        match store.apply_row("notes", &patched) {
+            Ok(()) => healed += 1,
+            Err(e) => {
+                eprintln!("reconcile_heal_content_tags: apply healed tag for note {note_id} failed, skipping: {e}")
+            }
+        }
+    }
+    Ok(healed)
 }
 
 /// Step 2e (SUR-835) — retroactive content-tag dedup. Collapse live notes that share a
@@ -1302,7 +1428,10 @@ mod tests {
             .with("books", vec![book("missing-book", false)])
             .with_app_config(OPENLIBRARY_EGRESS_KEY, json!({ "enabled": false }));
 
-        let first = block(reconcile(&store, &sink, "user-1")).unwrap();
+        // Self-heal is a no-op here: the fixtures' `text` is fake ciphertext ("enc:v2:x") that
+        // can't decrypt, so every tagless note is skipped and no tag is re-derived.
+        let vault = Vault::generate();
+        let first = block(reconcile(&store, &sink, "user-1", &vault)).unwrap();
         assert_eq!(
             first,
             ReconcileResult {
@@ -1315,7 +1444,7 @@ mod tests {
             }
         );
 
-        let second = block(reconcile(&store, &sink, "user-1")).unwrap();
+        let second = block(reconcile(&store, &sink, "user-1", &vault)).unwrap();
         assert_eq!(
             second,
             ReconcileResult::default(),
@@ -1612,6 +1741,214 @@ mod tests {
             reconcile_content_dupes(&store).unwrap(),
             0,
             "only the survivor is live with tag T — nothing left to collapse"
+        );
+    }
+
+    // ── reconcile_heal_content_tags (SUR-884) ────────────────────────────────
+
+    /// A live note whose `text` is REAL ciphertext sealed by `vault` (so heal can decrypt it),
+    /// with the `content_tag` left absent (null) — the tagless state heal is meant to repair.
+    fn tagless_note(vault: &Vault, id: &str, book_id: Option<&str>, plaintext: &str) -> Value {
+        json!({
+            "id": id,
+            "book_id": book_id,
+            "text": vault.encrypt_note(Some(id.to_string()), plaintext.to_string()),
+            "tags": [],
+            "created_at": 1,
+            "updated_at": 1,
+            "deleted": false,
+        })
+    }
+
+    fn stored_tag(store: &Store, id: &str) -> Option<String> {
+        store
+            .get_row("notes", id)
+            .unwrap()
+            .unwrap()
+            .get("content_tag")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    }
+
+    #[test]
+    fn heals_a_tagless_note_by_re_deriving_from_decrypted_text() {
+        // The core AC: a live note with a null content_tag + decryptable text gets its tag
+        // re-derived WITHOUT a user edit, and the value is exactly what enqueue_note would have
+        // sealed in (self-consistent with the same vault's derivation).
+        let store = Store::open_in_memory().unwrap();
+        let vault = Vault::generate();
+        put(
+            &store,
+            "notes",
+            &tagless_note(&vault, "n1", Some("book-1"), "the unexamined life"),
+        );
+
+        let healed = reconcile_heal_content_tags(&store, &vault).unwrap();
+
+        assert_eq!(healed, 1);
+        let expected = vault.content_tag("the unexamined life".into(), Some("book-1".into()));
+        assert_eq!(stored_tag(&store, "n1").as_deref(), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn heal_then_dedup_collapses_a_pair_a_stranded_null_created() {
+        // End-to-end intent: reconcile_stranded_notes nulls a rehomed note's tag; heal re-derives
+        // it; dedup then collapses it against its identical twin — all in one reconcile pass. Here
+        // we simulate the post-stranded state: two notes with the SAME plaintext + book, one still
+        // tagged (the twin), one tag-nulled. After heal they share a tag and dedup collapses them.
+        let store = Store::open_in_memory().unwrap();
+        let vault = Vault::generate();
+        let tag = vault.content_tag("same passage".into(), Some("b1".into()));
+
+        // The twin keeps its tag and 2 tags (so it's the deterministic survivor).
+        let mut twin = tagless_note(&vault, "keep", Some("b1"), "same passage");
+        twin["content_tag"] = json!(tag);
+        twin["tags"] = json!(["a", "b"]);
+        put(&store, "notes", &twin);
+        // The rehome-nulled duplicate: same content, no tag yet.
+        put(
+            &store,
+            "notes",
+            &tagless_note(&vault, "dupe", Some("b1"), "same passage"),
+        );
+
+        assert_eq!(reconcile_heal_content_tags(&store, &vault).unwrap(), 1);
+        assert_eq!(stored_tag(&store, "dupe").as_deref(), Some(tag.as_str()));
+        // Now dedup sees two notes sharing `tag` and collapses the duplicate into the survivor.
+        assert_eq!(reconcile_content_dupes(&store).unwrap(), 1);
+        assert_eq!(live_ids(&store, "notes"), vec!["keep"]);
+        assert!(is_deleted(&store, "notes", "dupe"));
+    }
+
+    #[test]
+    fn skips_a_note_whose_ciphertext_cannot_be_decrypted() {
+        // Mirror the oracle's decryptError gate: a note sealed under a DIFFERENT vault can't be
+        // decrypted, so it's left tagless — never fingerprinted from unreadable bytes.
+        let store = Store::open_in_memory().unwrap();
+        let mine = Vault::generate();
+        let foreign = Vault::generate();
+        put(
+            &store,
+            "notes",
+            &tagless_note(&foreign, "n1", Some("b1"), "not mine to read"),
+        );
+
+        let healed = reconcile_heal_content_tags(&store, &mine).unwrap();
+
+        assert_eq!(
+            healed, 0,
+            "an undecryptable note is skipped, not fingerprinted"
+        );
+        assert_eq!(stored_tag(&store, "n1"), None, "tag stays null");
+    }
+
+    #[test]
+    fn leaves_an_already_tagged_note_untouched() {
+        // A present, non-empty tag is never recomputed — that's what makes the pass idempotent and
+        // keeps it off notes whose tag is already correct.
+        let store = Store::open_in_memory().unwrap();
+        let vault = Vault::generate();
+        put(&store, "notes", &cnote("n1", "PRESET", &["a"], 1, None));
+
+        assert_eq!(reconcile_heal_content_tags(&store, &vault).unwrap(), 0);
+        assert_eq!(stored_tag(&store, "n1").as_deref(), Some("PRESET"));
+    }
+
+    #[test]
+    fn heal_write_is_local_only_and_does_not_bump_updated_at() {
+        // The convergence-critical invariant: the healed tag is written via apply_row, NOT the
+        // outbox — so it never enters the LWW/sync path (notes are whole-row LWW; a bumped
+        // updated_at would clobber a concurrent edit). Assert nothing is queued and updated_at is
+        // preserved.
+        let store = Store::open_in_memory().unwrap();
+        let vault = Vault::generate();
+        put(
+            &store,
+            "notes",
+            &tagless_note(&vault, "n1", Some("b1"), "local only"),
+        );
+        let before = store.outbox_items().unwrap().len();
+
+        assert_eq!(reconcile_heal_content_tags(&store, &vault).unwrap(), 1);
+
+        assert_eq!(
+            store.outbox_items().unwrap().len(),
+            before,
+            "healed tag must NOT be staged to the outbox (local-only, never propagated)"
+        );
+        let updated_at = store
+            .get_row("notes", "n1")
+            .unwrap()
+            .unwrap()
+            .get("updated_at")
+            .and_then(Value::as_i64);
+        assert_eq!(
+            updated_at,
+            Some(1),
+            "updated_at must be preserved, not bumped"
+        );
+    }
+
+    #[test]
+    fn is_idempotent_a_second_pass_heals_nothing() {
+        let store = Store::open_in_memory().unwrap();
+        let vault = Vault::generate();
+        put(
+            &store,
+            "notes",
+            &tagless_note(&vault, "n1", None, "idempotent"),
+        );
+
+        assert_eq!(reconcile_heal_content_tags(&store, &vault).unwrap(), 1);
+        assert_eq!(
+            reconcile_heal_content_tags(&store, &vault).unwrap(),
+            0,
+            "the note is already tagged — a second pass is a no-op"
+        );
+    }
+
+    #[test]
+    fn empty_text_is_tagged_and_collapses_like_the_oracle() {
+        // Pins the empty-text behavior (sync-reviewer ask). The oracle's guard is `n.text == null`,
+        // and `"" == null` is FALSE in JS, so the PWA fingerprints empty text too — we match it:
+        // `decrypt_note_text` yields `Some("")`, which is tagged (only an ABSENT text column,
+        // `None`, is skipped). Two empty-text notes in the same book therefore share a tag and the
+        // dedup pass collapses them — this is the same behavior `enqueue_note` already produces by
+        // tagging empty text at write time (pre-existing SUR-835), not new to self-heal. Whether
+        // content-dedup SHOULD exclude empty/image-only notes is a SUR-835 question, out of scope
+        // here; this test just locks the current, oracle-matching behavior so it can't drift silently.
+        let store = Store::open_in_memory().unwrap();
+        let vault = Vault::generate();
+        put(&store, "notes", &tagless_note(&vault, "e1", Some("b1"), ""));
+        put(&store, "notes", &tagless_note(&vault, "e2", Some("b1"), ""));
+
+        assert_eq!(reconcile_heal_content_tags(&store, &vault).unwrap(), 2);
+        let expected = vault.content_tag(String::new(), Some("b1".into()));
+        assert_eq!(stored_tag(&store, "e1").as_deref(), Some(expected.as_str()));
+        assert_eq!(stored_tag(&store, "e2").as_deref(), Some(expected.as_str()));
+        // ...and dedup then collapses the pair (both empty → same tag), like the oracle clusters them.
+        assert_eq!(reconcile_content_dupes(&store).unwrap(), 1);
+    }
+
+    /// The AC's byte-parity assertion: heal end-to-end reproduces the PWA's SUR-638 known-answer
+    /// vector (MK = 0x11*32, text "hello world", bookId "book-1" → a663…bb05). Gated on the
+    /// `test-seams` fixed-MK constructor (same seam `tests/parity.rs` uses); the derivation itself
+    /// is locked to this vector there too, so this proves the HEAL PATH feeds it correctly.
+    #[cfg(feature = "test-seams")]
+    #[test]
+    fn healed_tag_byte_matches_the_pwa_sur638_vector() {
+        let store = Store::open_in_memory().unwrap();
+        let vault = Vault::__with_raw_mk_hex(&"11".repeat(32)).unwrap();
+        put(
+            &store,
+            "notes",
+            &tagless_note(&vault, "n1", Some("book-1"), "hello world"),
+        );
+
+        assert_eq!(reconcile_heal_content_tags(&store, &vault).unwrap(), 1);
+        assert_eq!(
+            stored_tag(&store, "n1").as_deref(),
+            Some("a6632b65607c8efb959f50d9767e862fcc231fc7cb64b4519abe393a96ccbb05"),
         );
     }
 
@@ -1989,7 +2326,7 @@ mod tests {
 
         // reconcile() wraps cover-resolution best-effort — an outage yields covers_resolved: 0,
         // never an Err.
-        let r = block(reconcile(&store, &sink, "user-1")).unwrap();
+        let r = block(reconcile(&store, &sink, "user-1", &Vault::generate())).unwrap();
         assert_eq!(r.covers_resolved, 0);
     }
 

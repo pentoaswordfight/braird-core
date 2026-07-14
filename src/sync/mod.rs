@@ -587,7 +587,13 @@ impl SyncEngine {
         };
         let (result, reconciled) = self
             .runtime
-            .block_on(pull_and_reconcile(&store, &*client, token, &tables))
+            .block_on(pull_and_reconcile(
+                &store,
+                &*client,
+                token,
+                &tables,
+                &self.vault,
+            ))
             .map_err(SyncError::Flush)?;
         // Every requested table failing (e.g. offline / bad token) is a real error — surface it
         // rather than a misleading "pulled 0". A PARTIAL failure stays Ok (per-table isolation:
@@ -635,7 +641,13 @@ impl SyncEngine {
             .map_err(|e| SyncError::Flush(format!("bad access token: {e}")))?;
         let (pull, reconcile, flush) = self
             .runtime
-            .block_on(pull_then_flush(&store, &*client, &user_id, &tables))
+            .block_on(pull_then_flush(
+                &store,
+                &*client,
+                &user_id,
+                &tables,
+                &self.vault,
+            ))
             .map_err(SyncError::Flush)?;
         Ok(SyncSummary {
             pull: PullSummary {
@@ -774,6 +786,7 @@ pub async fn pull_then_flush<S: http::PostgrestSink + http::CoverEgress>(
     sink: &S,
     user_id: &str,
     tables: &[&str],
+    vault: &Vault,
 ) -> Result<
     (
         pull::PullResult,
@@ -792,7 +805,7 @@ pub async fn pull_then_flush<S: http::PostgrestSink + http::CoverEgress>(
     }
     // Best-effort (SUR-820): a reconciliation hiccup must never abort an otherwise-clean
     // pull+flush — logged and zeroed here, retried silently on the next sync.
-    let reconciled = reconcile::reconcile(store, sink, user_id)
+    let reconciled = reconcile::reconcile(store, sink, user_id, vault)
         .await
         .unwrap_or_else(|e| {
             eprintln!("sync: post-pull reconciliation failed (non-fatal, retries next pull): {e}");
@@ -831,6 +844,7 @@ pub async fn pull_and_reconcile<S: http::PostgrestSink + http::CoverEgress>(
     sink: &S,
     token: &str,
     tables: &[&str],
+    vault: &Vault,
 ) -> Result<(pull::PullResult, reconcile::ReconcileResult), String> {
     let pulled = pull::pull(store, sink, tables).await?;
     if !pulled.failed_tables.is_empty() {
@@ -842,7 +856,7 @@ pub async fn pull_and_reconcile<S: http::PostgrestSink + http::CoverEgress>(
         return Ok((pulled, reconcile::ReconcileResult::default()));
     }
     let outcome = match http::user_id_from_jwt(token) {
-        Ok(user_id) => reconcile::reconcile(store, sink, &user_id).await,
+        Ok(user_id) => reconcile::reconcile(store, sink, &user_id, vault).await,
         Err(e) => Err(format!("bad access token: {e}")),
     };
     let reconciled = outcome.unwrap_or_else(|e| {

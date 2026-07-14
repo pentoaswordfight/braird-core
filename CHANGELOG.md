@@ -6,6 +6,35 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+### Added
+
+- **SUR-884 — content-tag self-heal (the second half of `reconcileContentTags`).** A new pass,
+  `reconcile_heal_content_tags` (`src/sync/reconcile.rs`), runs on post-pull reconciliation between
+  stranded-notes and content-dedup: for every live note with a null/empty `content_tag` and
+  decryptable text, it re-derives the tag (`Vault::content_tag` = the SUR-638 per-user HMAC over
+  `normalize(plaintext)` + `book_id`) so the SUR-835 dedup pass — which keys on the STORED tag and
+  never decrypts — can cluster it. This closes a real gap: `reconcile_stranded_notes` **nulls**
+  `content_tag` on a rehome/detach (the tag bakes in `book_id`), and such a note stayed tagless and
+  un-clustered on native until its next user edit; the PWA heals it at load. With this, a
+  rehome-nulled duplicate is re-tagged and collapsed in the SAME pass, no edit required — flipping
+  the native-parity manifest row `reconcile-content-tags` from `waived` to `core` (both halves now
+  land). Byte-matches the PWA's SUR-638 vectors.
+- **Decrypt-failure gate + local-only persistence.** Plaintext is read through the exact
+  `decrypt_note_text` gate the SUR-744 read surface uses (one source for the `decryptError` skip),
+  so an undecryptable note is left tagless, never fingerprinted from unreadable ciphertext. This is
+  the ONE reconcile pass that holds keys — a bounded crossing of the otherwise key-less sync layer,
+  following the precedent `sync::read` already set; plaintext stays transient (only the opaque HMAC
+  tag is written). The healed tag is persisted **local-only** (`Store::apply_row`, no `updated_at`
+  bump), mirroring the oracle's no-`updatedAt` heal: it never enters the outbox/LWW path, so a
+  tag-only write can't clobber a concurrent edit under `notes`' whole-row LWW. Convergence is
+  unchanged — it rides the dedup pass's loser soft-delete (which does propagate), and two devices
+  re-derive identical tags and pick the same survivor. Idempotent; best-effort (a heal hiccup never
+  fails the pull, retried next pull). **No FFI/bindings change** — `reconcile()` and the
+  `pull_then_flush`/`pull_and_reconcile` free functions gain a `&Vault` param, but no
+  `#[uniffi::export]` signature or record changes; `ReconcileSummary` is unchanged (the heal count
+  is logged, not surfaced), so this ships as a core-pin bump with no host code change. Delivery: the
+  `chore(core): pin braird-core vX.Y.Z` bump in braird-ios + braird-android.
+
 ## [0.4.3] - 2026-07-11
 
 Seventh tagged release. Ships two new cases on the post-pull reconciliation pass (SUR-820):

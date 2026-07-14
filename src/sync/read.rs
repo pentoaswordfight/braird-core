@@ -324,7 +324,15 @@ fn custom_idea_record(row: &Map<String, Value>) -> CustomIdeaRecord {
 ///
 /// A successfully stored ciphertext therefore never crosses the FFI in its `enc:` form (AC #2):
 /// it is either decrypted plaintext or `None`.
-fn decrypt_note_text(row: &Map<String, Value>, id: &str, vault: &Vault) -> (Option<String>, bool) {
+///
+/// `pub(super)` so the content-tag self-heal ([`super::reconcile::reconcile_heal_content_tags`],
+/// SUR-884) re-derives a missing tag through the EXACT same decrypt gate the display path uses —
+/// one source for the `decryptError` skip, so the two paths can't drift.
+pub(super) fn decrypt_note_text(
+    row: &Map<String, Value>,
+    id: &str,
+    vault: &Vault,
+) -> (Option<String>, bool) {
     match string_field(row, "text") {
         None => (None, false),
         Some(t) if t.is_empty() => (Some(String::new()), false),
