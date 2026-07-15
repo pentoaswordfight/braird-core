@@ -12,7 +12,9 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   guard it together with `great-ideas.json`: the combined drift check requires byte equality with
   `surfc/main` and set equality between all 97 YAML leaf assignments and `GREAT_IDEAS`. Releases now
   attach both canon files with their own entries in `SHA256SUMS.txt`, so consumers pin the pair to
-  one exact tag and both checksums. Documentation/release-data only; no crate, FFI, or generated
+  one exact tag and both checksums. Their most-specific GATING route combines canon parity review
+  with release checksum/publication review, preserving `sync-reviewer` + `crypto-reviewer` while
+  adding `release-integrity-reviewer`. Documentation/release-data only; no crate, FFI, or generated
   binding change.
 
 ## [0.5.0] - 2026-07-14

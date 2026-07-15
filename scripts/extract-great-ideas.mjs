@@ -22,6 +22,84 @@ function buildList(surfcRoot) {
   return extractGreatIdeas(constantsJs);
 }
 
+function splitInlineMapping(record, lineNumber) {
+  const entries = [];
+  let start = 0;
+  let arrayDepth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let index = 0; index < record.length; index += 1) {
+    const character = record[index];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (character === '\\') {
+        escaped = true;
+      } else if (character === '"') {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (character === '"') {
+      inString = true;
+    } else if (character === '[') {
+      arrayDepth += 1;
+    } else if (character === ']') {
+      if (arrayDepth === 0) throw new Error(`unbalanced \`]\` in inline leaf entry at line ${lineNumber}`);
+      arrayDepth -= 1;
+    } else if (character === '{' || character === '}') {
+      throw new Error(`unsupported nested mapping in inline leaf entry at line ${lineNumber}`);
+    } else if (character === ',' && arrayDepth === 0) {
+      entries.push(record.slice(start, index).trim());
+      start = index + 1;
+    }
+  }
+
+  if (inString) throw new Error(`unterminated double-quoted string in inline leaf entry at line ${lineNumber}`);
+  if (arrayDepth !== 0) throw new Error(`unbalanced \`[]\` in inline leaf entry at line ${lineNumber}`);
+  entries.push(record.slice(start).trim());
+  if (entries.some((entry) => entry.length === 0)) {
+    throw new Error(`empty property in inline leaf entry at line ${lineNumber}`);
+  }
+  return entries;
+}
+
+function parseInlineValue(value, property, lineNumber) {
+  if (/^(?:true|false|null|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?)$/.test(value)) {
+    return JSON.parse(value);
+  }
+  if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith('[') && value.endsWith(']'))) {
+    try {
+      return JSON.parse(value);
+    } catch {
+      throw new Error(`malformed value for property ${JSON.stringify(property)} at line ${lineNumber}`);
+    }
+  }
+  throw new Error(`unsupported value for property ${JSON.stringify(property)} at line ${lineNumber}`);
+}
+
+function parseInlineMapping(record, lineNumber) {
+  const properties = new Map();
+  for (const entry of splitInlineMapping(record, lineNumber)) {
+    const colon = entry.indexOf(':');
+    if (colon < 0) throw new Error(`property without \`:\` in inline leaf entry at line ${lineNumber}`);
+
+    const property = entry.slice(0, colon).trim();
+    const value = entry.slice(colon + 1).trim();
+    if (!/^[A-Za-z_][A-Za-z0-9_-]*$/.test(property)) {
+      throw new Error(`unsupported non-plain property key at line ${lineNumber}: ${property}`);
+    }
+    if (!value) throw new Error(`missing value for property ${JSON.stringify(property)} at line ${lineNumber}`);
+    if (properties.has(property)) {
+      throw new Error(`duplicate property key ${JSON.stringify(property)} in inline leaf entry at line ${lineNumber}`);
+    }
+    properties.set(property, parseInlineValue(value, property, lineNumber));
+  }
+  return properties;
+}
+
 function extractIdeaTreeLeafNames(yaml) {
   const lines = yaml.split(/\r?\n/);
   const names = [];
@@ -38,9 +116,13 @@ function extractIdeaTreeLeafNames(yaml) {
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index];
     const lineNumber = index + 1;
+    const quotedLeavesDeclaration = line.match(/^( *)(?:"leaves"|'leaves')\s*:/);
     const leavesDeclaration = line.match(/^( *)leaves\s*:(.*)$/);
     const leavesMatch = line.match(/^( *)leaves:\s*(?:#.*)?$/);
 
+    if (quotedLeavesDeclaration) {
+      throw new Error(`unsupported quoted leaves declaration at line ${lineNumber}: ${line.trim()}`);
+    }
     if (leavesDeclaration) {
       if (!leavesMatch) {
         throw new Error(`unsupported \`leaves:\` declaration at line ${lineNumber}: ${line.trim()}`);
@@ -65,18 +147,11 @@ function extractIdeaTreeLeafNames(yaml) {
       throw new Error(`unsupported/non-inline leaf entry at line ${lineNumber}: ${line.trim()}`);
     }
 
-    const nameProperty = inline[1].match(/(?:^|,)\s*name\s*:\s*("(?:\\.|[^"\\])*")(?=\s*(?:,|$))/);
-    if (!nameProperty) {
-      throw new Error(`unsupported inline leaf entry without a double-quoted name at line ${lineNumber}`);
-    }
-
-    let name;
-    try {
-      name = JSON.parse(nameProperty[1]);
-    } catch {
-      throw new Error(`invalid double-quoted leaf name at line ${lineNumber}`);
-    }
-    if (!name) throw new Error(`empty leaf name at line ${lineNumber}`);
+    const properties = parseInlineMapping(inline[1], lineNumber);
+    if (!properties.has('name')) throw new Error(`inline leaf entry has no plain name property at line ${lineNumber}`);
+    const name = properties.get('name');
+    if (typeof name !== 'string') throw new Error(`leaf name must be one double-quoted string at line ${lineNumber}`);
+    if (name.length === 0) throw new Error(`empty leaf name at line ${lineNumber}`);
 
     const firstLine = firstLineByName.get(name);
     if (firstLine !== undefined) {
