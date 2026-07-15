@@ -1,0 +1,124 @@
+{
+  "pwaRows": {
+    "books": [
+      {
+        "id": "core-b-v19",
+        "title": "Core Export Fixture",
+        "author": "Braird",
+        "isbn": "9780000000911",
+        "coverUrl": "https://example.invalid/core-cover.jpg",
+        "coverSource": "manual",
+        "coverResolvedAt": 29001,
+        "createdAt": 29000,
+        "updatedAt": 29002,
+        "deleted": 0
+      }
+    ],
+    "notes": [
+      {
+        "id": "core-n-v19-child",
+        "bookId": "core-b-v19",
+        "text": "Core-supported margin note",
+        "page": "91",
+        "tags": ["Memory"],
+        "imagePath": null,
+        "inkCropPath": "core/crop.jpg",
+        "source": "handwritten",
+        "sourceId": "core-margin:1",
+        "sourceMeta": {},
+        "chapter": null,
+        "contentTag": null,
+        "createdAt": 29100,
+        "updatedAt": 29101,
+        "deleted": 0
+      },
+      {
+        "id": "core-n-v19-parent",
+        "bookId": "core-b-v19",
+        "text": "Core-supported parent passage",
+        "page": "91",
+        "tags": ["Truth", "Justice"],
+        "imagePath": "core/source.jpg",
+        "inkCropPath": null,
+        "source": "manual",
+        "sourceId": null,
+        "sourceMeta": { "origin": "core" },
+        "chapter": "IX",
+        "contentTag": null,
+        "createdAt": 29103,
+        "updatedAt": 29104,
+        "deleted": 0,
+        "user_metadata": {
+          "user_annotation": ["Core-supported margin note"]
+        }
+      }
+    ],
+    "customIdeas": [
+      {
+        "id": "core-ci-v19",
+        "name": "Attention",
+        "description": "Core-supported custom idea",
+        "createdAt": 29200,
+        "updatedAt": 29201,
+        "deleted": 0
+      }
+    ],
+    "noteLinks": [
+      {
+        "id": "core-link-v19",
+        "fromNoteId": "core-n-v19-parent",
+        "toNoteId": "core-n-v19-child",
+        "relationType": "handwritten_annotation",
+        "createdAt": 29300,
+        "updatedAt": 29301,
+        "deleted": 0
+      }
+    ],
+    "lenses": [
+      {
+        "id": "core-lens-v19",
+        "name": "Core Lens",
+        "leafIds": ["Truth", "Justice"],
+        "combinator": "AND",
+        "threshold": 75,
+        "createdAt": 29400,
+        "updatedAt": 29401,
+        "deleted": 0
+      }
+    ],
+    "collections": [
+      {
+        "id": "core-col-v19",
+        "name": "Core Collection",
+        "createdAt": 29500,
+        "updatedAt": 29501,
+        "deleted": 0
+      }
+    ],
+    "collectionMemberships": [
+      {
+        "id": "core-col-v19:core-n-v19-parent",
+        "noteId": "core-n-v19-parent",
+        "collectionId": "core-col-v19",
+        "createdAt": 29600,
+        "updatedAt": 29601,
+        "deleted": 0
+      }
+    ],
+    "noteSignals": [
+      {
+        "noteId": "core-n-v19-parent",
+        "sourcePrior": 0.7,
+        "returnVisits": 2,
+        "hasAnnotation": true,
+        "stitchSpawns": 1,
+        "exposureRecencyAt": 29700,
+        "engagementRecencyAt": 29701,
+        "importance": 1.4409723674632056,
+        "createdAt": 29702,
+        "updatedAt": 29703,
+        "deleted": 0
+      }
+    ]
+  }
+}

@@ -25,6 +25,29 @@ use serde_json::{Map, Value};
 /// keeps clippy's `type_complexity` lint happy).
 pub type OutboxRow = (i64, String, Option<String>, String, i64);
 
+/// One fully prepared snapshot-import write. Callers complete the row to its descriptor and seal
+/// note text before constructing this value; [`Store::stage_import_batch`] persists the identical
+/// row locally and in the outbox in one transaction.
+pub(crate) struct ImportWrite {
+    pub(crate) table: &'static str,
+    pub(crate) record_id: String,
+    pub(crate) row: Map<String, Value>,
+}
+
+impl ImportWrite {
+    pub(crate) fn new(
+        table: &'static str,
+        record_id: impl Into<String>,
+        row: Map<String, Value>,
+    ) -> Self {
+        Self {
+            table,
+            record_id: record_id.into(),
+            row,
+        }
+    }
+}
+
 /// The core's logical column-type vocabulary — the canonical axis the drift guard
 /// compares on (a pg `jsonb` and a `text[]` both round-trip as `Json`; every integer
 /// width is `Int`; `boolean` is `Bool`). One normalization map, shared with the
@@ -581,7 +604,7 @@ impl Store {
     // master key, so the ADR 0003 ciphertext-at-rest boundary is preserved.
 
     /// List live (`deleted = 0`) rows of a synced table, newest-first (`created_at DESC`,
-    /// `id DESC` tiebreak for deterministic offset pagination), as JSON objects. An optional
+    /// primary-key `DESC` tiebreak for deterministic offset pagination), as JSON objects. An optional
     /// single-column equality filter serves notes-by-book. `limit < 0` = no limit (the
     /// search-index scan wants the whole corpus). The table + filter-column identifiers are
     /// descriptor-derived or fixed literals from the caller — **never host input** — so
@@ -607,7 +630,10 @@ impl Store {
             sql.push_str(&format!(" AND {col} = ?"));
             params.push(SqlValue::Text(val.to_string()));
         }
-        sql.push_str(" ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?");
+        sql.push_str(&format!(
+            " ORDER BY created_at DESC, {} DESC LIMIT ? OFFSET ?",
+            schema.pk[0]
+        ));
         params.push(SqlValue::Integer(limit));
         params.push(SqlValue::Integer(offset));
 
@@ -795,6 +821,33 @@ impl Store {
         let tx = self.conn.unchecked_transaction()?;
         self.drop_pending_deletes_inner(table, record_id)?;
         self.stage_write_inner(table, record_id, partial, created_at)?;
+        tx.commit()
+    }
+
+    /// Atomically stage a complete, already-encrypted snapshot-import batch. The input order is
+    /// retained in the outbox (the import coordinator supplies dependency order). Pending local
+    /// tombstones for accepted resurrection candidates are removed inside the same transaction;
+    /// any later failure rolls back those drops together with every earlier row and enqueue.
+    pub(crate) fn stage_import_batch(
+        &self,
+        writes: &[ImportWrite],
+        batch_timestamp: i64,
+    ) -> rusqlite::Result<()> {
+        if writes.is_empty() {
+            return Ok(());
+        }
+
+        let tx = self.conn.unchecked_transaction()?;
+        for write in writes {
+            self.drop_pending_deletes_inner(write.table, &write.record_id)?;
+            self.apply_row(write.table, &write.row)?;
+            self.enqueue(
+                write.table,
+                &write.record_id,
+                &Value::Object(write.row.clone()).to_string(),
+                batch_timestamp,
+            )?;
+        }
         tx.commit()
     }
 
@@ -1234,5 +1287,128 @@ mod tests {
                 .unwrap();
             assert_eq!(n, 1, "missing {idx}");
         }
+    }
+
+    #[test]
+    fn import_batch_is_atomic_full_row_staging_and_drops_pending_tombstones() {
+        use serde_json::json;
+
+        let store = Store::open_in_memory().unwrap();
+        store
+            .enqueue(
+                "books",
+                "b1",
+                r#"{"id":"b1","updated_at":40,"deleted":true}"#,
+                40,
+            )
+            .unwrap();
+        store
+            .enqueue(
+                "books",
+                "keep",
+                r#"{"id":"keep","updated_at":41,"deleted":true}"#,
+                41,
+            )
+            .unwrap();
+
+        let book = json!({
+            "id":"b1", "title":"Imported", "author":null, "isbn":null,
+            "cover_url":null, "cover_source":null, "cover_resolved_at":null,
+            "created_at":1, "updated_at":99, "deleted":false
+        });
+        let note = json!({
+            "id":"n1", "book_id":"b1", "text":"enc:v2:cipher", "page":null,
+            "tags":[], "image_path":null, "ink_crop_path":null, "source":"manual",
+            "source_id":null, "source_meta":{}, "chapter":null, "content_tag":"tag",
+            "created_at":1, "updated_at":99, "deleted":false
+        });
+        let writes = vec![
+            ImportWrite::new("books", "b1", book.as_object().unwrap().clone()),
+            ImportWrite::new("notes", "n1", note.as_object().unwrap().clone()),
+        ];
+
+        store.stage_import_batch(&writes, 99).unwrap();
+
+        assert_eq!(
+            store.get_row("books", "b1").unwrap().unwrap(),
+            *book.as_object().unwrap()
+        );
+        assert_eq!(
+            store.get_row("notes", "n1").unwrap().unwrap(),
+            *note.as_object().unwrap()
+        );
+        let queued = store.outbox_items().unwrap();
+        assert_eq!(queued.len(), 3, "unrelated tombstone plus two imports");
+        assert_eq!(queued[0].2.as_deref(), Some("keep"));
+        assert_eq!(queued[1].1, "books");
+        assert_eq!(queued[2].1, "notes");
+        assert_eq!(
+            queued[1].3,
+            Value::Object(writes[0].row.clone()).to_string()
+        );
+        assert_eq!(
+            queued[2].3,
+            Value::Object(writes[1].row.clone()).to_string()
+        );
+        assert_eq!(queued[1].4, 99);
+        assert_eq!(queued[2].4, 99);
+    }
+
+    #[test]
+    fn import_batch_rolls_back_rows_outbox_and_tombstone_drops_after_late_failure() {
+        use serde_json::json;
+
+        let store = Store::open_in_memory().unwrap();
+        store
+            .enqueue(
+                "books",
+                "b1",
+                r#"{"id":"b1","updated_at":40,"deleted":true}"#,
+                40,
+            )
+            .unwrap();
+        store
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER fail_second_import BEFORE INSERT ON notes \
+                 WHEN NEW.id = 'n1' BEGIN SELECT RAISE(FAIL, 'injected'); END;",
+            )
+            .unwrap();
+        let writes = vec![
+            ImportWrite::new(
+                "books",
+                "b1",
+                json!({"id":"b1","title":"would rollback","updated_at":99,"deleted":false})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+            ImportWrite::new(
+                "notes",
+                "n1",
+                json!({"id":"n1","text":"enc:v2:cipher","updated_at":99,"deleted":false})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        ];
+
+        assert!(store.stage_import_batch(&writes, 99).is_err());
+        assert!(store.get_row("books", "b1").unwrap().is_none());
+        let queued = store.outbox_items().unwrap();
+        assert_eq!(queued.len(), 1, "the dropped tombstone must roll back too");
+        assert_eq!(queued[0].2.as_deref(), Some("b1"));
+        assert!(
+            serde_json::from_str::<Value>(&queued[0].3).unwrap()["deleted"]
+                .as_bool()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn empty_import_batch_performs_no_writes() {
+        let store = Store::open_in_memory().unwrap();
+        store.stage_import_batch(&[], 99).unwrap();
+        assert!(store.outbox_items().unwrap().is_empty());
     }
 }

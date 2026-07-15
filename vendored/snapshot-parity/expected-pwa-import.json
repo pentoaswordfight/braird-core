@@ -1,0 +1,113 @@
+{
+  "oracleSha": "700504615e79c8fbf364b529f37160590c76f071",
+  "fixedNow": 1700000000000,
+  "fixtures": {
+    "schema-1-preversioned.json": {
+      "schemaVersion": 1,
+      "defaultedEmptyArrays": [
+        "noteLinks",
+        "lenses",
+        "collections",
+        "collectionMemberships",
+        "noteSignals"
+      ],
+      "bookUpdatedAt": 1700000000000,
+      "customIdeaUpdatedAt": 1700000000000,
+      "note": {
+        "source": "manual",
+        "sourceId": null,
+        "sourceMeta": {},
+        "chapter": null,
+        "contentTag": null,
+        "tags": [],
+        "updatedAt": 1700000000000,
+        "deleted": 0
+      }
+    },
+    "schema-10-pre-v11.json": {
+      "schemaVersion": 10,
+      "noteTags": ["Conflict", "Truth", "Angel", "war"]
+    },
+    "schema-11-pre-v14.json": {
+      "schemaVersion": 11,
+      "noteTags": ["War", "Truth", "Conflict", "Status", "Power", "Angel"]
+    },
+    "schema-14-current-tags.json": {
+      "schemaVersion": 14,
+      "noteTags": ["War", "Knowledge", "Knowledge", "Angel"],
+      "noteLink": {
+        "relationType": "handwritten_annotation",
+        "createdAt": 1700000000000,
+        "updatedAt": 1700000000000,
+        "deleted": 0
+      }
+    },
+    "schema-19-all-stores.json": {
+      "schemaVersion": 19,
+      "fullRows": "expected-schema-19-all-stores.json",
+      "arrayLengths": {
+        "books": 1,
+        "notes": 2,
+        "customIdeas": 1,
+        "noteLinks": 1,
+        "lenses": 1,
+        "collections": 1,
+        "collectionMemberships": 1,
+        "noteSignals": 1
+      },
+      "parentContentTag": null,
+      "pwaPreservedExtraKeys": [
+        "imageDataUrl",
+        "inkCropDataUrl",
+        "user_metadata",
+        "futureField"
+      ],
+      "nativeIgnoredExtraKeys": [
+        "imageDataUrl",
+        "inkCropDataUrl",
+        "user_metadata",
+        "futureField"
+      ],
+      "noteSignal": {
+        "sourcePrior": 0.7,
+        "returnVisits": 4,
+        "hasAnnotation": true,
+        "stitchSpawns": 1,
+        "importance": 1.6020444242489622,
+        "deleted": 0
+      }
+    },
+    "schema-19-defaults.json": {
+      "schemaVersion": 19,
+      "fullRows": "expected-schema-19-defaults.json",
+      "arrayLengths": {
+        "books": 1,
+        "notes": 1,
+        "customIdeas": 1,
+        "noteLinks": 1,
+        "lenses": 1,
+        "collections": 1,
+        "collectionMemberships": 1,
+        "noteSignals": 1
+      }
+    },
+    "schema-19-core-export.json": {
+      "schemaVersion": 19,
+      "fullRows": "expected-schema-19-core-export.json",
+      "exportedAt": "2026-07-15T09:10:11.012Z",
+      "arrayLengths": {
+        "books": 1,
+        "notes": 2,
+        "customIdeas": 1,
+        "noteLinks": 1,
+        "lenses": 1,
+        "collections": 1,
+        "collectionMemberships": 1,
+        "noteSignals": 1
+      },
+      "parentContentTag": null,
+      "parentUserAnnotation": ["Core-supported margin note"],
+      "noteSignalImportance": 1.4409723674632056
+    }
+  }
+}

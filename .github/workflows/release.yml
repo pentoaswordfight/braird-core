@@ -101,8 +101,17 @@ jobs:
             echo "::error::tag $VERSION != Cargo.toml version $CARGO_VER — bump the crate + CHANGELOG in the release commit"
             exit 1
           fi
-          grep -Eq "^## \[$VERSION\]" CHANGELOG.md || {
-            echo "::error::CHANGELOG.md has no '## [$VERSION]' section header"; exit 1; }
+          # Treat VERSION as literal data, not an ERE: dots in 0.6.0 must not match arbitrary
+          # characters. Accept either an undated heading or the repository's dated release shape.
+          awk -v heading="## [$VERSION]" '
+            $0 == heading { found = 1 }
+            index($0, heading " - ") == 1 {
+              date = substr($0, length(heading) + 4)
+              if (date ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]$/) found = 1
+            }
+            END { exit found ? 0 : 1 }
+          ' CHANGELOG.md || {
+            echo "::error::CHANGELOG.md has no exact '## [$VERSION]' section header"; exit 1; }
 
       - name: Set up JDK
         uses: actions/setup-java@v4
@@ -186,8 +195,16 @@ jobs:
             echo "::error::tag $VERSION != Cargo.toml version $CARGO_VER — bump the crate + CHANGELOG in the release commit"
             exit 1
           fi
-          grep -Eq "^## \[$VERSION\]" CHANGELOG.md || {
-            echo "::error::CHANGELOG.md has no '## [$VERSION]' section header"; exit 1; }
+          # Keep this literal-safe check identical to the Android leg above.
+          awk -v heading="## [$VERSION]" '
+            $0 == heading { found = 1 }
+            index($0, heading " - ") == 1 {
+              date = substr($0, length(heading) + 4)
+              if (date ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]$/) found = 1
+            }
+            END { exit found ? 0 : 1 }
+          ' CHANGELOG.md || {
+            echo "::error::CHANGELOG.md has no exact '## [$VERSION]' section header"; exit 1; }
 
       - name: Install Rust toolchain + iOS targets
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable

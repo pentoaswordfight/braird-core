@@ -18,6 +18,7 @@
 //! Source of truth: surfc `src/supabase.js` (`collapseOutboxItems`, `flushOutbox`, `upsertBook`,
 //! `upsertNote`) — mirrored faithfully in `outbox.rs` / `push.rs` / `http.rs`.
 
+mod export_import;
 pub mod http;
 pub mod outbox;
 pub mod pull;
@@ -40,14 +41,38 @@ use read::{
 use reconcile::BookMergeUndo;
 
 /// Errors that cross the FFI from the sync engine. Coarse like [`crate::CryptoError`]: enough
-/// for a host to distinguish "couldn't open the store" from "the flush hit the network", never
-/// leaking key material or per-record server detail.
+/// for a host to distinguish store failures, network/sync failures, and invalid snapshot input,
+/// never leaking key material or per-record server detail. Invalid snapshot-input reasons are
+/// additionally sanitized so they never echo archive content.
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum SyncError {
     #[error("store error: {0}")]
     Store(String),
     #[error("flush error: {0}")]
     Flush(String),
+    #[error("invalid import: {0}")]
+    InvalidImport(String),
+}
+
+/// Per-table row counts reported by a snapshot import.
+#[derive(Debug, Default, PartialEq, Eq, uniffi::Record)]
+pub struct ImportCounts {
+    pub books: u32,
+    pub notes: u32,
+    pub custom_ideas: u32,
+    pub note_links: u32,
+    pub lenses: u32,
+    pub collections: u32,
+    pub collection_memberships: u32,
+    pub note_signals: u32,
+}
+
+/// The result of a snapshot import across the FFI.
+#[derive(Debug, uniffi::Record)]
+pub struct ImportSummary {
+    pub schema_version: u32,
+    pub imported: ImportCounts,
+    pub skipped_stale: ImportCounts,
 }
 
 /// The result of a flush across the FFI: how many outbox ids were pushed vs. left queued.
@@ -667,6 +692,47 @@ impl SyncEngine {
         })
     }
 
+    /// Export a plaintext, PWA-compatible snapshot of every live synced row. Note ciphertext is
+    /// decrypted inside the core; a single decryption failure aborts the entire export so neither
+    /// ciphertext nor a partial archive can cross the FFI. Local-only tables are never included.
+    ///
+    /// **Security:** the returned string contains plaintext note text. The host must never log it
+    /// or attach it to telemetry/crash reports, and must write it only through a restrictively
+    /// protected temporary file on the destination filesystem before verified atomic install and
+    /// cleanup. See `docs/snapshots.md` for the durable host-storage contract.
+    pub fn export_snapshot(&self) -> Result<String, SyncError> {
+        let store = lock!(self.store);
+        export_import::build_snapshot_at(&store, &self.vault, epoch_ms())
+    }
+
+    /// Protectively merge a plaintext PWA snapshot into the local mirror. Parsing happens before
+    /// any operational lock or token check. A valid archive then performs a clean all-table pull,
+    /// direct server LWW preflight, in-core note sealing, and one atomic local+outbox batch. The
+    /// staged batch is deliberately not flushed; the next normal [`SyncEngine::sync`] uploads it.
+    ///
+    /// **Security:** `json` contains plaintext note text. The host must source it only from
+    /// restrictively protected storage, never log or report it, and remove temporary plaintext on
+    /// every success/failure/cancellation path. See `docs/snapshots.md` for the full contract.
+    pub fn import_merge(&self, json: String) -> Result<ImportSummary, SyncError> {
+        let import_now = epoch_ms();
+        export_import::with_parsed_import_at(&json, import_now, |parsed| {
+            let store = lock!(self.store);
+            let client = lock!(self.client);
+            if client.access_token().is_none() {
+                return Err(SyncError::Flush(
+                    "no access token set — call set_access_token before importing".into(),
+                ));
+            }
+            self.runtime.block_on(export_import::merge_parsed_with_sink(
+                &store,
+                &*client,
+                &self.vault,
+                parsed,
+                import_now,
+            ))
+        })
+    }
+
     // ── read/query surface (SUR-744) ─────────────────────────────────────────
     // Decrypt-in-core reads for the native list/search screens (SUR-754). Every method
     // excludes soft-deleted rows and orders newest-first; note text is decrypted on the way
@@ -1055,6 +1121,65 @@ pub(crate) fn epoch_ms() -> i64 {
 mod tests {
     use super::*;
     use serde_json::Value;
+
+    #[test]
+    fn invalid_import_returns_before_token_network_or_store_locks() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("invalid-import.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = SyncEngine::open(
+            db_path.into(),
+            "https://x.supabase.co".into(),
+            "anon".into(),
+            Vault::generate(),
+        )
+        .unwrap();
+
+        let poison = engine.clone();
+        std::thread::spawn(move || {
+            let _store = poison.store.lock().unwrap();
+            let _client = poison.client.lock().unwrap();
+            panic!("poison both operational locks");
+        })
+        .join()
+        .unwrap_err();
+
+        let error = engine.import_merge("not json".into()).unwrap_err();
+        assert!(matches!(error, SyncError::InvalidImport(_)));
+        assert!(Store::open(db_path)
+            .unwrap()
+            .outbox_items()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn valid_import_requires_an_access_token_without_staging_anything() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("token-required-import.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = SyncEngine::open(
+            db_path.into(),
+            "https://x.supabase.co".into(),
+            "anon".into(),
+            Vault::generate(),
+        )
+        .unwrap();
+        let archive = serde_json::json!({
+            "_syntopicon":true,"schemaVersion":19,
+            "books":[],"notes":[],"customIdeas":[],"noteLinks":[],
+            "lenses":[],"collections":[],"collectionMemberships":[],"noteSignals":[]
+        })
+        .to_string();
+
+        let error = engine.import_merge(archive).unwrap_err();
+        assert!(matches!(error, SyncError::Flush(_)));
+        assert!(Store::open(db_path)
+            .unwrap()
+            .outbox_items()
+            .unwrap()
+            .is_empty());
+    }
 
     #[test]
     fn search_writes_no_plaintext_note_text_to_disk() {

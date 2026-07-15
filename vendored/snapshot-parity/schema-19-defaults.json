@@ -1,0 +1,54 @@
+{
+  "_syntopicon": true,
+  "schemaVersion": 19,
+  "exportedAt": "2024-01-02T03:04:05.123Z",
+  "books": [
+    {
+      "id": "b-defaults",
+      "title": "Defaults Book"
+    }
+  ],
+  "notes": [
+    {
+      "id": "n-defaults",
+      "text": "Defaults note"
+    }
+  ],
+  "customIdeas": [
+    {
+      "id": "ci-defaults",
+      "name": "Defaults Idea"
+    }
+  ],
+  "noteLinks": [
+    {
+      "id": "link-defaults",
+      "fromNoteId": "n-defaults",
+      "toNoteId": "n-defaults"
+    }
+  ],
+  "lenses": [
+    {
+      "id": "lens-defaults",
+      "name": "Defaults Lens"
+    }
+  ],
+  "collections": [
+    {
+      "id": "col-defaults",
+      "name": "Defaults Collection"
+    }
+  ],
+  "collectionMemberships": [
+    {
+      "id": "membership-defaults",
+      "noteId": "n-defaults",
+      "collectionId": "col-defaults"
+    }
+  ],
+  "noteSignals": [
+    {
+      "noteId": "n-defaults"
+    }
+  ]
+}

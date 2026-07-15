@@ -6,3 +6,9 @@
 *.yml  text eol=lf
 *.yaml text eol=lf
 *.rs   text eol=lf
+
+# UniFFI's canonical `--no-format` generator intentionally emits stable trailing
+# spaces. Binding drift is enforced byte-for-byte by `scripts/gen-bindings.sh`, so
+# keep `git diff --check` focused on hand-authored files for these generated paths.
+bindings/kotlin/src/main/kotlin/uniffi/braird_core/braird_core.kt -whitespace
+bindings/swift/Sources/BrairdCore/BrairdCore.swift -whitespace

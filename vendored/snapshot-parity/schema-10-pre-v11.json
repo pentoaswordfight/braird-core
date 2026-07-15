@@ -1,0 +1,21 @@
+{
+  "_syntopicon": true,
+  "schemaVersion": 10,
+  "exportedAt": "2020-10-10T10:10:10.010Z",
+  "books": [],
+  "notes": [
+    {
+      "id": "n-v10",
+      "text": "Two-stage tag migration",
+      "tags": ["War", "Knowledge", "War and Peace", "Angel", "war"],
+      "source": "image",
+      "sourceId": null,
+      "sourceMeta": { "origin": "scan" },
+      "chapter": null,
+      "createdAt": 10000,
+      "updatedAt": 10001,
+      "deleted": 0
+    }
+  ],
+  "customIdeas": []
+}

@@ -1,0 +1,21 @@
+{
+  "_syntopicon": true,
+  "schemaVersion": 11,
+  "exportedAt": "2021-11-11T11:11:11.011Z",
+  "books": [],
+  "notes": [
+    {
+      "id": "n-v11",
+      "text": "Only the v14 migration applies",
+      "tags": ["War", "Knowledge", "War and Peace", "Honor", "Aristocracy", "Monarchy", "Angel"],
+      "source": "readwise",
+      "sourceId": "rw:11",
+      "sourceMeta": { "book": "Oracle" },
+      "chapter": "2",
+      "createdAt": 11000,
+      "updatedAt": 11001,
+      "deleted": 0
+    }
+  ],
+  "customIdeas": []
+}

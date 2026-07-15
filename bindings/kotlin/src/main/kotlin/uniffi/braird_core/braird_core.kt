@@ -804,6 +804,10 @@ internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
 
 
 
+
+
+
+
 // A JNA Library to expose the extern-C FFI definitions.
 // This is an implementation detail which will be called internally by the public API.
 
@@ -847,6 +851,8 @@ internal interface UniffiLib : Library {
     ): Unit
     fun uniffi_braird_core_fn_method_syncengine_enqueue_note_signals(`ptr`: Pointer,`noteId`: RustBuffer.ByValue,`sourcePrior`: Double,`returnVisits`: Long,`hasAnnotation`: Byte,`stitchSpawns`: Long,`exposureRecencyAt`: Long,`engagementRecencyAt`: Long,`importance`: Double,`createdAt`: Long,`deleted`: Byte,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
+    fun uniffi_braird_core_fn_method_syncengine_export_snapshot(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_syncengine_flush(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_syncengine_get_book(`ptr`: Pointer,`id`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -854,6 +860,8 @@ internal interface UniffiLib : Library {
     fun uniffi_braird_core_fn_method_syncengine_get_note(`ptr`: Pointer,`id`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_syncengine_idea_counts(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_braird_core_fn_method_syncengine_import_merge(`ptr`: Pointer,`json`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_syncengine_list_books(`ptr`: Pointer,`limit`: Int,`offset`: Int,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
@@ -1051,6 +1059,8 @@ internal interface UniffiLib : Library {
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_enqueue_note_signals(
     ): Short
+    fun uniffi_braird_core_checksum_method_syncengine_export_snapshot(
+    ): Short
     fun uniffi_braird_core_checksum_method_syncengine_flush(
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_get_book(
@@ -1058,6 +1068,8 @@ internal interface UniffiLib : Library {
     fun uniffi_braird_core_checksum_method_syncengine_get_note(
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_idea_counts(
+    ): Short
+    fun uniffi_braird_core_checksum_method_syncengine_import_merge(
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_list_books(
     ): Short
@@ -1166,6 +1178,9 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_note_signals() != 33526.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_braird_core_checksum_method_syncengine_export_snapshot() != 42276.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_braird_core_checksum_method_syncengine_flush() != 39156.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1176,6 +1191,9 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_idea_counts() != 10262.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_braird_core_checksum_method_syncengine_import_merge() != 65.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_list_books() != 22597.toShort()) {
@@ -1783,6 +1801,18 @@ public interface SyncEngineInterface {
     fun `enqueueNoteSignals`(`noteId`: kotlin.String, `sourcePrior`: kotlin.Double, `returnVisits`: kotlin.Long, `hasAnnotation`: kotlin.Boolean, `stitchSpawns`: kotlin.Long, `exposureRecencyAt`: kotlin.Long, `engagementRecencyAt`: kotlin.Long, `importance`: kotlin.Double, `createdAt`: kotlin.Long, `deleted`: kotlin.Boolean)
     
     /**
+     * Export a plaintext, PWA-compatible snapshot of every live synced row. Note ciphertext is
+     * decrypted inside the core; a single decryption failure aborts the entire export so neither
+     * ciphertext nor a partial archive can cross the FFI. Local-only tables are never included.
+     *
+     * **Security:** the returned string contains plaintext note text. The host must never log it
+     * or attach it to telemetry/crash reports, and must write it only through a restrictively
+     * protected temporary file on the destination filesystem before verified atomic install and
+     * cleanup. See `docs/snapshots.md` for the durable host-storage contract.
+     */
+    fun `exportSnapshot`(): kotlin.String
+    
+    /**
      * Push every queued write to Supabase (books-first, remap, notes; failed stay queued).
      * Synchronous FFI — the async PostgREST calls run on the owned runtime via `block_on`.
      */
@@ -1803,6 +1833,18 @@ public interface SyncEngineInterface {
      * only for tags on ≥1 live note (the client overlays these onto its generated canon structure).
      */
     fun `ideaCounts`(): List<IdeaCount>
+    
+    /**
+     * Protectively merge a plaintext PWA snapshot into the local mirror. Parsing happens before
+     * any operational lock or token check. A valid archive then performs a clean all-table pull,
+     * direct server LWW preflight, in-core note sealing, and one atomic local+outbox batch. The
+     * staged batch is deliberately not flushed; the next normal [`SyncEngine::sync`] uploads it.
+     *
+     * **Security:** `json` contains plaintext note text. The host must source it only from
+     * restrictively protected storage, never log or report it, and remove temporary plaintext on
+     * every success/failure/cancellation path. See `docs/snapshots.md` for the full contract.
+     */
+    fun `importMerge`(`json`: kotlin.String): ImportSummary
     
     /**
      * Books for the Library / Sources grid, newest-first, each with its live `note_count`.
@@ -2222,6 +2264,29 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
 
     
     /**
+     * Export a plaintext, PWA-compatible snapshot of every live synced row. Note ciphertext is
+     * decrypted inside the core; a single decryption failure aborts the entire export so neither
+     * ciphertext nor a partial archive can cross the FFI. Local-only tables are never included.
+     *
+     * **Security:** the returned string contains plaintext note text. The host must never log it
+     * or attach it to telemetry/crash reports, and must write it only through a restrictively
+     * protected temporary file on the destination filesystem before verified atomic install and
+     * cleanup. See `docs/snapshots.md` for the durable host-storage contract.
+     */
+    @Throws(SyncException::class)override fun `exportSnapshot`(): kotlin.String {
+            return FfiConverterString.lift(
+    callWithPointer {
+    uniffiRustCallWithError(SyncException) { _status ->
+    UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_export_snapshot(
+        it, _status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
      * Push every queued write to Supabase (books-first, remap, notes; failed stay queued).
      * Synchronous FFI — the async PostgREST calls run on the owned runtime via `block_on`.
      */
@@ -2280,6 +2345,29 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
     uniffiRustCallWithError(SyncException) { _status ->
     UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_idea_counts(
         it, _status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * Protectively merge a plaintext PWA snapshot into the local mirror. Parsing happens before
+     * any operational lock or token check. A valid archive then performs a clean all-table pull,
+     * direct server LWW preflight, in-core note sealing, and one atomic local+outbox batch. The
+     * staged batch is deliberately not flushed; the next normal [`SyncEngine::sync`] uploads it.
+     *
+     * **Security:** `json` contains plaintext note text. The host must source it only from
+     * restrictively protected storage, never log or report it, and remove temporary plaintext on
+     * every success/failure/cancellation path. See `docs/snapshots.md` for the full contract.
+     */
+    @Throws(SyncException::class)override fun `importMerge`(`json`: kotlin.String): ImportSummary {
+            return FfiConverterTypeImportSummary.lift(
+    callWithPointer {
+    uniffiRustCallWithError(SyncException) { _status ->
+    UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_import_merge(
+        it, FfiConverterString.lower(`json`),_status)
 }
     }
     )
@@ -3475,6 +3563,104 @@ public object FfiConverterTypeIdeaCount: FfiConverterRustBuffer<IdeaCount> {
 
 
 /**
+ * Per-table row counts reported by a snapshot import.
+ */
+data class ImportCounts (
+    var `books`: kotlin.UInt, 
+    var `notes`: kotlin.UInt, 
+    var `customIdeas`: kotlin.UInt, 
+    var `noteLinks`: kotlin.UInt, 
+    var `lenses`: kotlin.UInt, 
+    var `collections`: kotlin.UInt, 
+    var `collectionMemberships`: kotlin.UInt, 
+    var `noteSignals`: kotlin.UInt
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeImportCounts: FfiConverterRustBuffer<ImportCounts> {
+    override fun read(buf: ByteBuffer): ImportCounts {
+        return ImportCounts(
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: ImportCounts) = (
+            FfiConverterUInt.allocationSize(value.`books`) +
+            FfiConverterUInt.allocationSize(value.`notes`) +
+            FfiConverterUInt.allocationSize(value.`customIdeas`) +
+            FfiConverterUInt.allocationSize(value.`noteLinks`) +
+            FfiConverterUInt.allocationSize(value.`lenses`) +
+            FfiConverterUInt.allocationSize(value.`collections`) +
+            FfiConverterUInt.allocationSize(value.`collectionMemberships`) +
+            FfiConverterUInt.allocationSize(value.`noteSignals`)
+    )
+
+    override fun write(value: ImportCounts, buf: ByteBuffer) {
+            FfiConverterUInt.write(value.`books`, buf)
+            FfiConverterUInt.write(value.`notes`, buf)
+            FfiConverterUInt.write(value.`customIdeas`, buf)
+            FfiConverterUInt.write(value.`noteLinks`, buf)
+            FfiConverterUInt.write(value.`lenses`, buf)
+            FfiConverterUInt.write(value.`collections`, buf)
+            FfiConverterUInt.write(value.`collectionMemberships`, buf)
+            FfiConverterUInt.write(value.`noteSignals`, buf)
+    }
+}
+
+
+
+/**
+ * The result of a snapshot import across the FFI.
+ */
+data class ImportSummary (
+    var `schemaVersion`: kotlin.UInt, 
+    var `imported`: ImportCounts, 
+    var `skippedStale`: ImportCounts
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeImportSummary: FfiConverterRustBuffer<ImportSummary> {
+    override fun read(buf: ByteBuffer): ImportSummary {
+        return ImportSummary(
+            FfiConverterUInt.read(buf),
+            FfiConverterTypeImportCounts.read(buf),
+            FfiConverterTypeImportCounts.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: ImportSummary) = (
+            FfiConverterUInt.allocationSize(value.`schemaVersion`) +
+            FfiConverterTypeImportCounts.allocationSize(value.`imported`) +
+            FfiConverterTypeImportCounts.allocationSize(value.`skippedStale`)
+    )
+
+    override fun write(value: ImportSummary, buf: ByteBuffer) {
+            FfiConverterUInt.write(value.`schemaVersion`, buf)
+            FfiConverterTypeImportCounts.write(value.`imported`, buf)
+            FfiConverterTypeImportCounts.write(value.`skippedStale`, buf)
+    }
+}
+
+
+
+/**
  * A lens — one authored saved-query — for the Lexicon list (SUR-858). `leaf_ids` is the query's
  * leaf set (SUR-737 whole-row LWW: a lens is ONE authored query, so no leaf union). `combinator` /
  * `threshold` are the query's combine rule; both are always written by `enqueue_lens` (defaults
@@ -4204,8 +4390,9 @@ public object FfiConverterTypeSearchDocKind: FfiConverterRustBuffer<SearchDocKin
 
 /**
  * Errors that cross the FFI from the sync engine. Coarse like [`crate::CryptoError`]: enough
- * for a host to distinguish "couldn't open the store" from "the flush hit the network", never
- * leaking key material or per-record server detail.
+ * for a host to distinguish store failures, network/sync failures, and invalid snapshot input,
+ * never leaking key material or per-record server detail. Invalid snapshot-input reasons are
+ * additionally sanitized so they never echo archive content.
  */
 sealed class SyncException: kotlin.Exception() {
     
@@ -4218,6 +4405,14 @@ sealed class SyncException: kotlin.Exception() {
     }
     
     class Flush(
+        
+        val v1: kotlin.String
+        ) : SyncException() {
+        override val message
+            get() = "v1=${ v1 }"
+    }
+    
+    class InvalidImport(
         
         val v1: kotlin.String
         ) : SyncException() {
@@ -4247,6 +4442,9 @@ public object FfiConverterTypeSyncError : FfiConverterRustBuffer<SyncException> 
             2 -> SyncException.Flush(
                 FfiConverterString.read(buf),
                 )
+            3 -> SyncException.InvalidImport(
+                FfiConverterString.read(buf),
+                )
             else -> throw RuntimeException("invalid error enum value, something is very wrong!!")
         }
     }
@@ -4263,6 +4461,11 @@ public object FfiConverterTypeSyncError : FfiConverterRustBuffer<SyncException> 
                 4UL
                 + FfiConverterString.allocationSize(value.v1)
             )
+            is SyncException.InvalidImport -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL
+                + FfiConverterString.allocationSize(value.v1)
+            )
         }
     }
 
@@ -4275,6 +4478,11 @@ public object FfiConverterTypeSyncError : FfiConverterRustBuffer<SyncException> 
             }
             is SyncException.Flush -> {
                 buf.putInt(2)
+                FfiConverterString.write(value.v1, buf)
+                Unit
+            }
+            is SyncException.InvalidImport -> {
+                buf.putInt(3)
                 FfiConverterString.write(value.v1, buf)
                 Unit
             }

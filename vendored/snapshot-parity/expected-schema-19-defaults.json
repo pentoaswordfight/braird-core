@@ -1,0 +1,193 @@
+{
+  "pwaRows": {
+    "books": [
+      {
+        "id": "b-defaults",
+        "title": "Defaults Book",
+        "updatedAt": 1700000000000,
+        "deleted": 0
+      }
+    ],
+    "notes": [
+      {
+        "id": "n-defaults",
+        "text": "Defaults note",
+        "source": "manual",
+        "sourceId": null,
+        "sourceMeta": {},
+        "chapter": null,
+        "contentTag": null,
+        "tags": [],
+        "updatedAt": 1700000000000,
+        "deleted": 0
+      }
+    ],
+    "customIdeas": [
+      {
+        "id": "ci-defaults",
+        "name": "Defaults Idea",
+        "updatedAt": 1700000000000,
+        "deleted": 0
+      }
+    ],
+    "noteLinks": [
+      {
+        "id": "link-defaults",
+        "fromNoteId": "n-defaults",
+        "toNoteId": "n-defaults",
+        "relationType": "handwritten_annotation",
+        "createdAt": 1700000000000,
+        "updatedAt": 1700000000000,
+        "deleted": 0
+      }
+    ],
+    "lenses": [
+      {
+        "id": "lens-defaults",
+        "name": "Defaults Lens",
+        "leafIds": [],
+        "combinator": "AND",
+        "threshold": 100,
+        "createdAt": 1700000000000,
+        "updatedAt": 1700000000000,
+        "deleted": 0
+      }
+    ],
+    "collections": [
+      {
+        "id": "col-defaults",
+        "name": "Defaults Collection",
+        "createdAt": 1700000000000,
+        "updatedAt": 1700000000000,
+        "deleted": 0
+      }
+    ],
+    "collectionMemberships": [
+      {
+        "id": "membership-defaults",
+        "noteId": "n-defaults",
+        "collectionId": "col-defaults",
+        "createdAt": 1700000000000,
+        "updatedAt": 1700000000000,
+        "deleted": 0
+      }
+    ],
+    "noteSignals": [
+      {
+        "noteId": "n-defaults",
+        "sourcePrior": 0.5,
+        "returnVisits": 0,
+        "hasAnnotation": false,
+        "stitchSpawns": 0,
+        "exposureRecencyAt": 0,
+        "engagementRecencyAt": 0,
+        "importance": 0.5,
+        "createdAt": 1700000000000,
+        "updatedAt": 1700000000000,
+        "deleted": 0
+      }
+    ]
+  },
+  "nativeRows": {
+    "books": [
+      {
+        "id": "b-defaults",
+        "title": "Defaults Book",
+        "author": null,
+        "isbn": null,
+        "cover_url": null,
+        "cover_source": null,
+        "cover_resolved_at": null,
+        "created_at": null,
+        "updated_at": 1700000000000,
+        "deleted": false
+      }
+    ],
+    "notes": [
+      {
+        "id": "n-defaults",
+        "book_id": null,
+        "text": "Defaults note",
+        "page": null,
+        "tags": [],
+        "image_path": null,
+        "ink_crop_path": null,
+        "source": "manual",
+        "source_id": null,
+        "source_meta": {},
+        "chapter": null,
+        "content_tag": null,
+        "created_at": null,
+        "updated_at": 1700000000000,
+        "deleted": false
+      }
+    ],
+    "custom_ideas": [
+      {
+        "id": "ci-defaults",
+        "name": "Defaults Idea",
+        "description": null,
+        "created_at": null,
+        "updated_at": 1700000000000,
+        "deleted": false
+      }
+    ],
+    "note_links": [
+      {
+        "id": "link-defaults",
+        "from_note_id": "n-defaults",
+        "to_note_id": "n-defaults",
+        "relation_type": "handwritten_annotation",
+        "created_at": 1700000000000,
+        "updated_at": 1700000000000,
+        "deleted": false
+      }
+    ],
+    "lenses": [
+      {
+        "id": "lens-defaults",
+        "name": "Defaults Lens",
+        "leaf_ids": [],
+        "combinator": "AND",
+        "threshold": 100,
+        "created_at": 1700000000000,
+        "updated_at": 1700000000000,
+        "deleted": false
+      }
+    ],
+    "collections": [
+      {
+        "id": "col-defaults",
+        "name": "Defaults Collection",
+        "created_at": 1700000000000,
+        "updated_at": 1700000000000,
+        "deleted": false
+      }
+    ],
+    "collection_memberships": [
+      {
+        "id": "membership-defaults",
+        "note_id": "n-defaults",
+        "collection_id": "col-defaults",
+        "created_at": 1700000000000,
+        "updated_at": 1700000000000,
+        "deleted": false
+      }
+    ],
+    "note_signals": [
+      {
+        "note_id": "n-defaults",
+        "source_prior": 0.5,
+        "return_visits": 0,
+        "has_annotation": false,
+        "stitch_spawns": 0,
+        "exposure_recency_at": 0,
+        "engagement_recency_at": 0,
+        "importance": 0.5,
+        "created_at": 1700000000000,
+        "updated_at": 1700000000000,
+        "deleted": false
+      }
+    ]
+  }
+}

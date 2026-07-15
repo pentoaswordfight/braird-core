@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "ticket": "SUR-911",
+  "sourceRepository": "braird/surfc",
+  "sourceCommit": "700504615e79c8fbf364b529f37160590c76f071",
+  "sourceRefAtCapture": "origin/main",
+  "capturedAt": "2026-07-15",
+  "fixedImportNow": 1700000000000,
+  "coreExportTestMasterKeyHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+  "pwaFixtures": [
+    "schema-1-preversioned.json",
+    "schema-10-pre-v11.json",
+    "schema-11-pre-v14.json",
+    "schema-14-current-tags.json",
+    "schema-19-all-stores.json",
+    "schema-19-defaults.json"
+  ],
+  "coreExportFixture": "schema-19-core-export.json",
+  "expectations": "expected-pwa-import.json"
+}

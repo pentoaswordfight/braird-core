@@ -661,6 +661,18 @@ public protocol SyncEngineProtocol : AnyObject {
     func enqueueNoteSignals(noteId: String, sourcePrior: Double, returnVisits: Int64, hasAnnotation: Bool, stitchSpawns: Int64, exposureRecencyAt: Int64, engagementRecencyAt: Int64, importance: Double, createdAt: Int64, deleted: Bool) throws 
     
     /**
+     * Export a plaintext, PWA-compatible snapshot of every live synced row. Note ciphertext is
+     * decrypted inside the core; a single decryption failure aborts the entire export so neither
+     * ciphertext nor a partial archive can cross the FFI. Local-only tables are never included.
+     *
+     * **Security:** the returned string contains plaintext note text. The host must never log it
+     * or attach it to telemetry/crash reports, and must write it only through a restrictively
+     * protected temporary file on the destination filesystem before verified atomic install and
+     * cleanup. See `docs/snapshots.md` for the durable host-storage contract.
+     */
+    func exportSnapshot() throws  -> String
+    
+    /**
      * Push every queued write to Supabase (books-first, remap, notes; failed stay queued).
      * Synchronous FFI — the async PostgREST calls run on the owned runtime via `block_on`.
      */
@@ -681,6 +693,18 @@ public protocol SyncEngineProtocol : AnyObject {
      * only for tags on ≥1 live note (the client overlays these onto its generated canon structure).
      */
     func ideaCounts() throws  -> [IdeaCount]
+    
+    /**
+     * Protectively merge a plaintext PWA snapshot into the local mirror. Parsing happens before
+     * any operational lock or token check. A valid archive then performs a clean all-table pull,
+     * direct server LWW preflight, in-core note sealing, and one atomic local+outbox batch. The
+     * staged batch is deliberately not flushed; the next normal [`SyncEngine::sync`] uploads it.
+     *
+     * **Security:** `json` contains plaintext note text. The host must source it only from
+     * restrictively protected storage, never log or report it, and remove temporary plaintext on
+     * every success/failure/cancellation path. See `docs/snapshots.md` for the full contract.
+     */
+    func importMerge(json: String) throws  -> ImportSummary
     
     /**
      * Books for the Library / Sources grid, newest-first, each with its live `note_count`.
@@ -1068,6 +1092,23 @@ open func enqueueNoteSignals(noteId: String, sourcePrior: Double, returnVisits: 
 }
     
     /**
+     * Export a plaintext, PWA-compatible snapshot of every live synced row. Note ciphertext is
+     * decrypted inside the core; a single decryption failure aborts the entire export so neither
+     * ciphertext nor a partial archive can cross the FFI. Local-only tables are never included.
+     *
+     * **Security:** the returned string contains plaintext note text. The host must never log it
+     * or attach it to telemetry/crash reports, and must write it only through a restrictively
+     * protected temporary file on the destination filesystem before verified atomic install and
+     * cleanup. See `docs/snapshots.md` for the durable host-storage contract.
+     */
+open func exportSnapshot()throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_braird_core_fn_method_syncengine_export_snapshot(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
      * Push every queued write to Supabase (books-first, remap, notes; failed stay queued).
      * Synchronous FFI — the async PostgREST calls run on the owned runtime via `block_on`.
      */
@@ -1107,6 +1148,24 @@ open func getNote(id: String)throws  -> NoteRecord? {
 open func ideaCounts()throws  -> [IdeaCount] {
     return try  FfiConverterSequenceTypeIdeaCount.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
     uniffi_braird_core_fn_method_syncengine_idea_counts(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * Protectively merge a plaintext PWA snapshot into the local mirror. Parsing happens before
+     * any operational lock or token check. A valid archive then performs a clean all-table pull,
+     * direct server LWW preflight, in-core note sealing, and one atomic local+outbox batch. The
+     * staged batch is deliberately not flushed; the next normal [`SyncEngine::sync`] uploads it.
+     *
+     * **Security:** `json` contains plaintext note text. The host must source it only from
+     * restrictively protected storage, never log or report it, and remove temporary plaintext on
+     * every success/failure/cancellation path. See `docs/snapshots.md` for the full contract.
+     */
+open func importMerge(json: String)throws  -> ImportSummary {
+    return try  FfiConverterTypeImportSummary.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_braird_core_fn_method_syncengine_import_merge(self.uniffiClonePointer(),
+        FfiConverterString.lower(json),$0
     )
 })
 }
@@ -2403,6 +2462,200 @@ public func FfiConverterTypeIdeaCount_lift(_ buf: RustBuffer) throws -> IdeaCoun
 #endif
 public func FfiConverterTypeIdeaCount_lower(_ value: IdeaCount) -> RustBuffer {
     return FfiConverterTypeIdeaCount.lower(value)
+}
+
+
+/**
+ * Per-table row counts reported by a snapshot import.
+ */
+public struct ImportCounts {
+    public var books: UInt32
+    public var notes: UInt32
+    public var customIdeas: UInt32
+    public var noteLinks: UInt32
+    public var lenses: UInt32
+    public var collections: UInt32
+    public var collectionMemberships: UInt32
+    public var noteSignals: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(books: UInt32, notes: UInt32, customIdeas: UInt32, noteLinks: UInt32, lenses: UInt32, collections: UInt32, collectionMemberships: UInt32, noteSignals: UInt32) {
+        self.books = books
+        self.notes = notes
+        self.customIdeas = customIdeas
+        self.noteLinks = noteLinks
+        self.lenses = lenses
+        self.collections = collections
+        self.collectionMemberships = collectionMemberships
+        self.noteSignals = noteSignals
+    }
+}
+
+
+
+extension ImportCounts: Equatable, Hashable {
+    public static func ==(lhs: ImportCounts, rhs: ImportCounts) -> Bool {
+        if lhs.books != rhs.books {
+            return false
+        }
+        if lhs.notes != rhs.notes {
+            return false
+        }
+        if lhs.customIdeas != rhs.customIdeas {
+            return false
+        }
+        if lhs.noteLinks != rhs.noteLinks {
+            return false
+        }
+        if lhs.lenses != rhs.lenses {
+            return false
+        }
+        if lhs.collections != rhs.collections {
+            return false
+        }
+        if lhs.collectionMemberships != rhs.collectionMemberships {
+            return false
+        }
+        if lhs.noteSignals != rhs.noteSignals {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(books)
+        hasher.combine(notes)
+        hasher.combine(customIdeas)
+        hasher.combine(noteLinks)
+        hasher.combine(lenses)
+        hasher.combine(collections)
+        hasher.combine(collectionMemberships)
+        hasher.combine(noteSignals)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeImportCounts: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ImportCounts {
+        return
+            try ImportCounts(
+                books: FfiConverterUInt32.read(from: &buf), 
+                notes: FfiConverterUInt32.read(from: &buf), 
+                customIdeas: FfiConverterUInt32.read(from: &buf), 
+                noteLinks: FfiConverterUInt32.read(from: &buf), 
+                lenses: FfiConverterUInt32.read(from: &buf), 
+                collections: FfiConverterUInt32.read(from: &buf), 
+                collectionMemberships: FfiConverterUInt32.read(from: &buf), 
+                noteSignals: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ImportCounts, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.books, into: &buf)
+        FfiConverterUInt32.write(value.notes, into: &buf)
+        FfiConverterUInt32.write(value.customIdeas, into: &buf)
+        FfiConverterUInt32.write(value.noteLinks, into: &buf)
+        FfiConverterUInt32.write(value.lenses, into: &buf)
+        FfiConverterUInt32.write(value.collections, into: &buf)
+        FfiConverterUInt32.write(value.collectionMemberships, into: &buf)
+        FfiConverterUInt32.write(value.noteSignals, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeImportCounts_lift(_ buf: RustBuffer) throws -> ImportCounts {
+    return try FfiConverterTypeImportCounts.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeImportCounts_lower(_ value: ImportCounts) -> RustBuffer {
+    return FfiConverterTypeImportCounts.lower(value)
+}
+
+
+/**
+ * The result of a snapshot import across the FFI.
+ */
+public struct ImportSummary {
+    public var schemaVersion: UInt32
+    public var imported: ImportCounts
+    public var skippedStale: ImportCounts
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(schemaVersion: UInt32, imported: ImportCounts, skippedStale: ImportCounts) {
+        self.schemaVersion = schemaVersion
+        self.imported = imported
+        self.skippedStale = skippedStale
+    }
+}
+
+
+
+extension ImportSummary: Equatable, Hashable {
+    public static func ==(lhs: ImportSummary, rhs: ImportSummary) -> Bool {
+        if lhs.schemaVersion != rhs.schemaVersion {
+            return false
+        }
+        if lhs.imported != rhs.imported {
+            return false
+        }
+        if lhs.skippedStale != rhs.skippedStale {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(schemaVersion)
+        hasher.combine(imported)
+        hasher.combine(skippedStale)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeImportSummary: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ImportSummary {
+        return
+            try ImportSummary(
+                schemaVersion: FfiConverterUInt32.read(from: &buf), 
+                imported: FfiConverterTypeImportCounts.read(from: &buf), 
+                skippedStale: FfiConverterTypeImportCounts.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ImportSummary, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.schemaVersion, into: &buf)
+        FfiConverterTypeImportCounts.write(value.imported, into: &buf)
+        FfiConverterTypeImportCounts.write(value.skippedStale, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeImportSummary_lift(_ buf: RustBuffer) throws -> ImportSummary {
+    return try FfiConverterTypeImportSummary.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeImportSummary_lower(_ value: ImportSummary) -> RustBuffer {
+    return FfiConverterTypeImportSummary.lower(value)
 }
 
 
@@ -3714,8 +3967,9 @@ extension SearchDocKind: Equatable, Hashable {}
 
 /**
  * Errors that cross the FFI from the sync engine. Coarse like [`crate::CryptoError`]: enough
- * for a host to distinguish "couldn't open the store" from "the flush hit the network", never
- * leaking key material or per-record server detail.
+ * for a host to distinguish store failures, network/sync failures, and invalid snapshot input,
+ * never leaking key material or per-record server detail. Invalid snapshot-input reasons are
+ * additionally sanitized so they never echo archive content.
  */
 public enum SyncError {
 
@@ -3724,6 +3978,8 @@ public enum SyncError {
     case Store(String
     )
     case Flush(String
+    )
+    case InvalidImport(String
     )
 }
 
@@ -3747,6 +4003,9 @@ public struct FfiConverterTypeSyncError: FfiConverterRustBuffer {
         case 2: return .Flush(
             try FfiConverterString.read(from: &buf)
             )
+        case 3: return .InvalidImport(
+            try FfiConverterString.read(from: &buf)
+            )
 
          default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -3766,6 +4025,11 @@ public struct FfiConverterTypeSyncError: FfiConverterRustBuffer {
         
         case let .Flush(v1):
             writeInt(&buf, Int32(2))
+            FfiConverterString.write(v1, into: &buf)
+            
+        
+        case let .InvalidImport(v1):
+            writeInt(&buf, Int32(3))
             FfiConverterString.write(v1, into: &buf)
             
         }
@@ -4211,6 +4475,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_braird_core_checksum_method_syncengine_enqueue_note_signals() != 33526) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_braird_core_checksum_method_syncengine_export_snapshot() != 42276) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_braird_core_checksum_method_syncengine_flush() != 39156) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -4221,6 +4488,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_idea_counts() != 10262) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_braird_core_checksum_method_syncengine_import_merge() != 65) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_list_books() != 22597) {

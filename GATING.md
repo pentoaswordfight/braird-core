@@ -64,7 +64,7 @@ repo by name (`shared/personas/<name>.md`).
 | Path | Pattern | Primary gate | Fallback gate (until primary exists) |
 |---|---|---|---|
 | The **distributed canon release payloads** — `vendored/canon/great-ideas.json`, `vendored/canon/idea-tree.yaml` | **GCE only** | Canon-drift contract green — ordered GREAT_IDEAS JSON, byte-identical idea-tree YAML, and YAML↔GREAT_IDEAS leaf parity — **and** release checksum/publication integrity green for both public assets — + founder sign-off | Founder sign-off after `release-integrity-reviewer` **+** `sync-reviewer` **+** `crypto-reviewer` pass |
-| The **sync engine + local store** (Phase 2, SUR-659; post-pull reconciliation SUR-820) — `src/store.rs`, `src/sync/**`, `src/outbox.rs`, `src/http.rs`, `vendored/schema/**`, `scripts/extract-sync-schema.mjs`, `vendored/canon/**`, `scripts/extract-great-ideas.mjs`, `.github/workflows/canon-drift.yml` | **GCE only** | Schema-drift **and** canon-drift guards green — `vendored/schema/**` reconciles against `surfc/main`'s synced schema (`tests/schema_parity.rs` + `.github/workflows/schema-drift.yml`), and canon proves ordered GREAT_IDEAS JSON, byte-identical idea-tree YAML, and YAML↔GREAT_IDEAS leaf parity (`.github/workflows/canon-drift.yml`) — + founder sign-off | Founder sign-off after `sync-reviewer` (engine, PWA↔native coexistence, schema/canon drift) **+** `crypto-reviewer` (the seal-at-flush boundary — note text must never leave unencrypted, SUR-724) pass |
+| The **sync engine + local store** (Phase 2, SUR-659; post-pull reconciliation SUR-820; snapshot export/import SUR-911) — `src/store.rs`, `src/sync/**`, `src/outbox.rs`, `src/http.rs`, `vendored/schema/**`, `scripts/extract-sync-schema.mjs`, `vendored/canon/**`, `scripts/extract-great-ideas.mjs`, `.github/workflows/canon-drift.yml`, `vendored/snapshot-parity/**`, `scripts/check-snapshot-parity.mjs`, `docs/snapshots.md` | **GCE only** | Schema-drift, canon-drift, **and snapshot-parity** checks green — `vendored/schema/**` reconciles against `surfc/main`'s synced schema (`tests/schema_parity.rs` + `.github/workflows/schema-drift.yml`); canon proves ordered GREAT_IDEAS JSON, byte-identical idea-tree YAML, and YAML↔GREAT_IDEAS leaf parity (`.github/workflows/canon-drift.yml`); and the snapshot fixtures pass deterministic Rust fixture tests plus a recorded clean-oracle `scripts/check-snapshot-parity.mjs` run against refreshed `origin/main` in the surfc checkout — + founder sign-off | Founder sign-off after `sync-reviewer` (engine, PWA↔native coexistence, schema/canon/snapshot parity) **+** `crypto-reviewer` (the plaintext snapshot boundary and seal-before-persist/flush boundary — note text must never reach SQLite/outbox unencrypted) pass |
 | The **release / packaging boundary** (SUR-760; row pre-wired by SUR-778) — `bindings/android/**`, `bindings/consumer-smoke/**`, `scripts/build-aar.sh`, `scripts/build-xcframework.sh`, `.github/workflows/release.yml`, `.github/workflows/android-artifacts.yml`, `docs/pinning.md` | **GCE only** | Release CI green — every shipped `.so` 16 KB-aligned (bundled deps included), SHA-256 per artifact published with the release, tag / `Cargo.toml` version / CHANGELOG agree — + founder sign-off | Founder sign-off after a `release-integrity-reviewer` (binding↔native atomicity, tag + SHA-256 pin, fail-closed fetch, alignment gates) pass |
 | `bindings/**`, `src/bin/uniffi-bindgen.rs` — the generated Swift/Kotlin surface + its round-trip tests (the public API devs consume) | **GCE only** | Swift **and** Kotlin round-trip parity green + founder sign-off | Founder sign-off after `naming-reviewer` (the API *word*) **+** `crypto-reviewer` (the seam) pass |
 | `vendored/crypto-parity/**` — the crypto parity vectors vendored from `surfc/main` | **GCE only** | Vendored-drift guard green — byte-identical to `surfc/main` (§4) — + founder sign-off | `crypto-reviewer` confirms the vectors against `surfc/main` |
@@ -87,11 +87,12 @@ are listed **above** the `src/**` row, and first-match isolates them correctly:
   → the distributed-canon release row → **`release-integrity-reviewer`** +
   **`sync-reviewer`** + **`crypto-reviewer`**; the following `vendored/canon/**`
   token remains the catch-all for future canon files;
-- `src/store.rs` / `src/sync/**` / `src/outbox.rs` / `src/http.rs` (or the schema fixture)
+- `src/store.rs` / `src/sync/**` / `src/outbox.rs` / `src/http.rs` (or the schema/snapshot fixtures)
   → the sync/store row → **`sync-reviewer`** (its gate also names `crypto-reviewer`);
-- an exported **type / method / error name** in a `#[uniffi::export]` item (chiefly
-  `src/vault.rs`, `src/lib.rs` — this crate has no `.udl`) lands in `bindings/**` /
-  `src/bin/uniffi-bindgen.rs` → the binding row → **`naming-reviewer`** + `crypto-reviewer`.
+- an exported type / method / error implemented under `src/sync/**` first-matches the sync/store
+  row; its required regenerated `bindings/**` files independently match the binding row. The
+  touched-row union therefore supplies **`sync-reviewer`** + **`naming-reviewer`** +
+  **`crypto-reviewer`**. Classification is path-based, not symbol-aware.
 
 Keep `src/**` **last**. Moving it up would shadow the specific rows and silently drop their
 reviewer — the sync-engine slice reviewed without `sync-reviewer` (SUR-724 caught this: the
@@ -148,13 +149,17 @@ A change is **gateable** when all of the following are true:
 4. **Parity is green** — the Rust harness reproduces the 10 in-scope + the normalization
    vectors **bit-identical**, foreign-ciphertext decrypt passes, and (for binding changes)
    the Swift + Kotlin round-trips pass. CI enforces this on every core change.
-5. **The drift guards are green** — `vendored/crypto-parity/**` is byte-identical to
-   `surfc/main`; `vendored/schema/**` reconciles against the synced schema; and canon proves
-   ordered `great-ideas.json`, byte-identical `idea-tree.yaml`, and YAML↔GREAT_IDEAS leaf
-   parity. The two distributed canon payloads also pass release checksum/publication integrity.
-   See `.github/workflows/`.
+5. **The parity / drift checks are green** — `vendored/crypto-parity/**` is byte-identical to
+   `surfc/main`; `vendored/schema/**` reconciles against the synced schema; canon proves ordered
+   `great-ideas.json`, byte-identical `idea-tree.yaml`, and YAML↔GREAT_IDEAS leaf parity; and
+   `vendored/snapshot-parity/**` passes its deterministic Rust fixture tests plus a recorded
+   `scripts/check-snapshot-parity.mjs` run that materializes the oracle from refreshed
+   `origin/main` in the surfc checkout (never its dirty worktree). The two distributed canon
+   payloads also pass release checksum/publication integrity. Automated drift guards live in
+   `.github/workflows/`; snapshot parity is the deterministic Rust + recorded clean-oracle evidence
+   named here, not a separate workflow.
 6. `crypto-reviewer` (+ `naming-reviewer` for binding changes, + `sync-reviewer` for
-   store/schema/canon changes, + `release-integrity-reviewer` for the two distributed canon
+   store/schema/canon/snapshot changes, + `release-integrity-reviewer` for the two distributed canon
    payloads) has passed, or its findings are explicitly accepted with rationale.
 7. Founder has signed off in writing (PR comment is fine).
 8. A `CHANGELOG.md` `[Unreleased]` entry exists (CI-enforced, dependabot-exempt).
@@ -185,6 +190,10 @@ yet built for a new surface:
   surfc#331) established this repo; ADR 0002 records the crypto-backend choice (RustCrypto).
 - `vendored/crypto-parity/` — crypto parity vectors vendored from `surfc/main`, drift-guarded.
 - `vendored/schema/` — the synced-schema fixture, drift-guarded against `surfc/main` (SUR-723).
+- `vendored/snapshot-parity/` — frozen PWA snapshot fixtures for schemas 1, 10, 11, 14, and 19
+  plus the core-export fixture. Deterministic Rust tests consume them, and
+  `scripts/check-snapshot-parity.mjs` records a cross-oracle pass from clean modules materialized
+  out of refreshed `origin/main` in the surfc checkout rather than its worktree (SUR-911).
 - `vendored/canon/` — the ordered `GREAT_IDEAS` JSON and byte-vendored idea-tree YAML,
   drift-guarded against `surfc/main` with YAML↔GREAT_IDEAS leaf parity and distributed together
   as checksum-pinned release assets (SUR-820 Canon-102 awareness; SUR-918 release distribution).

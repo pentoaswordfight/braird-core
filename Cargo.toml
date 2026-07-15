@@ -17,7 +17,7 @@ members = [".", "test-support"]
 
 [package]
 name = "braird-core"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 publish = false
 license = "UNLICENSED"
@@ -75,9 +75,13 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # SyncEngine `block_on`s inside its synchronous UniFFI methods (the FFI stays sync, like Vault).
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 tokio = { version = "1", default-features = false, features = ["rt", "net", "time"] }
-# serde_json carries serde transitively; add an explicit `serde = { features = ["derive"] }`
-# only when the first `#[derive(Serialize/Deserialize)]` lands (none yet — SUR-724 Gate-2 nit).
+# Native snapshot DTOs derive `Serialize`; keep serde beside the native-only sync dependencies so
+# the PWA WASM build does not acquire a new direct dependency.
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Native snapshot exports mirror JavaScript Date#toISOString exactly: UTC with a fixed
+# three-digit millisecond field. `time` replaces the error-prone hand-rolled civil calendar.
+time = { version = "0.3", default-features = false, features = ["formatting", "macros"] }
 
 [dev-dependencies]
 serde_json = "1"

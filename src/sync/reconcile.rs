@@ -202,7 +202,7 @@ async fn reconcile_books<S: PostgrestSink>(store: &Store, sink: &S) -> Result<us
     }
 
     let ids: Vec<String> = missing_ids.into_iter().collect();
-    let fetched = sink.fetch_by_ids("books", &ids).await?;
+    let fetched = sink.fetch_by_ids("books", "id", &ids).await?;
     let mut backfilled = 0;
     for row in &fetched {
         let Some(obj) = row.as_object() else { continue };
@@ -1416,7 +1416,13 @@ mod tests {
         ) -> Result<Vec<Value>, String> {
             Ok(Vec::new())
         }
-        async fn fetch_by_ids(&self, table: &str, ids: &[String]) -> Result<Vec<Value>, String> {
+        async fn fetch_by_ids(
+            &self,
+            table: &str,
+            primary_key: &str,
+            ids: &[String],
+        ) -> Result<Vec<Value>, String> {
+            assert_eq!(primary_key, "id");
             self.calls
                 .borrow_mut()
                 .push((table.to_string(), ids.to_vec()));
