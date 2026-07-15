@@ -1,8 +1,10 @@
 name: Release
 
 # SUR-760 + SUR-745: on a version tag, build + publish the pinned artifacts — Android AAR +
-# desktop JVM jar (SUR-760) and the iOS BrairdCore.xcframework (SUR-745) — to one GitHub Release
-# with a SHA-256 per artifact. Consumers pin the tag + checksums; the `chore(core): pin
+# desktop JVM jar (SUR-760), the iOS BrairdCore.xcframework (SUR-745), and the two
+# machine-consumed canon files — to one GitHub Release. Six payloads are hashed in
+# SHA256SUMS.txt; with the manifest, the release has seven total assets. Consumers pin
+# the tag + checksums; the `chore(core): pin
 # braird-core vX.Y.Z` PR in the app repo is the integration gate (docs/pinning.md).
 # Routed to release-integrity-reviewer (GATING.md §3.1): binding↔native atomicity, tag+SHA-256
 # pin, 16 KB alignment (Android), version agreement.
@@ -225,9 +227,10 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  # Assemble every artifact into one SHA256SUMS.txt and cut the release once. This is the ONLY job
-  # with contents: write, and the ONLY job that touches the release — so create-only immutability
-  # can't be raced by a parallel lane.
+  # Assemble four built artifacts + two machine-consumed canon files into one SHA256SUMS.txt and
+  # cut the release once: six hashed payloads, seven total assets including the manifest. This is
+  # the ONLY job with contents: write, and the ONLY job that touches the release — so create-only
+  # immutability can't be raced by a parallel lane.
   publish:
     needs: [validate, build-android, build-ios]
     runs-on: ubuntu-latest
@@ -244,19 +247,29 @@ jobs:
           path: dist
           merge-multiple: true # flatten android-artifacts/ + ios-artifacts/ into dist/
 
+      # These exact two machine-consumed files from the validated tagged checkout are part of the
+      # public release interface. Keep the allowlist explicit: future SUR-920 notices or
+      # administrative files must not silently become release assets.
+      - name: Stage canon data for publish
+        run: |
+          cp vendored/canon/great-ideas.json dist/great-ideas.json
+          cp vendored/canon/idea-tree.yaml dist/idea-tree.yaml
+
       - name: Stage SHA-256 manifest
         env:
           VERSION: ${{ needs.validate.outputs.version }}
         run: |
           cd dist
-          # BrairdCore.swift is checksummed alongside the binary: an iOS consumer pins BOTH hashes
-          # so the wrapper is never trusted to a mutable tag (SUR-745 review). Hashed here from the
-          # exact bytes about to be published — no rebuild, no re-download.
+          # BrairdCore.swift and both canon files are checksummed alongside the three binaries: six
+          # payloads total. Consumers pin the applicable hashes so no payload is trusted to a mutable
+          # tag. Hashed here from the exact bytes about to be published — no rebuild, no re-download.
           ( sha256sum \
               "braird-core-$VERSION.aar" \
               "braird-core-desktop-$VERSION.jar" \
               "braird-core-$VERSION.xcframework.zip" \
-              "BrairdCore.swift" | tee SHA256SUMS.txt )
+              "BrairdCore.swift" \
+              "great-ideas.json" \
+              "idea-tree.yaml" | tee SHA256SUMS.txt )
 
       # Create-only. Published assets are immutable: if a release for this tag already exists we
       # hard-fail rather than overwrite — every consumer pin (tag + SHA-256) stays valid forever.
@@ -275,10 +288,13 @@ jobs:
             "dist/braird-core-desktop-$VERSION.jar" \
             "dist/braird-core-$VERSION.xcframework.zip" \
             "dist/BrairdCore.swift" \
+            "dist/great-ideas.json" \
+            "dist/idea-tree.yaml" \
             "dist/SHA256SUMS.txt" \
             --title "braird-core $TAG" \
             --verify-tag \
-            --notes "Pinned artifacts for the Braird native clients — verify every download against SHA256SUMS.txt. Pin/bump protocol: docs/pinning.md.
+            --notes "Pinned payloads for the Braird clients — six SHA-256-hashed payloads plus SHA256SUMS.txt (seven total release assets). Verify every download against the manifest. Pin/bump protocol: docs/pinning.md.
 
           - **iOS** (braird-ios): \`braird-core-$VERSION.xcframework.zip\` (arm64 iOS device + arm64 iOS simulator + an arm64 macOS-host slice) **and** \`BrairdCore.swift\` (the generated wrapper — the xcframework doesn't carry it). Pin BOTH SHA-256s from SHA256SUMS.txt; the zip's is SwiftPM's \`.binaryTarget(checksum:)\`. Do not vendor the wrapper from the tag — fetch it from this release and verify its checksum.
-          - **Android** (braird-android): \`braird-core-$VERSION.aar\` (arm64-v8a + x86_64, 16 KB-aligned) + self-contained \`braird-core-desktop-$VERSION.jar\`. Add JNA 5.17.0 @aar alongside the AAR."
+          - **Android** (braird-android): \`braird-core-$VERSION.aar\` (arm64-v8a + x86_64, 16 KB-aligned) + self-contained \`braird-core-desktop-$VERSION.jar\`. Add JNA 5.17.0 @aar alongside the AAR.
+          - **Canon data** (native clients): \`great-ideas.json\` is the exact tag canon and \`idea-tree.yaml\` is its hierarchy metadata. Pin and verify BOTH SHA-256s from SHA256SUMS.txt."
