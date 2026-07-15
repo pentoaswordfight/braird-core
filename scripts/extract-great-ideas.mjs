@@ -38,9 +38,13 @@ function extractIdeaTreeLeafNames(yaml) {
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index];
     const lineNumber = index + 1;
+    const leavesDeclaration = line.match(/^( *)leaves\s*:(.*)$/);
     const leavesMatch = line.match(/^( *)leaves:\s*(?:#.*)?$/);
 
-    if (leavesMatch) {
+    if (leavesDeclaration) {
+      if (!leavesMatch) {
+        throw new Error(`unsupported \`leaves:\` declaration at line ${lineNumber}: ${line.trim()}`);
+      }
       finishBlock();
       block = { indent: leavesMatch[1].length, line: lineNumber, count: 0 };
       leavesBlocks += 1;
