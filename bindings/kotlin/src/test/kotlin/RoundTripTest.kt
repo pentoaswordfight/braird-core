@@ -1,19 +1,48 @@
 package braird.core.test
 
+import com.sun.net.httpserver.HttpServer
 import java.io.File
+import java.net.InetSocketAddress
+import java.util.Base64
+import java.util.concurrent.atomic.AtomicInteger
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertThrows
+import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import uniffi.braird_core.BookUpsert
 import uniffi.braird_core.CryptoException
+import uniffi.braird_core.ImportCounts
+import uniffi.braird_core.ImportSummary
 import uniffi.braird_core.NoteUpsert
 import uniffi.braird_core.SearchDocKind
 import uniffi.braird_core.SyncEngine
 import uniffi.braird_core.SyncException
 import uniffi.braird_core.Vault
 import uniffi.braird_core.WrappedBlob
+
+private class EmptyJsonLoopbackServer : AutoCloseable {
+    private val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+    val requestCount = AtomicInteger()
+    val baseUrl: String
+        get() = "http://127.0.0.1:${server.address.port}"
+
+    init {
+        server.createContext("/") { exchange ->
+            requestCount.incrementAndGet()
+            val response = "[]".toByteArray(Charsets.UTF_8)
+            exchange.responseHeaders.add("Content-Type", "application/json")
+            exchange.sendResponseHeaders(200, response.size.toLong())
+            exchange.responseBody.use { it.write(response) }
+            exchange.close()
+        }
+        server.start()
+    }
+
+    override fun close() = server.stop(0)
+}
 
 /**
  * Kotlin/JVM round-trip parity over the FFI. Decrypts FOREIGN (JS-produced) ciphertext
@@ -27,6 +56,36 @@ class RoundTripTest {
 
     private fun vectors() = JSONArray(File(repoRoot, "vendored/crypto-parity/vectors.json").readText())
     private fun inputs() = JSONObject(File(repoRoot, "vendored/crypto-parity/inputs.json").readText())
+    private fun snapshotFixture() =
+        File(repoRoot, "vendored/snapshot-parity/schema-19-all-stores.json").readText()
+
+    private fun testJwt(): String {
+        val payload = Base64.getUrlEncoder().withoutPadding()
+            .encodeToString("{\"sub\":\"snapshot-host-test\"}".toByteArray())
+        return "h.$payload.sig"
+    }
+
+    private fun assertImportCounts(counts: ImportCounts, notes: UInt) {
+        assertEquals(1u, counts.books)
+        assertEquals(notes, counts.notes)
+        assertEquals(1u, counts.customIdeas)
+        assertEquals(1u, counts.noteLinks)
+        assertEquals(1u, counts.lenses)
+        assertEquals(1u, counts.collections)
+        assertEquals(1u, counts.collectionMemberships)
+        assertEquals(1u, counts.noteSignals)
+    }
+
+    private fun assertZeroImportCounts(counts: ImportCounts) {
+        assertEquals(0u, counts.books)
+        assertEquals(0u, counts.notes)
+        assertEquals(0u, counts.customIdeas)
+        assertEquals(0u, counts.noteLinks)
+        assertEquals(0u, counts.lenses)
+        assertEquals(0u, counts.collections)
+        assertEquals(0u, counts.collectionMemberships)
+        assertEquals(0u, counts.noteSignals)
+    }
 
     private fun hex(s: String) =
         ByteArray(s.length / 2) {
@@ -372,5 +431,96 @@ class RoundTripTest {
         assertEquals(1u, e2.mergeContentDuplicates("keep", listOf("dup"), false))
         assertEquals(listOf("keep"), e2.listNotes(null, 50u, 0u).map { it.id })
         assertEquals(listOf("a", "b"), e2.getNote("keep")?.tags)
+    }
+
+    /** SUR-911: the generated host surface performs a real protective merge against an empty
+     * loopback PostgREST oracle, returns every summary field, then exports plaintext schema 19. */
+    @Test
+    fun snapshotTransferSurfaceOverFfi() {
+        EmptyJsonLoopbackServer().use { server ->
+            val db = File.createTempFile("braird-snapshot", ".sqlite").apply { deleteOnExit() }
+            val engine = SyncEngine.open(db.absolutePath, server.baseUrl, "anon", Vault.generate())
+            try {
+                engine.setAccessToken(testJwt())
+
+                val summary: ImportSummary = engine.importMerge(snapshotFixture())
+                assertEquals(19u, summary.schemaVersion)
+                assertImportCounts(summary.imported, notes = 2u)
+                assertZeroImportCounts(summary.skippedStale)
+                assertTrue(server.requestCount.get() >= 16, "pull + direct-fetch preflight used HTTP")
+
+                val exportedText = engine.exportSnapshot()
+                val exported = JSONObject(exportedText)
+                assertTrue(exported.getBoolean("_syntopicon"))
+                assertEquals(19, exported.getInt("schemaVersion"))
+                assertTrue(
+                    Regex("""^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$""")
+                        .matches(exported.getString("exportedAt")),
+                    "exportedAt is exact UTC milliseconds",
+                )
+                for ((name, expected) in mapOf(
+                    "books" to 1,
+                    "notes" to 2,
+                    "customIdeas" to 1,
+                    "noteLinks" to 1,
+                    "lenses" to 1,
+                    "collections" to 1,
+                    "collectionMemberships" to 1,
+                    "noteSignals" to 1,
+                )) {
+                    assertEquals(expected, exported.getJSONArray(name).length(), name)
+                }
+                val notes = exported.getJSONArray("notes").objects().associateBy { it.getString("id") }
+                assertEquals("A parent passage", notes.getValue("n-v19-parent").getString("text"))
+                assertEquals("Margin thought", notes.getValue("n-v19-child").getString("text"))
+                assertTrue(notes.values.all { !it.getString("text").startsWith("enc:v") })
+                assertFalse(exportedText.contains("enc:v"), "ciphertext must not cross export FFI")
+                assertFalse(exportedText.contains("data:image/"), "device-local previews are omitted")
+                assertFalse(exportedText.contains("LOCAL_SOURCE"))
+                assertFalse(exportedText.contains("LOCAL_CROP"))
+                assertFalse(exportedText.contains("stale-exporting-master-key-tag"))
+                for (localTable in listOf("outbox", "meta", "embeddings", "discovery_jobs")) {
+                    assertFalse(exported.has(localTable), "local table $localTable must not export")
+                }
+            } finally {
+                engine.close()
+            }
+        }
+    }
+
+    /** Parse failures are a distinct generated variant and never echo archive material. */
+    @Test
+    fun snapshotImportInvalidVariantIsSanitized() {
+        val db = File.createTempFile("braird-snapshot-invalid", ".sqlite").apply { deleteOnExit() }
+        val engine = SyncEngine.open(
+            db.absolutePath,
+            "http://127.0.0.1:9",
+            "anon",
+            Vault.generate(),
+        )
+        try {
+            val sentinel = "SNAPSHOT-PLAINTEXT-MUST-NOT-ECHO"
+            for (invalid in listOf(
+                """{"_syntopicon":false,"private":"$sentinel"}""",
+                "{$sentinel",
+            )) {
+                val error = assertThrows(SyncException.InvalidImport::class.java) {
+                    engine.importMerge(invalid)
+                }
+                assertFalse(error.v1.contains(sentinel))
+                assertFalse(error.message.orEmpty().contains(sentinel))
+            }
+        } finally {
+            engine.close()
+        }
+    }
+
+    /** SUR-911 deliberately exposes protective Merge only; no destructive Replace entrypoint. */
+    @Test
+    fun generatedSnapshotSurfaceHasNoReplaceApi() {
+        val methods = SyncEngine::class.java.methods.map { it.name }
+        assertTrue("exportSnapshot" in methods)
+        assertTrue("importMerge" in methods)
+        assertFalse(methods.any { it.contains("replace", ignoreCase = true) })
     }
 }

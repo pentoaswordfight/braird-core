@@ -9,10 +9,11 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 ## [0.6.0] - 2026-07-15
 
 Tenth release batch. **SUR-918** publishes the checksum-pinned paired canon assets, and **SUR-911**
-adds the Rust/UniFFI-source snapshot export plus protective merge-import boundary for all eight
-synced stores. Snapshot note text crosses this API as plaintext for portability, then accepted
-imports are re-tagged and freshly sealed under the active Vault before one atomic local+outbox
-batch.
+adds the snapshot export plus protective merge-import boundary for all eight synced stores across
+the Rust/UniFFI API and regenerated Swift/Kotlin bindings. Native host acceptance exercises both
+public methods plus their summary and sanitized-error types. Snapshot note text crosses this API as
+plaintext for portability, then accepted imports are re-tagged and freshly sealed under the active
+Vault before one atomic local+outbox batch.
 
 ### Added
 
@@ -27,9 +28,13 @@ batch.
   `release-integrity-reviewer`. Documentation/release-data only; no crate, FFI, or generated binding
   change.
 - **SUR-911 — PWA-compatible snapshot export and protective merge import.** Add
-  `SyncEngine::export_snapshot()` and `SyncEngine::import_merge(json)` in the Rust UniFFI source
-  surface, with schema-19 export across the eight synced stores and strict schema-1-through-19
-  import parsing. Export is live-only, decrypts note text, reconstructs handwritten
+  `SyncEngine::export_snapshot()` and `SyncEngine::import_merge(json)` to the public Rust UniFFI
+  surface and regenerate the Swift/Kotlin bindings. Kotlin/JVM acceptance drives both generated
+  methods end-to-end through a local `HttpServer`; the equivalent Swift macOS test uses a
+  self-contained `NWListener`. Both cover `ImportSummary`/all eight `ImportCounts` fields, the
+  sanitized generated `InvalidImport` variant, and the deliberate absence of a Replace API. The
+  transfer itself provides schema-19 export across the eight synced stores and strict
+  schema-1-through-19 import parsing. Export is live-only, decrypts note text, reconstructs handwritten
   `user_metadata.user_annotation`, and excludes local-only tables plus device-local data-URL
   previews. Import parses before operational access, requires a token and clean eight-table pull,
   directly fetches every candidate (including tombstones), and accepts only archive timestamps

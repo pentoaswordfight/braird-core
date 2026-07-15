@@ -1,6 +1,125 @@
 import BrairdCore
 import Foundation
+import Network
 import XCTest
+
+private enum LoopbackServerError: Error {
+    case startupTimedOut
+    case startupFailed
+    case missingPort
+}
+
+/// Minimal HTTP/1.1 loopback endpoint for native import preflight. Every request receives an
+/// empty JSON array, which is the real PostgREST shape for an empty pull/direct-id fetch.
+private final class EmptyJSONLoopbackServer {
+    private let listener: NWListener
+    private let queue = DispatchQueue(label: "braird.snapshot.loopback")
+    private let started = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private var startupFailed = false
+    private var requests = 0
+
+    var requestCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return requests
+    }
+
+    var baseURL: String {
+        "http://127.0.0.1:\(listener.port!.rawValue)"
+    }
+
+    init() throws {
+        let parameters = NWParameters.tcp
+        parameters.requiredLocalEndpoint = .hostPort(
+            host: NWEndpoint.Host("127.0.0.1"),
+            port: NWEndpoint.Port.any)
+        listener = try NWListener(using: parameters)
+        listener.stateUpdateHandler = { [weak self] state in
+            guard let self else { return }
+            switch state {
+            case .ready:
+                self.started.signal()
+            case .failed(_):
+                self.lock.lock()
+                self.startupFailed = true
+                self.lock.unlock()
+                self.started.signal()
+            default:
+                break
+            }
+        }
+        listener.newConnectionHandler = { [weak self] connection in
+            self?.accept(connection)
+        }
+        listener.start(queue: queue)
+
+        guard started.wait(timeout: .now() + 5) == .success else {
+            listener.cancel()
+            throw LoopbackServerError.startupTimedOut
+        }
+        lock.lock()
+        let failed = startupFailed
+        lock.unlock()
+        guard !failed else {
+            listener.cancel()
+            throw LoopbackServerError.startupFailed
+        }
+        guard listener.port != nil else {
+            listener.cancel()
+            throw LoopbackServerError.missingPort
+        }
+    }
+
+    func stop() {
+        listener.cancel()
+    }
+
+    private func accept(_ connection: NWConnection) {
+        connection.stateUpdateHandler = { [weak self] state in
+            switch state {
+            case .ready:
+                connection.stateUpdateHandler = nil
+                self?.receiveAndRespond(connection)
+            case .failed(_), .cancelled:
+                connection.stateUpdateHandler = nil
+                connection.cancel()
+            default:
+                break
+            }
+        }
+        connection.start(queue: queue)
+    }
+
+    private func receiveAndRespond(_ connection: NWConnection) {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) {
+            [weak self] data, _, isComplete, error in
+            guard let self else {
+                connection.cancel()
+                return
+            }
+            guard let data, !data.isEmpty else {
+                if error == nil && !isComplete {
+                    self.receiveAndRespond(connection)
+                } else {
+                    connection.cancel()
+                }
+                return
+            }
+
+            self.lock.lock()
+            self.requests += 1
+            self.lock.unlock()
+            let responseText =
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n" +
+                "Connection: close\r\n\r\n[]"
+            let response = Data(responseText.utf8)
+            connection.send(content: response, completion: .contentProcessed { _ in
+                connection.cancel()
+            })
+        }
+    }
+}
 
 /// Swift round-trip parity over the FFI. Proves the generated Swift binding decrypts
 /// FOREIGN (JS-produced) ciphertext and reproduces the deterministic content tags
@@ -19,6 +138,43 @@ final class RoundTripTests: XCTestCase {
     private func fixture(_ name: String) throws -> Any {
         let url = repoRoot().appendingPathComponent("vendored/crypto-parity/\(name)")
         return try JSONSerialization.jsonObject(with: Data(contentsOf: url))
+    }
+
+    private func snapshotFixture() throws -> String {
+        let url = repoRoot()
+            .appendingPathComponent("vendored/snapshot-parity/schema-19-all-stores.json")
+        return try String(contentsOf: url, encoding: .utf8)
+    }
+
+    private func testJWT() -> String {
+        let payload = Data(#"{"sub":"snapshot-host-test"}"#.utf8)
+            .base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+        return "h.\(payload).sig"
+    }
+
+    private func assertImportCounts(_ counts: ImportCounts, notes: UInt32) {
+        XCTAssertEqual(counts.books, 1)
+        XCTAssertEqual(counts.notes, notes)
+        XCTAssertEqual(counts.customIdeas, 1)
+        XCTAssertEqual(counts.noteLinks, 1)
+        XCTAssertEqual(counts.lenses, 1)
+        XCTAssertEqual(counts.collections, 1)
+        XCTAssertEqual(counts.collectionMemberships, 1)
+        XCTAssertEqual(counts.noteSignals, 1)
+    }
+
+    private func assertZeroImportCounts(_ counts: ImportCounts) {
+        XCTAssertEqual(counts.books, 0)
+        XCTAssertEqual(counts.notes, 0)
+        XCTAssertEqual(counts.customIdeas, 0)
+        XCTAssertEqual(counts.noteLinks, 0)
+        XCTAssertEqual(counts.lenses, 0)
+        XCTAssertEqual(counts.collections, 0)
+        XCTAssertEqual(counts.collectionMemberships, 0)
+        XCTAssertEqual(counts.noteSignals, 0)
     }
 
     private func hexData(_ s: String) -> Data {
@@ -344,5 +500,103 @@ final class RoundTripTests: XCTestCase {
         XCTAssertEqual(try e2.mergeContentDuplicates(survivorId: "keep", loserIds: ["dup"], allowCrossCluster: false), 1)
         XCTAssertEqual(try e2.listNotes(bookId: nil, limit: 50, offset: 0).map { $0.id }, ["keep"])
         XCTAssertEqual(try e2.getNote(id: "keep")?.tags, ["a", "b"])
+    }
+
+    /// SUR-911: the generated host surface performs a real protective merge against an empty
+    /// loopback PostgREST oracle, returns every summary field, then exports plaintext schema 19.
+    func testSnapshotTransferSurfaceOverFfi() throws {
+        let server = try EmptyJSONLoopbackServer()
+        defer { server.stop() }
+        let db = FileManager.default.temporaryDirectory
+            .appendingPathComponent("braird-snapshot-\(UUID().uuidString).sqlite")
+        let engine = try SyncEngine.open(
+            dbPath: db.path, supabaseUrl: server.baseURL, anonKey: "anon",
+            vault: Vault.generate())
+        engine.setAccessToken(jwt: testJWT())
+
+        let summary: ImportSummary = try engine.importMerge(json: snapshotFixture())
+        XCTAssertEqual(summary.schemaVersion, 19)
+        assertImportCounts(summary.imported, notes: 2)
+        assertZeroImportCounts(summary.skippedStale)
+        XCTAssertGreaterThanOrEqual(server.requestCount, 16, "pull + direct-fetch preflight used HTTP")
+
+        let exportedText = try engine.exportSnapshot()
+        let exported = try JSONSerialization.jsonObject(with: Data(exportedText.utf8))
+            as! [String: Any]
+        XCTAssertEqual(exported["_syntopicon"] as? Bool, true)
+        XCTAssertEqual(exported["schemaVersion"] as? Int, 19)
+        let exportedAt = exported["exportedAt"] as! String
+        XCTAssertNotNil(
+            exportedAt.range(
+                of: #"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$"#,
+                options: .regularExpression),
+            "exportedAt is exact UTC milliseconds")
+        for (name, expected) in [
+            "books": 1,
+            "notes": 2,
+            "customIdeas": 1,
+            "noteLinks": 1,
+            "lenses": 1,
+            "collections": 1,
+            "collectionMemberships": 1,
+            "noteSignals": 1,
+        ] {
+            XCTAssertEqual((exported[name] as? [Any])?.count, expected, name)
+        }
+        let notes = exported["notes"] as! [[String: Any]]
+        let parent = notes.first { $0["id"] as? String == "n-v19-parent" }!
+        let child = notes.first { $0["id"] as? String == "n-v19-child" }!
+        XCTAssertEqual(parent["text"] as? String, "A parent passage")
+        XCTAssertEqual(child["text"] as? String, "Margin thought")
+        XCTAssertTrue(notes.allSatisfy { !(($0["text"] as? String) ?? "").hasPrefix("enc:v") })
+        XCTAssertFalse(exportedText.contains("enc:v"), "ciphertext must not cross export FFI")
+        XCTAssertFalse(exportedText.contains("data:image/"), "device-local previews are omitted")
+        XCTAssertFalse(exportedText.contains("LOCAL_SOURCE"))
+        XCTAssertFalse(exportedText.contains("LOCAL_CROP"))
+        XCTAssertFalse(exportedText.contains("stale-exporting-master-key-tag"))
+        for localTable in ["outbox", "meta", "embeddings", "discovery_jobs"] {
+            XCTAssertNil(exported[localTable], "local table \(localTable) must not export")
+        }
+    }
+
+    /// Parse failures are a distinct generated variant and never echo archive material.
+    func testSnapshotImportInvalidVariantIsSanitized() throws {
+        let db = FileManager.default.temporaryDirectory
+            .appendingPathComponent("braird-snapshot-invalid-\(UUID().uuidString).sqlite")
+        let engine = try SyncEngine.open(
+            dbPath: db.path, supabaseUrl: "http://127.0.0.1:9", anonKey: "anon",
+            vault: Vault.generate())
+        let sentinel = "SNAPSHOT-PLAINTEXT-MUST-NOT-ECHO"
+        let invalidArchives = [
+            "{\"_syntopicon\":false,\"private\":\"\(sentinel)\"}",
+            "{\(sentinel)",
+        ]
+
+        for invalid in invalidArchives {
+            do {
+                _ = try engine.importMerge(json: invalid)
+                XCTFail("expected InvalidImport")
+            } catch let error as SyncError {
+                switch error {
+                case .InvalidImport(let message):
+                    XCTAssertFalse(message.contains(sentinel))
+                    XCTAssertFalse(error.localizedDescription.contains(sentinel))
+                default:
+                    XCTFail("expected InvalidImport, got \(error)")
+                }
+            }
+        }
+    }
+
+    /// SUR-911 deliberately exposes protective Merge only; no destructive Replace entrypoint.
+    func testGeneratedSnapshotSurfaceHasNoReplaceApi() throws {
+        let sourceURL = repoRoot()
+            .appendingPathComponent("bindings/swift/Sources/BrairdCore/BrairdCore.swift")
+        let source = try String(contentsOf: sourceURL, encoding: .utf8)
+        XCTAssertTrue(source.contains("func exportSnapshot("))
+        XCTAssertTrue(source.contains("func importMerge("))
+        XCTAssertFalse(source.localizedCaseInsensitiveContains("func importReplace("))
+        XCTAssertFalse(source.localizedCaseInsensitiveContains("func replaceSnapshot("))
+        XCTAssertFalse(source.contains("syncengine_import_replace"))
     }
 }
