@@ -42,7 +42,8 @@ use reconcile::BookMergeUndo;
 
 /// Errors that cross the FFI from the sync engine. Coarse like [`crate::CryptoError`]: enough
 /// for a host to distinguish store failures, network/sync failures, and invalid snapshot input,
-/// never leaking key material, archive content, server response bodies, or per-record detail.
+/// never leaking key material or per-record server detail. Invalid snapshot-input reasons are
+/// additionally sanitized so they never echo archive content.
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum SyncError {
     #[error("store error: {0}")]
