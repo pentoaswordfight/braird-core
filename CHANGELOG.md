@@ -6,6 +6,15 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+### Added
+
+- **SUR-918 — checksum-pinned canon release assets.** Byte-vendor the surfc idea-tree YAML and
+  guard it together with `great-ideas.json`: the combined drift check requires byte equality with
+  `surfc/main` and set equality between all 97 YAML leaf assignments and `GREAT_IDEAS`. Releases now
+  attach both canon files with their own entries in `SHA256SUMS.txt`, so consumers pin the pair to
+  one exact tag and both checksums. Documentation/release-data only; no crate, FFI, or generated
+  binding change.
+
 ## [0.5.0] - 2026-07-14
 
 Ninth tagged release. Two native-platformization surfaces land over the FFI, batched into one cut:
