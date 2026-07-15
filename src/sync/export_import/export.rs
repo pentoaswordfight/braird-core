@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use serde::Serialize;
 use serde_json::{json, Map, Value};
+use time::{macros::format_description, OffsetDateTime};
 
 use crate::store::Store;
 use crate::sync::SyncError;
@@ -139,7 +140,7 @@ pub(in crate::sync) fn build_snapshot_at(
     serde_json::to_string(&SnapshotExport {
         syntopicon: true,
         schema_version: SCHEMA_VERSION,
-        exported_at: format_utc_iso8601(now_ms),
+        exported_at: format_utc_iso8601(now_ms)?,
         books,
         notes,
         custom_ideas,
@@ -263,34 +264,14 @@ fn edge_id(edge: &Map<String, Value>) -> &str {
     edge.get("id").and_then(Value::as_str).unwrap_or_default()
 }
 
-fn format_utc_iso8601(epoch_ms: i64) -> String {
-    let epoch_ms = epoch_ms.max(0);
-    let epoch_seconds = epoch_ms / 1_000;
-    let milliseconds = epoch_ms % 1_000;
-    let days = epoch_seconds / 86_400;
-    let seconds_in_day = epoch_seconds % 86_400;
-    let hour = seconds_in_day / 3_600;
-    let minute = (seconds_in_day % 3_600) / 60;
-    let second = seconds_in_day % 60;
-    let (year, month, day) = civil_from_unix_days(days);
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{milliseconds:03}Z")
-}
-
-fn civil_from_unix_days(days: i64) -> (i64, i64, i64) {
-    let shifted = days + 719_468;
-    let era = shifted / 146_097;
-    let day_of_era = shifted - era * 146_097;
-    let year_of_era =
-        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let mut year = year_of_era + era * 400;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_prime = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
-    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
-    if month <= 2 {
-        year += 1;
-    }
-    (year, month, day)
+fn format_utc_iso8601(epoch_ms: i64) -> Result<String, SyncError> {
+    const UTC_MILLISECONDS: &[time::format_description::FormatItem<'static>] =
+        format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z");
+    let timestamp = OffsetDateTime::from_unix_timestamp_nanos(i128::from(epoch_ms) * 1_000_000)
+        .map_err(|_| SyncError::Store("snapshot export timestamp formatting failed".into()))?;
+    timestamp
+        .format(UTC_MILLISECONDS)
+        .map_err(|_| SyncError::Store("snapshot export timestamp formatting failed".into()))
 }
 
 #[cfg(test)]
@@ -302,6 +283,12 @@ mod tests {
     use crate::store::Store;
     use crate::sync::SyncEngine;
     use crate::vault::Vault;
+
+    #[cfg(feature = "test-seams")]
+    const CORE_EXPORT_FIXTURE: &str =
+        include_str!("../../../vendored/snapshot-parity/schema-19-core-export.json");
+    #[cfg(feature = "test-seams")]
+    const SNAPSHOT_MANIFEST: &str = include_str!("../../../vendored/snapshot-parity/manifest.json");
 
     fn put(store: &Store, table: &str, value: Value) {
         store
@@ -350,6 +337,175 @@ mod tests {
                 "\"noteSignals\":[]}"
             )
         );
+    }
+
+    #[test]
+    fn utc_formatter_matches_javascript_at_epoch_and_calendar_edges() {
+        for (epoch_ms, expected) in [
+            (-2_208_988_800_000, "1900-01-01T00:00:00.000Z"),
+            (-1, "1969-12-31T23:59:59.999Z"),
+            (0, "1970-01-01T00:00:00.000Z"),
+            (951_782_400_000, "2000-02-29T00:00:00.000Z"),
+            (1_704_164_645_123, "2024-01-02T03:04:05.123Z"),
+            (4_107_542_400_999, "2100-03-01T00:00:00.999Z"),
+        ] {
+            assert_eq!(super::format_utc_iso8601(epoch_ms).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn utc_formatter_fails_closed_for_out_of_range_test_clocks() {
+        let store = Store::open_in_memory().unwrap();
+        let vault = Vault::generate();
+
+        for epoch_ms in [i64::MIN, i64::MAX] {
+            let error = super::build_snapshot_at(&store, &vault, epoch_ms).unwrap_err();
+
+            assert_eq!(
+                error.to_string(),
+                "store error: snapshot export timestamp formatting failed"
+            );
+        }
+    }
+
+    #[cfg(feature = "test-seams")]
+    #[test]
+    fn fixed_clock_export_matches_the_exact_all_store_fixture() {
+        let manifest: Value = serde_json::from_str(SNAPSHOT_MANIFEST).unwrap();
+        let vault =
+            Vault::__with_raw_mk_hex(manifest["coreExportTestMasterKeyHex"].as_str().unwrap())
+                .unwrap();
+        let store = Store::open_in_memory().unwrap();
+
+        put(
+            &store,
+            "books",
+            json!({
+                "id":"core-b-v19", "title":"Core Export Fixture", "author":"Braird",
+                "isbn":"9780000000911", "cover_url":"https://example.invalid/core-cover.jpg",
+                "cover_source":"manual", "cover_resolved_at":29001, "created_at":29000,
+                "updated_at":29002, "deleted":false
+            }),
+        );
+        for (
+            id,
+            plaintext,
+            page,
+            tags,
+            image_path,
+            ink_crop_path,
+            source,
+            source_id,
+            source_meta,
+            chapter,
+            created_at,
+            updated_at,
+        ) in [
+            (
+                "core-n-v19-parent",
+                "Core-supported parent passage",
+                "91",
+                json!(["Truth", "Justice"]),
+                json!("core/source.jpg"),
+                Value::Null,
+                "manual",
+                Value::Null,
+                json!({"origin":"core"}),
+                json!("IX"),
+                29103,
+                29104,
+            ),
+            (
+                "core-n-v19-child",
+                "Core-supported margin note",
+                "91",
+                json!(["Memory"]),
+                Value::Null,
+                json!("core/crop.jpg"),
+                "handwritten",
+                json!("core-margin:1"),
+                json!({}),
+                Value::Null,
+                29100,
+                29101,
+            ),
+        ] {
+            put(
+                &store,
+                "notes",
+                json!({
+                    "id":id, "book_id":"core-b-v19",
+                    "text":vault.encrypt_note(Some(id.into()), plaintext.into()), "page":page,
+                    "tags":tags, "image_path":image_path, "ink_crop_path":ink_crop_path,
+                    "source":source, "source_id":source_id, "source_meta":source_meta,
+                    "chapter":chapter,
+                    "content_tag":vault.content_tag(
+                        plaintext.into(), Some("core-b-v19".into())
+                    ),
+                    "created_at":created_at, "updated_at":updated_at, "deleted":false
+                }),
+            );
+        }
+        put(
+            &store,
+            "custom_ideas",
+            json!({
+                "id":"core-ci-v19", "name":"Attention",
+                "description":"Core-supported custom idea", "created_at":29200,
+                "updated_at":29201, "deleted":false
+            }),
+        );
+        put(
+            &store,
+            "note_links",
+            json!({
+                "id":"core-link-v19", "from_note_id":"core-n-v19-parent",
+                "to_note_id":"core-n-v19-child", "relation_type":"handwritten_annotation",
+                "created_at":29300, "updated_at":29301, "deleted":false
+            }),
+        );
+        put(
+            &store,
+            "lenses",
+            json!({
+                "id":"core-lens-v19", "name":"Core Lens", "leaf_ids":["Truth","Justice"],
+                "combinator":"AND", "threshold":75, "created_at":29400,
+                "updated_at":29401, "deleted":false
+            }),
+        );
+        put(
+            &store,
+            "collections",
+            json!({
+                "id":"core-col-v19", "name":"Core Collection", "created_at":29500,
+                "updated_at":29501, "deleted":false
+            }),
+        );
+        put(
+            &store,
+            "collection_memberships",
+            json!({
+                "id":"core-col-v19:core-n-v19-parent",
+                "note_id":"core-n-v19-parent", "collection_id":"core-col-v19",
+                "created_at":29600, "updated_at":29601, "deleted":false
+            }),
+        );
+        put(
+            &store,
+            "note_signals",
+            json!({
+                "note_id":"core-n-v19-parent", "source_prior":0.7, "return_visits":2,
+                "has_annotation":true, "stitch_spawns":1, "exposure_recency_at":29700,
+                "engagement_recency_at":29701, "importance":123.456,
+                "created_at":29702, "updated_at":29703, "deleted":false
+            }),
+        );
+
+        let actual: Value =
+            serde_json::from_str(&snapshot_at(&store, &vault, 1_784_106_611_012)).unwrap();
+        let expected: Value = serde_json::from_str(CORE_EXPORT_FIXTURE).unwrap();
+
+        assert_eq!(actual, expected);
     }
 
     #[test]

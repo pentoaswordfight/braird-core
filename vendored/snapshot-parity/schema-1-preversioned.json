@@ -1,0 +1,28 @@
+{
+  "_syntopicon": true,
+  "exportedAt": "2019-01-01T00:00:00.000Z",
+  "books": [
+    {
+      "id": "b-v1",
+      "title": "Legacy Book",
+      "author": "",
+      "createdAt": 1000
+    }
+  ],
+  "notes": [
+    {
+      "id": "n-v1",
+      "bookId": "b-v1",
+      "text": "Legacy note",
+      "page": "1",
+      "createdAt": 2000
+    }
+  ],
+  "customIdeas": [
+    {
+      "id": "ci-v1",
+      "name": "Legacy idea",
+      "description": ""
+    }
+  ]
+}

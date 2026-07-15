@@ -1,0 +1,35 @@
+{
+  "_syntopicon": true,
+  "schemaVersion": 14,
+  "exportedAt": "2022-02-14T14:00:00.014Z",
+  "books": [],
+  "notes": [
+    {
+      "id": "n-v14-parent",
+      "text": "Current-schema tags stay byte-for-byte",
+      "tags": ["War", "Knowledge", "Knowledge", "Angel"],
+      "source": "manual",
+      "createdAt": 14000,
+      "updatedAt": 14001,
+      "deleted": 0
+    },
+    {
+      "id": "n-v14-child",
+      "text": "Legacy margin annotation",
+      "tags": [],
+      "source": "handwritten",
+      "createdAt": 14002,
+      "updatedAt": 14003,
+      "deleted": 0
+    }
+  ],
+  "customIdeas": [],
+  "noteLinks": [
+    {
+      "id": "link-v14",
+      "fromNoteId": "n-v14-parent",
+      "toNoteId": "n-v14-child",
+      "deleted": 0
+    }
+  ]
+}

@@ -646,12 +646,31 @@ fn source_prior(source: Option<&str>) -> f64 {
 
 #[cfg(test)]
 mod import_tests {
+    use std::future::Future;
+
     use serde_json::{json, Map, Value};
 
-    use super::{parse_import_at, NormalizedImport, NormalizedRow};
+    use super::super::merge::merge_parsed_with_sink;
+    use super::{
+        parse_import_at, NormalizedImport, NormalizedRow, CANON_REMAP_V14, GREAT_IDEAS_RENAMES,
+    };
+    use crate::store::{table_schema, Store};
+    use crate::sync::http::PostgrestSink;
     use crate::sync::{ImportCounts, ImportSummary, SyncError};
+    use crate::vault::Vault;
 
     const NOW: i64 = 9_000;
+    const FIXTURE_NOW: i64 = 1_700_000_000_000;
+    const SCHEMA_1_FIXTURE: &str =
+        include_str!("../../../vendored/snapshot-parity/schema-1-preversioned.json");
+    const SCHEMA_10_FIXTURE: &str =
+        include_str!("../../../vendored/snapshot-parity/schema-10-pre-v11.json");
+    const SCHEMA_11_FIXTURE: &str =
+        include_str!("../../../vendored/snapshot-parity/schema-11-pre-v14.json");
+    const SCHEMA_14_FIXTURE: &str =
+        include_str!("../../../vendored/snapshot-parity/schema-14-current-tags.json");
+    const SCHEMA_19_FIXTURE: &str =
+        include_str!("../../../vendored/snapshot-parity/schema-19-all-stores.json");
 
     fn parse_raw(raw: &str) -> Result<NormalizedImport, SyncError> {
         parse_import_at(raw, NOW)
@@ -672,6 +691,45 @@ mod import_tests {
     fn assert_invalid(raw: &str) {
         let error = parse_raw(raw).unwrap_err();
         assert!(matches!(error, SyncError::InvalidImport(_)));
+    }
+
+    fn run<T>(future: impl Future<Output = T>) -> T {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(future)
+    }
+
+    struct EmptySink;
+
+    impl PostgrestSink for EmptySink {
+        async fn upsert(
+            &self,
+            _table: &str,
+            _on_conflict: &str,
+            _rows: &Value,
+        ) -> Result<(), String> {
+            panic!("snapshot import must only stage an outbox write")
+        }
+
+        async fn fetch_page(
+            &self,
+            _table: &str,
+            _after_seq: i64,
+            _limit: i64,
+        ) -> Result<Vec<Value>, String> {
+            Ok(Vec::new())
+        }
+
+        async fn fetch_by_ids(
+            &self,
+            _table: &str,
+            _primary_key: &str,
+            _ids: &[String],
+        ) -> Result<Vec<Value>, String> {
+            Ok(Vec::new())
+        }
     }
 
     #[test]
@@ -1077,6 +1135,300 @@ mod import_tests {
             parse_tags(14, json!(["War", "Knowledge", "Knowledge"])),
             json!(["War", "Knowledge", "Knowledge"])
         );
+    }
+
+    #[test]
+    fn frozen_pwa_fixtures_cover_schemas_1_10_11_14_and_19() {
+        let schema_1 = parse_import_at(SCHEMA_1_FIXTURE, FIXTURE_NOW).unwrap();
+        assert_eq!(schema_1.schema_version, 1);
+        assert_eq!(schema_1.books.len(), 1);
+        assert_eq!(schema_1.notes.len(), 1);
+        assert_eq!(schema_1.custom_ideas.len(), 1);
+        assert!(schema_1.note_links.is_empty());
+        assert!(schema_1.lenses.is_empty());
+        assert!(schema_1.collections.is_empty());
+        assert!(schema_1.collection_memberships.is_empty());
+        assert!(schema_1.note_signals.is_empty());
+        assert_eq!(row(&schema_1.books[0])["updated_at"], FIXTURE_NOW);
+        assert_eq!(row(&schema_1.custom_ideas[0])["updated_at"], FIXTURE_NOW);
+        assert_eq!(
+            row(&schema_1.notes[0]),
+            json!({
+                "id":"n-v1", "book_id":"b-v1", "text":"Legacy note", "page":"1",
+                "tags":[], "source":"manual", "source_id":null, "source_meta":{},
+                "chapter":null, "created_at":2000, "updated_at":FIXTURE_NOW,
+                "deleted":false
+            })
+            .as_object()
+            .unwrap()
+        );
+
+        let schema_10 = parse_import_at(SCHEMA_10_FIXTURE, FIXTURE_NOW).unwrap();
+        assert_eq!(schema_10.schema_version, 10);
+        assert_eq!(
+            row(&schema_10.notes[0])["tags"],
+            json!(["Conflict", "Truth", "Angel", "war"])
+        );
+
+        let schema_11 = parse_import_at(SCHEMA_11_FIXTURE, FIXTURE_NOW).unwrap();
+        assert_eq!(schema_11.schema_version, 11);
+        assert_eq!(
+            row(&schema_11.notes[0])["tags"],
+            json!(["War", "Truth", "Conflict", "Status", "Power", "Angel"])
+        );
+
+        let schema_14 = parse_import_at(SCHEMA_14_FIXTURE, FIXTURE_NOW).unwrap();
+        assert_eq!(schema_14.schema_version, 14);
+        assert_eq!(
+            row(&schema_14.notes[0])["tags"],
+            json!(["War", "Knowledge", "Knowledge", "Angel"])
+        );
+        assert_eq!(
+            row(&schema_14.note_links[0]),
+            json!({
+                "id":"link-v14", "from_note_id":"n-v14-parent",
+                "to_note_id":"n-v14-child", "relation_type":"handwritten_annotation",
+                "created_at":FIXTURE_NOW, "updated_at":FIXTURE_NOW, "deleted":false
+            })
+            .as_object()
+            .unwrap()
+        );
+
+        let schema_19 = parse_import_at(SCHEMA_19_FIXTURE, FIXTURE_NOW).unwrap();
+        assert_eq!(schema_19.schema_version, 19);
+        assert_eq!(schema_19.books.len(), 1);
+        assert_eq!(schema_19.notes.len(), 2);
+        assert_eq!(schema_19.custom_ideas.len(), 1);
+        assert_eq!(schema_19.note_links.len(), 1);
+        assert_eq!(schema_19.lenses.len(), 1);
+        assert_eq!(schema_19.collections.len(), 1);
+        assert_eq!(schema_19.collection_memberships.len(), 1);
+        assert_eq!(schema_19.note_signals.len(), 1);
+        let parent = row(&schema_19.notes[0]);
+        for ignored in [
+            "content_tag",
+            "contentTag",
+            "imageDataUrl",
+            "inkCropDataUrl",
+            "user_metadata",
+            "futureField",
+        ] {
+            assert!(!parent.contains_key(ignored));
+        }
+        let signal = row(&schema_19.note_signals[0]);
+        assert_eq!(signal["source_prior"], 0.7);
+        assert_eq!(signal["return_visits"], 4);
+        assert_eq!(signal["has_annotation"], true);
+        assert_eq!(signal["stitch_spawns"], 1);
+        assert_eq!(signal["importance"], 1.6020444242489622);
+    }
+
+    #[test]
+    fn frozen_tag_migration_tables_are_exhaustive() {
+        const EXPECTED_V11: &[(&str, &str)] = &[
+            ("Good", "Good and Evil"),
+            ("Custom", "Custom and Convention"),
+            ("Pleasure", "Pleasure and Pain"),
+            ("Virtue", "Virtue and Vice"),
+            ("Sign", "Sign and Symbol"),
+            ("War", "War and Peace"),
+            ("Tyranny", "Tyranny and Despotism"),
+            ("Life", "Life and Death"),
+            ("Memory", "Memory and Imagination"),
+            ("Necessity", "Necessity and Contingency"),
+            ("Universal", "Universal and Particular"),
+        ];
+        const EXPECTED_V14: &[(&str, &str)] = &[
+            ("Cause", "Causation"),
+            ("Chance", "Probability"),
+            ("Liberty", "Freedom"),
+            ("Honor", "Status"),
+            ("Virtue and Vice", "Virtue"),
+            ("Animal", "Life"),
+            ("Aristocracy", "Power"),
+            ("Monarchy", "Power"),
+            ("Oligarchy", "Power"),
+            ("Tyranny and Despotism", "Power"),
+            ("Constitution", "Institutions"),
+            ("Government", "Institutions"),
+            ("State", "Institutions"),
+            ("Citizen", "Institutions"),
+            ("Custom and Convention", "Institutions"),
+            ("Courage", "Virtue"),
+            ("Dialectic", "Reasoning"),
+            ("Induction", "Reasoning"),
+            ("Logic", "Reasoning"),
+            ("Duty", "Obligation"),
+            ("Education", "Learning"),
+            ("Experience", "Learning"),
+            ("Family", "Community"),
+            ("Form", "Beauty"),
+            ("God", "the Sacred"),
+            ("Religion", "the Sacred"),
+            ("Theology", "the Sacred"),
+            ("Prophecy", "the Sacred"),
+            ("Immortality", "the Sacred"),
+            ("Hypothesis", "Evidence"),
+            ("Labor", "Productivity"),
+            ("Mind", "Consciousness"),
+            ("Soul", "Consciousness"),
+            ("Sense", "Consciousness"),
+            ("Poetry", "Art"),
+            ("Property", "Markets"),
+            ("Wealth", "Markets"),
+            ("Prudence", "Strategy"),
+            ("Punishment", "Justice"),
+            ("Revolution", "Conflict"),
+            ("Rhetoric", "Narrative"),
+            ("Sign and Symbol", "Language"),
+            ("Sin", "Morality"),
+            ("Temperance", "Discipline"),
+            ("Wisdom", "Judgment"),
+            ("Opinion", "Judgment"),
+            ("Will", "Motivation"),
+            ("World", "Nature"),
+            ("Man", "Identity"),
+            ("Good and Evil", "Morality"),
+            ("Happiness", "Purpose"),
+            ("Knowledge", "Truth"),
+            ("Law", "Institutions"),
+            ("Life and Death", "Life"),
+            ("Memory and Imagination", "Memory"),
+            ("Pleasure and Pain", "Emotion"),
+            ("Slavery", "Freedom"),
+            ("War and Peace", "Conflict"),
+        ];
+
+        assert_eq!(GREAT_IDEAS_RENAMES, EXPECTED_V11);
+        assert_eq!(CANON_REMAP_V14, EXPECTED_V14);
+        assert_eq!(EXPECTED_V11.len(), 11);
+        assert_eq!(EXPECTED_V14.len(), 58);
+    }
+
+    #[test]
+    fn frozen_schema_19_import_stages_exact_rows_for_all_eight_stores() {
+        let store = Store::open_in_memory().unwrap();
+        let vault = Vault::generate();
+        let parsed = parse_import_at(SCHEMA_19_FIXTURE, FIXTURE_NOW).unwrap();
+
+        let summary = run(merge_parsed_with_sink(
+            &store,
+            &EmptySink,
+            &vault,
+            parsed,
+            FIXTURE_NOW,
+        ))
+        .unwrap();
+
+        assert_eq!(summary.schema_version, 19);
+        assert_eq!(summary.imported.books, 1);
+        assert_eq!(summary.imported.notes, 2);
+        assert_eq!(summary.imported.custom_ideas, 1);
+        assert_eq!(summary.imported.note_links, 1);
+        assert_eq!(summary.imported.lenses, 1);
+        assert_eq!(summary.imported.collections, 1);
+        assert_eq!(summary.imported.collection_memberships, 1);
+        assert_eq!(summary.imported.note_signals, 1);
+        assert_eq!(summary.skipped_stale.books, 0);
+        assert_eq!(summary.skipped_stale.notes, 0);
+        assert_eq!(summary.skipped_stale.custom_ideas, 0);
+        assert_eq!(summary.skipped_stale.note_links, 0);
+        assert_eq!(summary.skipped_stale.lenses, 0);
+        assert_eq!(summary.skipped_stale.collections, 0);
+        assert_eq!(summary.skipped_stale.collection_memberships, 0);
+        assert_eq!(summary.skipped_stale.note_signals, 0);
+
+        let expected = parse_import_at(SCHEMA_19_FIXTURE, FIXTURE_NOW).unwrap();
+        for (table, candidates) in [
+            ("books", expected.books),
+            ("notes", expected.notes),
+            ("custom_ideas", expected.custom_ideas),
+            ("note_links", expected.note_links),
+            ("lenses", expected.lenses),
+            ("collections", expected.collections),
+            ("collection_memberships", expected.collection_memberships),
+            ("note_signals", expected.note_signals),
+        ] {
+            let schema = table_schema(table).unwrap();
+            for candidate in candidates {
+                let mut expected_row = candidate.row;
+                expected_row.insert("updated_at".into(), Value::from(FIXTURE_NOW));
+                expected_row.insert("deleted".into(), Value::Bool(false));
+                let mut actual = store
+                    .get_row(table, &candidate.primary_key)
+                    .unwrap()
+                    .unwrap();
+
+                if table == "notes" {
+                    let plaintext = expected_row
+                        .remove("text")
+                        .and_then(|text| text.as_str().map(str::to_owned))
+                        .unwrap();
+                    let ciphertext = actual
+                        .remove("text")
+                        .and_then(|text| text.as_str().map(str::to_owned))
+                        .unwrap();
+                    assert_eq!(
+                        vault
+                            .decrypt_note(Some(candidate.primary_key.clone()), ciphertext)
+                            .unwrap(),
+                        plaintext
+                    );
+                    let book_id = expected_row
+                        .get("book_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                    let expected_tag = vault.content_tag(plaintext, book_id);
+                    assert_eq!(
+                        actual.remove("content_tag"),
+                        Some(Value::String(expected_tag))
+                    );
+                    expected_row.remove("content_tag");
+                }
+
+                let mut complete_expected: Map<String, Value> = schema
+                    .columns
+                    .iter()
+                    .map(|(column, _)| {
+                        (
+                            (*column).to_owned(),
+                            expected_row.remove(*column).unwrap_or(Value::Null),
+                        )
+                    })
+                    .collect();
+                if table == "notes" {
+                    complete_expected.remove("text");
+                    complete_expected.remove("content_tag");
+                }
+                assert_eq!(actual, complete_expected, "persisted {table} row mismatch");
+            }
+        }
+
+        let expected_order = [
+            ("books", "b-v19"),
+            ("notes", "n-v19-parent"),
+            ("notes", "n-v19-child"),
+            ("custom_ideas", "ci-v19"),
+            ("note_links", "link-v19"),
+            ("lenses", "lens-v19"),
+            ("collections", "col-v19"),
+            ("collection_memberships", "col-v19:n-v19-parent"),
+            ("note_signals", "n-v19-parent"),
+        ];
+        let queued = store.outbox_items().unwrap();
+        assert_eq!(queued.len(), expected_order.len());
+        for ((_, table, record_id, payload, created_at), (expected_table, expected_id)) in
+            queued.iter().zip(expected_order)
+        {
+            assert_eq!(table, expected_table);
+            assert_eq!(record_id.as_deref(), Some(expected_id));
+            assert_eq!(*created_at, FIXTURE_NOW);
+            let payload: Value = serde_json::from_str(payload).unwrap();
+            assert_eq!(
+                payload.as_object(),
+                store.get_row(table, expected_id).unwrap().as_ref()
+            );
+        }
     }
 
     #[test]

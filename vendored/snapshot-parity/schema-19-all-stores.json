@@ -1,0 +1,125 @@
+{
+  "_syntopicon": true,
+  "schemaVersion": 19,
+  "exportedAt": "2024-01-02T03:04:05.123Z",
+  "books": [
+    {
+      "id": "b-v19",
+      "title": "The Complete Oracle",
+      "author": "A. Reader",
+      "isbn": "9780000000019",
+      "coverUrl": "https://example.invalid/cover.jpg",
+      "coverSource": "openlibrary",
+      "coverResolvedAt": 19001,
+      "createdAt": 19000,
+      "updatedAt": 19002,
+      "deleted": 0
+    }
+  ],
+  "notes": [
+    {
+      "id": "n-v19-parent",
+      "bookId": "b-v19",
+      "text": "A parent passage",
+      "page": "19",
+      "tags": ["Truth", "Justice"],
+      "imagePath": "user/source.jpg",
+      "inkCropPath": null,
+      "source": "manual",
+      "sourceId": null,
+      "sourceMeta": { "case": 2 },
+      "chapter": null,
+      "contentTag": "stale-exporting-master-key-tag",
+      "createdAt": 19100,
+      "updatedAt": 19101,
+      "deleted": 0,
+      "imageDataUrl": "data:image/jpeg;base64,LOCAL_SOURCE",
+      "inkCropDataUrl": "data:image/jpeg;base64,LOCAL_CROP",
+      "user_metadata": { "user_annotation": ["Margin thought"] },
+      "futureField": "ignore-me"
+    },
+    {
+      "id": "n-v19-child",
+      "bookId": "b-v19",
+      "text": "Margin thought",
+      "page": "19",
+      "tags": ["Memory"],
+      "imagePath": null,
+      "inkCropPath": "user/crop.jpg",
+      "source": "handwritten",
+      "sourceId": "margin:1",
+      "sourceMeta": {},
+      "chapter": "IV",
+      "contentTag": null,
+      "createdAt": 19102,
+      "updatedAt": 19103,
+      "deleted": 0
+    }
+  ],
+  "customIdeas": [
+    {
+      "id": "ci-v19",
+      "name": "Attention",
+      "description": "Reader-defined",
+      "createdAt": 19200,
+      "updatedAt": 19201,
+      "deleted": 0
+    }
+  ],
+  "noteLinks": [
+    {
+      "id": "link-v19",
+      "fromNoteId": "n-v19-parent",
+      "toNoteId": "n-v19-child",
+      "relationType": "handwritten_annotation",
+      "createdAt": 19300,
+      "updatedAt": 19301,
+      "deleted": 0
+    }
+  ],
+  "lenses": [
+    {
+      "id": "lens-v19",
+      "name": "Truth with Justice",
+      "leafIds": ["Truth", "Justice"],
+      "combinator": "COOCCUR",
+      "threshold": 60,
+      "createdAt": 19400,
+      "updatedAt": 19401,
+      "deleted": 0
+    }
+  ],
+  "collections": [
+    {
+      "id": "col-v19",
+      "name": "Study",
+      "createdAt": 19500,
+      "updatedAt": 19501,
+      "deleted": 0
+    }
+  ],
+  "collectionMemberships": [
+    {
+      "id": "col-v19:n-v19-parent",
+      "noteId": "n-v19-parent",
+      "collectionId": "col-v19",
+      "createdAt": 19600,
+      "updatedAt": 19601,
+      "deleted": 0
+    }
+  ],
+  "noteSignals": [
+    {
+      "noteId": "n-v19-parent",
+      "returnVisits": 4,
+      "hasAnnotation": true,
+      "stitchSpawns": 1,
+      "exposureRecencyAt": 19700,
+      "engagementRecencyAt": 19701,
+      "importance": 999,
+      "createdAt": 19702,
+      "updatedAt": 19703,
+      "deleted": 0
+    }
+  ]
+}

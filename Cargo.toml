@@ -79,6 +79,9 @@ tokio = { version = "1", default-features = false, features = ["rt", "net", "tim
 # the PWA WASM build does not acquire a new direct dependency.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Native snapshot exports mirror JavaScript Date#toISOString exactly: UTC with a fixed
+# three-digit millisecond field. `time` replaces the error-prone hand-rolled civil calendar.
+time = { version = "0.3", default-features = false, features = ["formatting", "macros"] }
 
 [dev-dependencies]
 serde_json = "1"
