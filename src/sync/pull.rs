@@ -87,11 +87,11 @@ pub async fn pull<S: PostgrestSink>(
                 result.skipped_tombstones += stats.skipped_tombstones;
                 result.superseded.extend(stats.superseded);
             }
-            Err(e) => {
+            Err(_) => {
                 // ponytail: log the dropped table — a silent failure would read as "nothing to
                 // pull". The cursor stays at the last merged page (retry next pull); the caller
                 // decides if all-tables-failed is a hard error (see the FFI `pull`).
-                eprintln!("pull: table {table} failed (cursor at last merged page): {e}");
+                eprintln!("pull: table {table} failed (cursor at last merged page)");
                 result.failed_tables.push(table.to_string());
             }
         }

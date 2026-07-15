@@ -169,12 +169,14 @@ impl PostgrestClient {
         Ok(resp.json::<Vec<Value>>().await?)
     }
 
-    /// Batch-fetch rows from `table` by primary key, via PostgREST's `in.()` filter — the
+    /// Batch-fetch rows from `table` by its supplied descriptor primary key, via PostgREST's
+    /// `in.()` filter — the
     /// missing-book backfill read ([`super::reconcile`], SUR-820). `ids` must be non-empty (an
     /// empty `in.()` filter is invalid PostgREST syntax); callers guard this before calling.
     pub async fn get_by_ids(
         &self,
         table: &str,
+        primary_key: &str,
         ids: &[String],
     ) -> Result<Vec<Value>, Box<dyn std::error::Error + Send + Sync>> {
         let token = self
@@ -182,7 +184,7 @@ impl PostgrestClient {
             .as_deref()
             .ok_or("no access token set — call set_access_token before pull")?;
 
-        let url = by_ids_url(&self.base_url, table, ids);
+        let url = by_ids_url(&self.base_url, table, primary_key, ids)?;
 
         let mut headers = HeaderMap::new();
         headers.insert("apikey", HeaderValue::from_str(&self.anon_key)?);
@@ -299,11 +301,28 @@ impl PostgrestClient {
     }
 }
 
-/// The PostgREST `in.()` filter URL for a batch-by-id fetch — split out from
+/// The PostgREST `in.()` filter URL for a batch primary-key fetch — split out from
 /// [`PostgrestClient::get_by_ids`] so the wire-format shape is unit-testable without a live
 /// server (SUR-820: no integration test for this new read path, per the fast-gate-only scope).
-fn by_ids_url(base_url: &str, table: &str, ids: &[String]) -> String {
-    format!("{base_url}/rest/v1/{table}?id=in.({})", ids.join(","))
+fn by_ids_url(
+    base_url: &str,
+    table: &str,
+    primary_key: &str,
+    ids: &[String],
+) -> Result<String, &'static str> {
+    let mut url = reqwest::Url::parse(&format!("{base_url}/rest/v1/{table}"))
+        .map_err(|_| "invalid PostgREST base URL")?;
+    let values = ids
+        .iter()
+        .map(|id| {
+            let escaped = id.replace('\\', "\\\\").replace('\"', "\\\"");
+            format!("\"{escaped}\"")
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    url.query_pairs_mut()
+        .append_pair(primary_key, &format!("in.({values})"));
+    Ok(url.into())
 }
 
 /// The PostgREST seam [`push::flush`](super::push::flush) and [`pull`](super::pull) drive.
@@ -326,11 +345,17 @@ pub trait PostgrestSink {
         limit: i64,
     ) -> Result<Vec<Value>, String>;
 
-    /// Batch-fetch rows by primary key (`id=in.(...)`) — the post-pull reconciliation's
+    /// Batch-fetch rows by the supplied descriptor primary key (`<pk>=in.(...)`) — the
+    /// post-pull reconciliation's
     /// missing-book backfill ([`super::reconcile`], SUR-820). Defaulted to empty so the existing
     /// sinks that never fetch by id (`MapSink`, `PagingSink`, `VecSink`, `RecordingSink`) don't
     /// need a stub they'd never exercise.
-    async fn fetch_by_ids(&self, _table: &str, _ids: &[String]) -> Result<Vec<Value>, String> {
+    async fn fetch_by_ids(
+        &self,
+        _table: &str,
+        _primary_key: &str,
+        _ids: &[String],
+    ) -> Result<Vec<Value>, String> {
         Ok(Vec::new())
     }
 
@@ -361,11 +386,18 @@ impl PostgrestSink for PostgrestClient {
             .map_err(|e| e.to_string())
     }
 
-    async fn fetch_by_ids(&self, table: &str, ids: &[String]) -> Result<Vec<Value>, String> {
+    async fn fetch_by_ids(
+        &self,
+        table: &str,
+        primary_key: &str,
+        ids: &[String],
+    ) -> Result<Vec<Value>, String> {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        self.get_by_ids(table, ids).await.map_err(|e| e.to_string())
+        self.get_by_ids(table, primary_key, ids)
+            .await
+            .map_err(|e| e.to_string())
     }
 
     async fn fetch_app_config(&self, key: &str) -> Result<Option<Value>, String> {
@@ -499,18 +531,44 @@ mod tests {
     }
 
     #[test]
-    fn by_ids_url_uses_the_postgrest_in_filter() {
+    fn by_ids_url_uses_the_requested_primary_key() {
+        let url = by_ids_url(
+            "https://proj.supabase.co",
+            "note_signals",
+            "note_id",
+            &["n1".into(), "n2".into()],
+        )
+        .unwrap();
+        let parsed = reqwest::Url::parse(&url).unwrap();
+        let query: Vec<_> = parsed.query_pairs().collect();
+
+        assert_eq!(parsed.path(), "/rest/v1/note_signals");
+        assert_eq!(query, vec![("note_id".into(), "in.(\"n1\",\"n2\")".into())]);
+    }
+
+    #[test]
+    fn by_ids_url_quotes_and_encodes_reserved_id_characters() {
+        let ids = vec![
+            "comma,value".into(),
+            "paren(value)".into(),
+            "quote\"value".into(),
+            "slash\\value".into(),
+        ];
+        let url = by_ids_url("https://proj.supabase.co", "books", "id", &ids).unwrap();
+        let parsed = reqwest::Url::parse(&url).unwrap();
+        let filter = parsed
+            .query_pairs()
+            .find_map(|(key, value)| (key == "id").then(|| value.into_owned()))
+            .unwrap();
+
         assert_eq!(
-            by_ids_url(
-                "https://proj.supabase.co",
-                "books",
-                &["b1".into(), "b2".into()]
-            ),
-            "https://proj.supabase.co/rest/v1/books?id=in.(b1,b2)"
+            filter,
+            "in.(\"comma,value\",\"paren(value)\",\"quote\\\"value\",\"slash\\\\value\")"
         );
         assert_eq!(
-            by_ids_url("https://proj.supabase.co", "books", &["only-one".into()]),
-            "https://proj.supabase.co/rest/v1/books?id=in.(only-one)"
+            parsed.query_pairs().count(),
+            1,
+            "IDs cannot add query terms"
         );
     }
 }

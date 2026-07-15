@@ -54,7 +54,7 @@ pub enum SyncError {
 }
 
 /// Per-table row counts reported by a snapshot import.
-#[derive(Debug, uniffi::Record)]
+#[derive(Debug, Default, PartialEq, Eq, uniffi::Record)]
 pub struct ImportCounts {
     pub books: u32,
     pub notes: u32,
@@ -699,6 +699,30 @@ impl SyncEngine {
         export_import::build_snapshot_at(&store, &self.vault, epoch_ms())
     }
 
+    /// Protectively merge a plaintext PWA snapshot into the local mirror. Parsing happens before
+    /// any operational lock or token check. A valid archive then performs a clean all-table pull,
+    /// direct server LWW preflight, in-core note sealing, and one atomic local+outbox batch. The
+    /// staged batch is deliberately not flushed; the next normal [`SyncEngine::sync`] uploads it.
+    pub fn import_merge(&self, json: String) -> Result<ImportSummary, SyncError> {
+        let import_now = epoch_ms();
+        export_import::with_parsed_import_at(&json, import_now, |parsed| {
+            let store = lock!(self.store);
+            let client = lock!(self.client);
+            if client.access_token().is_none() {
+                return Err(SyncError::Flush(
+                    "no access token set — call set_access_token before importing".into(),
+                ));
+            }
+            self.runtime.block_on(export_import::merge_parsed_with_sink(
+                &store,
+                &*client,
+                &self.vault,
+                parsed,
+                import_now,
+            ))
+        })
+    }
+
     // ── read/query surface (SUR-744) ─────────────────────────────────────────
     // Decrypt-in-core reads for the native list/search screens (SUR-754). Every method
     // excludes soft-deleted rows and orders newest-first; note text is decrypted on the way
@@ -1087,6 +1111,65 @@ pub(crate) fn epoch_ms() -> i64 {
 mod tests {
     use super::*;
     use serde_json::Value;
+
+    #[test]
+    fn invalid_import_returns_before_token_network_or_store_locks() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("invalid-import.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = SyncEngine::open(
+            db_path.into(),
+            "https://x.supabase.co".into(),
+            "anon".into(),
+            Vault::generate(),
+        )
+        .unwrap();
+
+        let poison = engine.clone();
+        std::thread::spawn(move || {
+            let _store = poison.store.lock().unwrap();
+            let _client = poison.client.lock().unwrap();
+            panic!("poison both operational locks");
+        })
+        .join()
+        .unwrap_err();
+
+        let error = engine.import_merge("not json".into()).unwrap_err();
+        assert!(matches!(error, SyncError::InvalidImport(_)));
+        assert!(Store::open(db_path)
+            .unwrap()
+            .outbox_items()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn valid_import_requires_an_access_token_without_staging_anything() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("token-required-import.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = SyncEngine::open(
+            db_path.into(),
+            "https://x.supabase.co".into(),
+            "anon".into(),
+            Vault::generate(),
+        )
+        .unwrap();
+        let archive = serde_json::json!({
+            "_syntopicon":true,"schemaVersion":19,
+            "books":[],"notes":[],"customIdeas":[],"noteLinks":[],
+            "lenses":[],"collections":[],"collectionMemberships":[],"noteSignals":[]
+        })
+        .to_string();
+
+        let error = engine.import_merge(archive).unwrap_err();
+        assert!(matches!(error, SyncError::Flush(_)));
+        assert!(Store::open(db_path)
+            .unwrap()
+            .outbox_items()
+            .unwrap()
+            .is_empty());
+    }
 
     #[test]
     fn search_writes_no_plaintext_note_text_to_disk() {
