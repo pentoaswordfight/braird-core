@@ -49,6 +49,29 @@ pub enum SyncError {
     Store(String),
     #[error("flush error: {0}")]
     Flush(String),
+    #[error("invalid import: {0}")]
+    InvalidImport(String),
+}
+
+/// Per-table row counts reported by a snapshot import.
+#[derive(Debug, uniffi::Record)]
+pub struct ImportCounts {
+    pub books: u32,
+    pub notes: u32,
+    pub custom_ideas: u32,
+    pub note_links: u32,
+    pub lenses: u32,
+    pub collections: u32,
+    pub collection_memberships: u32,
+    pub note_signals: u32,
+}
+
+/// The result of a snapshot import across the FFI.
+#[derive(Debug, uniffi::Record)]
+pub struct ImportSummary {
+    pub schema_version: u32,
+    pub imported: ImportCounts,
+    pub skipped_stale: ImportCounts,
 }
 
 /// The result of a flush across the FFI: how many outbox ids were pushed vs. left queued.
