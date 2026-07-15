@@ -1,21 +1,17 @@
-name: Canon (GREAT_IDEAS) drift check
+name: Canon (GREAT_IDEAS + idea tree) drift check
 
-# SUR-820 Canon-102 awareness. Fails the build if the vendored canon-list fixture
-# diverges from surfc/main — i.e. if a canonical idea was added, removed, renamed, or
-# reordered in surfc's `src/constants.js` GREAT_IDEAS array without the core's mirror
-# being re-vendored. Without this, the post-pull reconciliation's dropped-tag pass would
-# silently use a stale canon and misclassify a current idea as "orphaned."
+# SUR-918 Canon-102 awareness. Fails if either vendored canon fixture diverges
+# from surfc/main, or if the live idea-tree leaf names no longer set-match the
+# live GREAT_IDEAS list. JSON order and YAML bytes are both load-bearing.
 #
-# The single source of truth is surfc; this repo vendors a copy
-# (vendored/canon/great-ideas.json) and `scripts/extract-great-ideas.mjs` re-derives it
-# from surfc/main here to prove the copy is current. Sibling of schema-drift.yml (same
-# derive-and-`--check` shape, since GREAT_IDEAS lives in JS source, not already-JSON).
+# The single source of truth is surfc; this repo vendors GREAT_IDEAS as
+# vendored/canon/great-ideas.json and src/constants/surfc-idea-tree.yaml as
+# vendored/canon/idea-tree.yaml. Missing fixtures are drift failures.
 #
 # Requires the SURFC_READ_PAT secret (cross-repo read-only PAT).
 
 on:
-  # Per-PR: re-derive the fixture from surfc/main on every PR to main — so a PR that
-  # edits reconcile.rs's canon usage WITHOUT touching the fixture is still cross-checked.
+  # Per-PR: re-check both fixtures from surfc/main on every PR to main.
   pull_request:
     branches: [main]
   # On push to the guarded paths (a fixture / script / workflow change on any branch).
@@ -24,8 +20,7 @@ on:
       - 'vendored/canon/**'
       - 'scripts/extract-great-ideas.mjs'
       - '.github/workflows/canon-drift.yml'
-  # Weekly: the only trigger that catches surfc-side drift when NO PR here touches
-  # anything (surfc changes the canon while this repo is static).
+  # Weekly: catches surfc-side drift while this repo is static.
   schedule:
     - cron: '0 9 * * 1' # Monday 09:00 UTC (with the crypto + schema drift checks)
   workflow_dispatch:
@@ -36,32 +31,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Guard — skip until the fixture is vendored
-        id: guard
-        run: |
-          if [ -f vendored/canon/great-ideas.json ]; then
-            echo "ready=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "ready=false" >> "$GITHUB_OUTPUT"
-            echo "No vendored/canon/great-ideas.json yet — nothing to drift-check."
-          fi
-
       - name: Set up Node
-        if: steps.guard.outputs.ready == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: '24.15.0'
 
-      # Shallow clone of surfc/main — the extractor reads only src/constants.js. A plain
-      # depth-1 checkout is robust; sparse cone-mode rejects a single-file path, and the
-      # repo is small enough at depth 1 (matches schema-drift.yml's fetch).
+      # Depth 1 is enough: the checker reads src/constants.js and the idea-tree YAML.
       - name: Fetch surfc/main sources
-        if: steps.guard.outputs.ready == 'true'
         run: |
           git clone --depth 1 \
             "https://x-access-token:${{ secrets.SURFC_READ_PAT }}@github.com/braird/surfc.git" \
             /tmp/surfc
 
-      - name: Assert great-ideas.json has not drifted from surfc/main
-        if: steps.guard.outputs.ready == 'true'
-        run: node scripts/extract-great-ideas.mjs /tmp/surfc --check vendored/canon/great-ideas.json
+      - name: Assert canon fixtures and live leaf set have not drifted from surfc/main
+        run: >-
+          node scripts/extract-great-ideas.mjs /tmp/surfc
+          --check vendored/canon/great-ideas.json
+          --tree vendored/canon/idea-tree.yaml

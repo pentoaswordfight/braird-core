@@ -1,0 +1,268 @@
+# Surfc Idea Tree — canopy lookup (CONTEMPORARY canon)
+#
+# SUR-597: replaces the Adler-derived classical canon (3 tops / 8 middles / 102
+# leaves; SUR-481/505) with a contemporary canon chosen to match how people read
+# non-fiction today. The shipped architecture is PRESERVED — top → middle → leaf,
+# connections at the leaf only, the standing "Ideas You Bring" branch — only the
+# content, ids, and counts change.
+#
+# STRUCTURE
+#   Level 1 (top):     4 categories  (+ the hardcoded "Ideas You Bring")
+#   Level 2 (middle):  8 branches    (+ the hardcoded "your_ideas")
+#   Level 3 (leaf):    97 leaves     (+ the user's dynamic custom ideas)
+#                      (SUR-597 shipped 87; SUR-624 added 10 — see LEAF FLAGS)
+#
+# CONNECTION SEMANTICS (load-bearing, unchanged)
+#   Connections (Spark / Tension Map / Idea Discovery) live ONLY at the leaf
+#   level. Middle and top nodes are render-time rollups, never stored edges.
+#
+# LEAF FLAGS
+#   new:     true  — no classical ancestor (the "0:1" bucket). 21 leaves (11 from
+#                    SUR-597 + the 10 SUR-624 additions, which are all new). These
+#                    receive no migrated tag and launch empty (render at MIN_PX
+#                    in the cloud until re-tagging or a re-discovery pass fills
+#                    them). Probability (← Chance) and Status (← Honor) are NOT
+#                    new — the reconciled Canon disposition map ties them to
+#                    classical ancestors, so they inherit migrated tags.
+#   crossBranch: true — SUR-624 marker for a leaf that does not sit cleanly under a
+#                    single branch (provisionally placed; "lives across branches").
+#                    6 leaves: Teachability, Self-Compassion, Externalized Cognition,
+#                    Decision Quality, Representation, Restitution. Rendered with a
+#                    trailing "*" in the tree/picker (render is a tracked follow-up;
+#                    the data flag lands here). Distinct from new: true — a leaf can
+#                    be both. A later ticket lets users choose the mapping themselves.
+#   aliases: [...]  — old classical leaf names that were DROPPED onto this leaf
+#                    as the nearest contemporary target. Search-only: an alias
+#                    does NOT migrate a tag, it only lets the old search term land
+#                    on this leaf in the idea picker (AddIdeaSheet, via
+#                    getLeafMeta().aliases). 20 SUR-597 aliases across 14 leaves
+#                    (+ SUR-624: Decision Quality ← Resulting).
+#
+# SOURCE OF TRUTH
+#   The leaf set here must exactly equal GREAT_IDEAS (src/constants.js); the
+#   ideaTree.js loader throws on drift. The 4th top "bring" and its middle
+#   "your_ideas" are NOT in this file — they are hardcoded in ideaTree.js because
+#   their leaves are the user's custom ideas, read dynamically from Dexie.
+
+version: 2
+top_categories:
+  - id: inner_life
+    label: "Inner Life"
+    description: "The mind and the self — how we think and who we are."
+    children: [mind, self]
+
+  - id: thinking_doing
+    label: "Thinking & Doing"
+    description: "How we know the world and how we act in it."
+    children: [knowledge_systems, action_work]
+
+  - id: living_together
+    label: "Living Together"
+    description: "Power, society, and the ethics of life with others."
+    children: [power_society, relationships_ethics]
+
+  - id: the_world
+    label: "The World"
+    description: "Time, change, and the meaning of the world around us."
+    children: [time_change, world_meaning]
+
+middle_nodes:
+
+  # ─── Inner Life ─────────────────────────────────────────────────────────
+
+  - id: mind
+    label: "Mind"
+    parent: inner_life
+    leaves:
+      - { name: "Attention" }
+      - { name: "Memory" }
+      - { name: "Learning" }
+      - { name: "Reasoning", aliases: ["Philosophy"] }
+      - { name: "Judgment" }
+      - { name: "Creativity" }
+      - { name: "Curiosity" }
+      - { name: "Intuition" }
+      - { name: "Bias", new: true }
+      - { name: "Uncertainty", new: true, aliases: ["Necessity and Contingency"] }
+      - { name: "Expertise" }
+      - { name: "Teachability", new: true, crossBranch: true }
+
+  - id: self
+    label: "Self"
+    parent: inner_life
+    leaves:
+      - { name: "Identity", aliases: ["Same and Other"] }
+      - { name: "Emotion" }
+      - { name: "Motivation" }
+      - { name: "Habit" }
+      - { name: "Discipline" }
+      - { name: "Anxiety" }
+      - { name: "Resilience", new: true }
+      - { name: "Purpose" }
+      - { name: "Authenticity" }
+      - { name: "Vulnerability" }
+      - { name: "Desire" }
+      - { name: "Consciousness" }
+      - { name: "Acceptance", new: true }
+      - { name: "Self-Compassion", new: true, crossBranch: true }
+      - { name: "Sufficiency", new: true }
+
+  # ─── Thinking & Doing ───────────────────────────────────────────────────
+
+  - id: knowledge_systems
+    label: "Knowledge & Systems"
+    parent: thinking_doing
+    leaves:
+      - { name: "Truth" }
+      - { name: "Evidence", aliases: ["Science"] }
+      - { name: "Explanation" }
+      - { name: "Language", aliases: ["Definition"] }
+      - { name: "Narrative" }
+      - { name: "Models", new: true, aliases: ["Idea", "Mathematics", "Principle"] }
+      - { name: "Information", new: true }
+      - { name: "Complexity", new: true }
+      - { name: "Emergence", new: true }
+      - { name: "Systems", new: true, aliases: ["Relation"] }
+      - { name: "Causation" }
+      - { name: "Probability" }
+      - { name: "Understanding", new: true }
+      - { name: "Externalized Cognition", new: true, crossBranch: true }
+
+  - id: action_work
+    label: "Action & Work"
+    parent: thinking_doing
+    leaves:
+      - { name: "Decision" }
+      - { name: "Strategy" }
+      - { name: "Risk" }
+      - { name: "Mastery" }
+      - { name: "Failure" }
+      - { name: "Innovation" }
+      - { name: "Feedback", new: true }
+      - { name: "Incentives", new: true }
+      - { name: "Leadership" }
+      - { name: "Collaboration" }
+      - { name: "Productivity" }
+      - { name: "Decision Quality", new: true, crossBranch: true, aliases: ["Resulting"] }
+      - { name: "Positioning", new: true }
+
+  # ─── Living Together ────────────────────────────────────────────────────
+
+  - id: power_society
+    label: "Power & Society"
+    parent: living_together
+    leaves:
+      - { name: "Justice" }
+      - { name: "Freedom" }
+      - { name: "Equality" }
+      - { name: "Power" }
+      - { name: "Authority" }
+      - { name: "Institutions" }
+      - { name: "Markets" }
+      - { name: "Inequality" }
+      - { name: "Democracy" }
+      - { name: "Trust" }
+      - { name: "Status" }
+      - { name: "Conflict", aliases: ["Opposition"] }
+      - { name: "Cooperation" }
+      - { name: "Representation", new: true, crossBranch: true }
+      - { name: "Restitution", new: true, crossBranch: true }
+
+  - id: relationships_ethics
+    label: "Relationships & Ethics"
+    parent: living_together
+    leaves:
+      - { name: "Love" }
+      - { name: "Friendship" }
+      - { name: "Community" }
+      - { name: "Care", aliases: ["Medicine"] }
+      - { name: "Empathy" }
+      - { name: "Obligation" }
+      - { name: "Morality" }
+      - { name: "Virtue" }
+      - { name: "Forgiveness" }
+
+  # ─── The World ──────────────────────────────────────────────────────────
+
+  - id: time_change
+    label: "Time & Change"
+    parent: the_world
+    leaves:
+      - { name: "Time", aliases: ["Eternity"] }
+      - { name: "Change" }
+      - { name: "Progress" }
+      - { name: "History" }
+      - { name: "Growth" }
+      - { name: "Entropy", new: true }
+      - { name: "Cycles", aliases: ["Fate"] }
+      - { name: "Future" }
+
+  - id: world_meaning
+    label: "World & Meaning"
+    parent: the_world
+    leaves:
+      - { name: "Nature", aliases: ["Astronomy", "Space"] }
+      - { name: "Life" }
+      - { name: "Evolution" }
+      - { name: "Energy", aliases: ["Element", "Matter", "Mechanics", "Physics"] }
+      - { name: "Beauty" }
+      - { name: "Art" }
+      - { name: "Play" }
+      - { name: "Wonder" }
+      - { name: "Suffering" }
+      - { name: "Death" }
+      - { name: "the Sacred", aliases: ["Angel"] }
+
+# ─── Counts and integrity ──────────────────────────────────────────────────
+#
+# Leaves per branch (SUR-624: +1 Mind, +3 Self, +2 Knowledge & Systems,
+#   +2 Action & Work, +2 Power & Society):
+#   Mind:                 12
+#   Self:                 15
+#   Knowledge & Systems:  14
+#   Action & Work:        13
+#   Power & Society:       15
+#   Relationships & Ethics: 9
+#   Time & Change:         8
+#   World & Meaning:      11
+#   TOTAL:                97 ✓
+#
+# Per top: Inner Life 27 · Thinking & Doing 27 · Living Together 24 · The World 19
+#
+# new: true (21) — SUR-597 (11): Bias, Uncertainty, Resilience, Models, Information,
+#   Complexity, Emergence, Systems, Feedback, Incentives, Entropy.
+#   SUR-624 (10): Teachability, Acceptance, Self-Compassion, Sufficiency,
+#   Understanding, Externalized Cognition, Decision Quality, Positioning,
+#   Representation, Restitution.
+#
+# crossBranch: true (6, SUR-624) — Teachability, Self-Compassion, Externalized
+#   Cognition, Decision Quality, Representation, Restitution.
+#
+# aliases (21 across 15 leaves) — dropped classical leaves routed to their nearest
+#   contemporary target for search only (Canon disposition map, SUR-597), plus the
+#   SUR-624 search alias Decision Quality ← Resulting:
+#     Reasoning ← Philosophy
+#     Uncertainty ← Necessity and Contingency
+#     Identity ← Same and Other
+#     Evidence ← Science
+#     Language ← Definition
+#     Models ← Idea, Mathematics, Principle
+#     Systems ← Relation
+#     Conflict ← Opposition
+#     Care ← Medicine
+#     Time ← Eternity
+#     Cycles ← Fate
+#     Nature ← Astronomy, Space
+#     Energy ← Element, Matter, Mechanics, Physics
+#     the Sacred ← Angel
+#     Decision Quality ← Resulting   (SUR-624; not a classical drop — a modern alias)
+#   Six dropped leaves carry no alias (no defensible target): Being, Infinity,
+#   One and Many, Quality, Quantity, Universal and Particular.
+#
+# ─── Provenance ────────────────────────────────────────────────────────────
+#
+# Founder decision (SUR-597). Contemporary non-fiction trends toward mindful
+# self-help, historical investigation, expert scenario analysis, and thoughtful
+# memoir; the classics-aimed Adler canon served only a narrow subset of readers.
+# Per-leaf 102 → 87 disposition: the "Canon disposition map — classical 102 →
+# contemporary 87 (reconciled)" attachment on SUR-597 (founder-ratified 2026-06-14).

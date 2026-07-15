@@ -1,17 +1,21 @@
 name: Release
 
 # SUR-760 + SUR-745: on a version tag, build + publish the pinned artifacts — Android AAR +
-# desktop JVM jar (SUR-760) and the iOS BrairdCore.xcframework (SUR-745) — to one GitHub Release
-# with a SHA-256 per artifact. Consumers pin the tag + checksums; the `chore(core): pin
+# desktop JVM jar (SUR-760), the iOS BrairdCore.xcframework (SUR-745), and the two
+# machine-consumed canon files — to one GitHub Release. Six payloads are hashed in
+# SHA256SUMS.txt; with the manifest, the release has seven total assets. Consumers pin
+# the tag + checksums; the `chore(core): pin
 # braird-core vX.Y.Z` PR in the app repo is the integration gate (docs/pinning.md).
 # Routed to release-integrity-reviewer (GATING.md §3.1): binding↔native atomicity, tag+SHA-256
 # pin, 16 KB alignment (Android), version agreement.
 #
-# Job DAG (SUR-745): validate → {build-android (ubuntu), build-ios (macos-14)} → publish (ubuntu).
-# The two build legs run in parallel off the same validated tag; a single publish job assembles
-# every artifact into one SHA256SUMS.txt and cuts the release once. Splitting the iOS leg onto a
-# macOS runner is unavoidable (only xcodebuild builds an xcframework) — it carries a 10x
-# runner-minute multiplier, but fires only on a version tag.
+# Job DAG (SUR-745 + SUR-918): validate → {build-android (ubuntu), build-ios (macos-14)} →
+# validate-canon (ubuntu, read-only) → publish (ubuntu). The two build legs run in parallel off the
+# same resolved commit; canon validation runs after them so the live-source check is as close as
+# possible to publication. A single publish job assembles every artifact into one SHA256SUMS.txt
+# and cuts the release once. Splitting the iOS leg onto a macOS runner is unavoidable (only
+# xcodebuild builds an xcframework) — it carries a 10x runner-minute multiplier, but fires only on
+# a version tag.
 #
 # Hardening (release-integrity-reviewer, SUR-760 + SUR-745):
 #   - Published assets are IMMUTABLE: create-only, no --clobber. A re-run on an already-published
@@ -20,6 +24,11 @@ name: Release
 #     default read-only token: an attacker-influenceable string never reaches a lane that can
 #     write a release. The tag/version reach shell only via `env:` (never interpolated into a
 #     `run:` body) and the tag is allowlist-validated in `validate` before any job consumes it.
+#   - The validated tag resolves once to a commit SHA; every build and the canon handoff use that
+#     SHA, and `publish` refuses a tag that moved before release creation.
+#   - `validate-canon` uses the trusted current-main checker in a read-only job, with checkout
+#     credentials never persisted. It hands only the two validated canon bytes to `publish`, so the
+#     write-capable job receives neither `SURFC_READ_PAT` nor tagged repository code.
 on:
   push:
     tags: ['v*']
@@ -47,6 +56,7 @@ jobs:
     outputs:
       tag: ${{ steps.v.outputs.tag }}
       version: ${{ steps.v.outputs.version }}
+      sha: ${{ steps.commit.outputs.sha }}
     steps:
       - name: Resolve + validate the tag
         id: v
@@ -61,6 +71,16 @@ jobs:
           echo "tag=$TAG_RAW" >> "$GITHUB_OUTPUT"
           echo "version=${TAG_RAW#v}" >> "$GITHUB_OUTPUT"
 
+      - name: Check out validated tag without persisting credentials
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.v.outputs.tag }}
+          persist-credentials: false
+
+      - name: Resolve validated tag to one exact commit
+        id: commit
+        run: echo "sha=$(git rev-parse --verify HEAD^{commit})" >> "$GITHUB_OUTPUT"
+
   # Android AAR (arm64-v8a + x86_64, 16 KB-aligned) + self-contained desktop JVM jar. Uploads both
   # as a workflow artifact for `publish` to attach — this leg never touches the release itself.
   build-android:
@@ -69,7 +89,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.validate.outputs.tag }} # the validated tag, never the raw input
+          ref: ${{ needs.validate.outputs.sha }} # exact commit resolved from the validated tag
 
       # Fail-closed: the tag, the crate version, and the CHANGELOG must agree before anything builds.
       - name: Verify tag == Cargo.toml version + CHANGELOG section
@@ -153,7 +173,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.validate.outputs.tag }} # the validated tag, never the raw input
+          ref: ${{ needs.validate.outputs.sha }} # exact commit resolved from the validated tag
 
       # Same fail-closed agreement check as the Android leg, so a mismatched tag fails this leg
       # too rather than burning macOS minutes on a build that publish would reject.
@@ -225,47 +245,112 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  # Assemble every artifact into one SHA256SUMS.txt and cut the release once. This is the ONLY job
-  # with contents: write, and the ONLY job that touches the release — so create-only immutability
-  # can't be raced by a parallel lane.
-  publish:
+  # Validate the exact release commit's two canon fixtures against current surfc/main only after
+  # both build legs pass. This job is read-only, runs the trusted checker from current main (not a
+  # potentially stale tag), persists no checkout credentials, and hands only validated data bytes
+  # to the write-capable publisher.
+  validate-canon:
     needs: [validate, build-android, build-ios]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out trusted current canon validator
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          path: validator
+          persist-credentials: false
+
+      - name: Check out exact release commit canon fixtures
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          path: release
+          persist-credentials: false
+
+      - name: Fetch surfc/main without persisting credentials
+        uses: actions/checkout@v4
+        with:
+          repository: braird/surfc
+          ref: main
+          token: ${{ secrets.SURFC_READ_PAT }}
+          path: surfc
+          persist-credentials: false
+
+      - name: Set up Node for canon release validation
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24.15.0'
+
+      - name: Assert exact release canon assets still match surfc/main
+        run: >-
+          node validator/scripts/extract-great-ideas.mjs surfc
+          --check release/vendored/canon/great-ideas.json
+          --tree release/vendored/canon/idea-tree.yaml
+
+      # The common parent is stripped by upload-artifact, yielding exactly the two stable asset
+      # names at the artifact root when publish downloads with merge-multiple.
+      - name: Upload validated canon data for publish
+        uses: actions/upload-artifact@v4
+        with:
+          name: canon-artifacts
+          path: |
+            release/vendored/canon/great-ideas.json
+            release/vendored/canon/idea-tree.yaml
+          if-no-files-found: error
+          retention-days: 1
+
+  # Assemble four built artifacts + two machine-consumed canon files into one SHA256SUMS.txt and
+  # cut the release once: six hashed payloads, seven total assets including the manifest. This is
+  # the ONLY job with contents: write, and the ONLY job that touches the release — so create-only
+  # immutability can't be raced by a parallel lane.
+  publish:
+    needs: [validate, build-android, build-ios, validate-canon]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.validate.outputs.tag }} # the validated tag, never the raw input
-
-      - name: Download build artifacts into dist/
+      - name: Download built + validated artifacts into dist/
         uses: actions/download-artifact@v4
         with:
           path: dist
-          merge-multiple: true # flatten android-artifacts/ + ios-artifacts/ into dist/
+          # Flatten android-artifacts/ + ios-artifacts/ + canon-artifacts/ into dist/. The checksum
+          # and gh-release steps below remain the explicit publication allowlist, so future
+          # administrative artifacts cannot silently become release assets.
+          merge-multiple: true
 
       - name: Stage SHA-256 manifest
         env:
           VERSION: ${{ needs.validate.outputs.version }}
         run: |
           cd dist
-          # BrairdCore.swift is checksummed alongside the binary: an iOS consumer pins BOTH hashes
-          # so the wrapper is never trusted to a mutable tag (SUR-745 review). Hashed here from the
-          # exact bytes about to be published — no rebuild, no re-download.
+          # BrairdCore.swift and both canon files are checksummed alongside the three binaries: six
+          # payloads total. Consumers pin the applicable hashes so no payload is trusted to a mutable
+          # tag. Hashed here from the exact bytes about to be published — no rebuild, no re-download.
           ( sha256sum \
               "braird-core-$VERSION.aar" \
               "braird-core-desktop-$VERSION.jar" \
               "braird-core-$VERSION.xcframework.zip" \
-              "BrairdCore.swift" | tee SHA256SUMS.txt )
+              "BrairdCore.swift" \
+              "great-ideas.json" \
+              "idea-tree.yaml" | tee SHA256SUMS.txt )
 
       # Create-only. Published assets are immutable: if a release for this tag already exists we
       # hard-fail rather than overwrite — every consumer pin (tag + SHA-256) stays valid forever.
       - name: Publish GitHub Release + attach artifacts (create-only)
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           TAG: ${{ needs.validate.outputs.tag }}
           VERSION: ${{ needs.validate.outputs.version }}
+          EXPECTED_SHA: ${{ needs.validate.outputs.sha }}
         run: |
+          CURRENT_SHA=$(gh api "repos/$GH_REPO/commits/$TAG" --jq .sha)
+          if [ "$CURRENT_SHA" != "$EXPECTED_SHA" ]; then
+            echo "::error::tag $TAG moved from validated commit $EXPECTED_SHA to $CURRENT_SHA — refusing release"
+            exit 1
+          fi
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "::error::a release for $TAG already exists — published artifacts are immutable; cut a new version"
             exit 1
@@ -275,10 +360,13 @@ jobs:
             "dist/braird-core-desktop-$VERSION.jar" \
             "dist/braird-core-$VERSION.xcframework.zip" \
             "dist/BrairdCore.swift" \
+            "dist/great-ideas.json" \
+            "dist/idea-tree.yaml" \
             "dist/SHA256SUMS.txt" \
             --title "braird-core $TAG" \
             --verify-tag \
-            --notes "Pinned artifacts for the Braird native clients — verify every download against SHA256SUMS.txt. Pin/bump protocol: docs/pinning.md.
+            --notes "Pinned payloads for the Braird clients — six SHA-256-hashed payloads plus SHA256SUMS.txt (seven total release assets). Verify every download against the manifest. Pin/bump protocol: docs/pinning.md.
 
           - **iOS** (braird-ios): \`braird-core-$VERSION.xcframework.zip\` (arm64 iOS device + arm64 iOS simulator + an arm64 macOS-host slice) **and** \`BrairdCore.swift\` (the generated wrapper — the xcframework doesn't carry it). Pin BOTH SHA-256s from SHA256SUMS.txt; the zip's is SwiftPM's \`.binaryTarget(checksum:)\`. Do not vendor the wrapper from the tag — fetch it from this release and verify its checksum.
-          - **Android** (braird-android): \`braird-core-$VERSION.aar\` (arm64-v8a + x86_64, 16 KB-aligned) + self-contained \`braird-core-desktop-$VERSION.jar\`. Add JNA 5.17.0 @aar alongside the AAR."
+          - **Android** (braird-android): \`braird-core-$VERSION.aar\` (arm64-v8a + x86_64, 16 KB-aligned) + self-contained \`braird-core-desktop-$VERSION.jar\`. Add JNA 5.17.0 @aar alongside the AAR.
+          - **Canon data** (native clients): \`great-ideas.json\` is the exact tag canon and \`idea-tree.yaml\` is its hierarchy metadata. Pin and verify BOTH SHA-256s from SHA256SUMS.txt."
