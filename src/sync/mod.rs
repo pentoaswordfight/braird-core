@@ -41,8 +41,8 @@ use read::{
 use reconcile::BookMergeUndo;
 
 /// Errors that cross the FFI from the sync engine. Coarse like [`crate::CryptoError`]: enough
-/// for a host to distinguish "couldn't open the store" from "the flush hit the network", never
-/// leaking key material or per-record server detail.
+/// for a host to distinguish store failures, network/sync failures, and invalid snapshot input,
+/// never leaking key material, archive content, server response bodies, or per-record detail.
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum SyncError {
     #[error("store error: {0}")]
@@ -694,6 +694,11 @@ impl SyncEngine {
     /// Export a plaintext, PWA-compatible snapshot of every live synced row. Note ciphertext is
     /// decrypted inside the core; a single decryption failure aborts the entire export so neither
     /// ciphertext nor a partial archive can cross the FFI. Local-only tables are never included.
+    ///
+    /// **Security:** the returned string contains plaintext note text. The host must never log it
+    /// or attach it to telemetry/crash reports, and must write it only through a restrictively
+    /// protected temporary file on the destination filesystem before verified atomic install and
+    /// cleanup. See `docs/snapshots.md` for the durable host-storage contract.
     pub fn export_snapshot(&self) -> Result<String, SyncError> {
         let store = lock!(self.store);
         export_import::build_snapshot_at(&store, &self.vault, epoch_ms())
@@ -703,6 +708,10 @@ impl SyncEngine {
     /// any operational lock or token check. A valid archive then performs a clean all-table pull,
     /// direct server LWW preflight, in-core note sealing, and one atomic local+outbox batch. The
     /// staged batch is deliberately not flushed; the next normal [`SyncEngine::sync`] uploads it.
+    ///
+    /// **Security:** `json` contains plaintext note text. The host must source it only from
+    /// restrictively protected storage, never log or report it, and remove temporary plaintext on
+    /// every success/failure/cancellation path. See `docs/snapshots.md` for the full contract.
     pub fn import_merge(&self, json: String) -> Result<ImportSummary, SyncError> {
         let import_now = epoch_ms();
         export_import::with_parsed_import_at(&json, import_now, |parsed| {

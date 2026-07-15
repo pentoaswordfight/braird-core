@@ -6,6 +6,14 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-07-15
+
+Tenth release batch. **SUR-918** publishes the checksum-pinned paired canon assets, and **SUR-911**
+adds the Rust/UniFFI-source snapshot export plus protective merge-import boundary for all eight
+synced stores. Snapshot note text crosses this API as plaintext for portability, then accepted
+imports are re-tagged and freshly sealed under the active Vault before one atomic local+outbox
+batch.
+
 ### Added
 
 - **SUR-918 — checksum-pinned canon release assets.** Byte-vendor the surfc idea-tree YAML and
@@ -18,6 +26,19 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   checksum/publication review, preserving `sync-reviewer` + `crypto-reviewer` while adding
   `release-integrity-reviewer`. Documentation/release-data only; no crate, FFI, or generated binding
   change.
+- **SUR-911 — PWA-compatible snapshot export and protective merge import.** Add
+  `SyncEngine::export_snapshot()` and `SyncEngine::import_merge(json)` in the Rust UniFFI source
+  surface, with schema-19 export across the eight synced stores and strict schema-1-through-19
+  import parsing. Export is live-only, decrypts note text, reconstructs handwritten
+  `user_metadata.user_annotation`, and excludes local-only tables plus device-local data-URL
+  previews. Import parses before operational access, requires a token and clean eight-table pull,
+  directly fetches every candidate (including tombstones), and accepts only archive timestamps
+  strictly newer than both local and server state. Accepted notes are re-tagged and freshly sealed
+  as note-id-bound `enc:v2`, then the complete dependency-ordered batch is staged locally and in
+  the outbox in one transaction with no automatic flush. `ImportSummary` reports exact per-store
+  imported/skipped counts; there is no destructive Replace API. `docs/snapshots.md` pins the
+  plaintext host-storage boundary: restrictive destination-filesystem temporary storage, no
+  logging/telemetry/crash capture, verified atomic install, and cleanup on every exit path.
 
 ## [0.5.0] - 2026-07-14
 
