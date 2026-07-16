@@ -6,6 +6,12 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-07-16
+
+Twelfth release batch. This **SUR-921** patch release fixes the v0.7.0 sparse-note transport so a
+successful PostgREST response cannot silently discard a plaintext-free patch when its server row
+is missing. The outbox now drains only after the targeted write confirms exactly one affected row.
+
 ### Fixed
 
 - **SUR-921 follow-up — retain sparse note patches when the server target is missing.** Targeted
