@@ -26,7 +26,8 @@ but this implementation does not cut, tag, or publish that release.
   - ignore the record's mandatory `created_at` value and omit `created_at` from the partial, so an
     immutable creation stamp cannot be moved by a retag;
   - preserve the other existing `NoteUpsert` field semantics, including supplied `tags`,
-    `deleted`, clear directives, and the fresh `updated_at` stamp.
+    `deleted`, clear directives, and the fresh `updated_at` stamp, except that setting or clearing
+    `book_id` is rejected because the retained content tag is scoped by book id.
 
 `text` and `content_tag` remain non-clearable. `clearable_columns("notes")` is unchanged.
 
@@ -82,6 +83,11 @@ the mechanism being relied upon:
 - in the outbox, omitted fields do not appear in the patch JSON;
 - during collapse, a later patch lacking `text` cannot replace an earlier sealed `text`, while a
   later full write carrying `text` does replace it.
+
+At flush, a collapsed notes group that still lacks `text` uses a targeted PostgREST `PATCH` by
+primary key. A sparse PostgREST upsert is not valid for `notes`: its INSERT candidate is checked
+against the NOT-NULL `text` column before conflict update. A create followed by a patch collapses
+to a group that still carries the create's `text`, so it continues through the normal upsert leg.
 
 ## Error and Security Properties
 

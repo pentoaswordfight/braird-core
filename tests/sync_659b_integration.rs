@@ -186,8 +186,8 @@ fn flush_seals_text_and_upserts_via_token_handoff() {
         "outbox cleared after successful flush"
     );
 
-    // SUR-921: a plaintext-free UPDATE must be accepted by merge-duplicates without a text key,
-    // and the server's sealed/immutable columns must survive byte-for-byte.
+    // SUR-921: a plaintext-free targeted PATCH must be accepted without a text key, and the
+    // server's sealed/immutable columns must survive byte-for-byte.
     std::thread::sleep(std::time::Duration::from_millis(2));
     engine
         .enqueue_note(NoteUpsert {

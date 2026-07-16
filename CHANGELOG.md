@@ -15,8 +15,11 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   its tag, and the immutable creation stamp remain byte-identical. Patch-mode `source: None`
   likewise means keep instead of defaulting to `"manual"`, enabling decrypt-failed notes to be
   retagged safely. Missing or already-tombstoned targets surface as the dedicated
-  `SyncError::PatchTargetMissing` host contract. This is a breaking pre-1.0 FFI record/error
-  change intended for the separately cut v0.7.0 release; this change does not cut or publish it.
+  `SyncError::PatchTargetMissing` host contract. Patch mode rejects setting or clearing `book_id`,
+  because the content tag is book-scoped and cannot be recomputed without plaintext. Sparse note
+  groups flush through a targeted server `PATCH`; collapsed create-then-patch groups still carry
+  `text` and use the normal upsert path. This is a breaking pre-1.0 FFI record/error change intended
+  for the separately cut v0.7.0 release; this change does not cut or publish it.
 
 ## [0.6.0] - 2026-07-15
 

@@ -338,7 +338,9 @@ impl SyncEngine {
     /// On a full write, `source` is the one exception — `None` → `"manual"` (the PWA's
     /// `|| 'manual'` / the prior hardcode). On a plaintext-free patch, `source: None` is omitted
     /// like every other optional so it cannot clobber an existing source; `Some` explicitly
-    /// updates it. To clear a `?? null` column to NULL name it in `clear_nullable_fields` (notes:
+    /// updates it. A plaintext-free patch cannot set or clear `book_id`: the content tag includes
+    /// that id, and without plaintext the patch can neither recompute the tag nor safely retain it.
+    /// Full writes may clear a `?? null` column by naming it in `clear_nullable_fields` (notes:
     /// `book_id`/`chapter`/`image_path`/`ink_crop_path`/`source_id` — [`clearable_columns`]).
     /// `page` is `|| ''`, not NULL-clearable — clearing it is `Some("")`. `text` (sealed) and
     /// `content_tag` (derived) are never clearable; a bad/contradictory clear list is rejected and
@@ -421,6 +423,15 @@ impl SyncEngine {
             }
             None => {
                 // Existing-row patch: no Vault call; absent source means keep.
+                if book_id.is_some()
+                    || clear_nullable_fields
+                        .iter()
+                        .any(|column| column == "book_id")
+                {
+                    return Err(SyncError::Store(
+                        "plaintext-free note patches cannot change book_id".into(),
+                    ));
+                }
                 insert_opt(&mut row, "source", source);
                 self.stage_existing_live_note_patch(&id, row)
             }
@@ -1749,6 +1760,72 @@ mod tests {
         assert_eq!(payload["deleted"], json!(true));
         assert!(payload.get("text").is_none());
         assert!(payload.get("content_tag").is_none());
+    }
+
+    #[test]
+    fn note_patch_rejects_book_moves_that_would_stale_the_content_tag() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        {
+            let store = Store::open(db_path).unwrap();
+            for id in ["set-book", "clear-book"] {
+                store
+                    .apply_row(
+                        "notes",
+                        json!({
+                            "id": id,
+                            "book_id": "b1",
+                            "text": "enc:v2:foreign-ciphertext",
+                            "tags": ["before"],
+                            "source": "kindle",
+                            "content_tag": "book-b1-content-tag",
+                            "created_at": 10,
+                            "updated_at": 1,
+                            "deleted": false
+                        })
+                        .as_object()
+                        .unwrap(),
+                    )
+                    .unwrap();
+            }
+        }
+        let engine = engine_at(db_path);
+
+        let set_error = engine
+            .enqueue_note(NoteUpsert {
+                book_id: Some("b2".into()),
+                tags: vec!["after".into()],
+                ..note_patch("set-book")
+            })
+            .unwrap_err();
+        assert!(matches!(set_error, SyncError::Store(_)));
+        assert_eq!(
+            set_error.to_string(),
+            "store error: plaintext-free note patches cannot change book_id"
+        );
+
+        let clear_error = engine
+            .enqueue_note(NoteUpsert {
+                tags: vec!["after".into()],
+                clear_nullable_fields: vec!["book_id".into()],
+                ..note_patch("clear-book")
+            })
+            .unwrap_err();
+        assert!(matches!(clear_error, SyncError::Store(_)));
+        assert_eq!(
+            clear_error.to_string(),
+            "store error: plaintext-free note patches cannot change book_id"
+        );
+
+        let store = Store::open(db_path).unwrap();
+        for id in ["set-book", "clear-book"] {
+            let row = store.get_row("notes", id).unwrap().unwrap();
+            assert_eq!(row["book_id"], json!("b1"));
+            assert_eq!(row["content_tag"], json!("book-b1-content-tag"));
+            assert_eq!(row["tags"], json!(["before"]));
+        }
+        assert!(store.outbox_items().unwrap().is_empty());
     }
 
     #[test]

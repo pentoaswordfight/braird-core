@@ -775,8 +775,8 @@ impl Store {
     /// has no queued outbox row (which would silently never flush yet still win an LWW compare).
     ///
     /// The synced row is the MERGED row (a partial edit can't null pulled-only columns like a book
-    /// cover); the outbox payload is the PARTIAL row as supplied (the server upsert `merge-duplicates`
-    /// patches only the changed columns — sending the merged full row could clobber a newer field).
+    /// cover); the outbox payload is the PARTIAL row as supplied (the server write applies only the
+    /// changed columns — sending the merged full row could clobber a newer field).
     pub fn stage_local_write(
         &self,
         table: &str,

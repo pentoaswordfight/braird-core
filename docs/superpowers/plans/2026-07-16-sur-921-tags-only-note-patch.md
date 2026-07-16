@@ -233,7 +233,9 @@ match plaintext {
 ```
 
 Both branches insert a fresh `updated_at`; tags, deleted, supplied optionals, source metadata, and
-clear directives retain existing semantics. Ensure `apply_clears` runs before either staging call.
+clear directives retain existing semantics except that patch-mode `book_id` set/clear is rejected
+to avoid retaining a tag derived for a different book. Ensure `apply_clears` runs before either
+staging call.
 
 Add a private `SyncEngine` helper that holds the existing store mutex while calling
 `stage_local_write_existing_live`, mapping:
@@ -328,13 +330,16 @@ After the existing full note create and successful flush:
 2. enqueue a `NoteUpsert` for the same id with `plaintext: None`, changed tags, `source: None`, and a
    deliberately different `created_at`;
 3. inspect the local outbox payload and assert `text`, `content_tag`, and `created_at` are absent;
-4. flush again;
+4. flush again through the targeted PATCH leg used for a collapsed note group with no `text`;
 5. select the server row again and assert:
    - tags changed;
    - `updated_at` is newer;
    - `text`, `content_tag`, and `created_at` are byte-identical.
 
-Use a bounded timestamp strategy already accepted in this test suite (for example a short
+The normal PostgREST upsert cannot carry this sparse shape because `notes.text` is NOT NULL on its
+INSERT candidate. Add a `PostgrestSink::patch` seam and route only collapsed notes groups lacking
+`text` through it; groups retaining `text` continue to upsert. Use a bounded timestamp strategy
+already accepted in this test suite (for example a short
 millisecond delay before enqueue) so the `updated_at` comparison is deterministic.
 
 **Step 2: Run the ignored test when infrastructure is available**

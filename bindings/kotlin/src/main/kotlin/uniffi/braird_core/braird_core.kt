@@ -1169,7 +1169,7 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_lens() != 60504.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_note() != 27821.toShort()) {
+    if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_note() != 9431.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_note_link() != 53465.toShort()) {
@@ -1769,7 +1769,9 @@ public interface SyncEngineInterface {
      * On a full write, `source` is the one exception — `None` → `"manual"` (the PWA's
      * `|| 'manual'` / the prior hardcode). On a plaintext-free patch, `source: None` is omitted
      * like every other optional so it cannot clobber an existing source; `Some` explicitly
-     * updates it. To clear a `?? null` column to NULL name it in `clear_nullable_fields` (notes:
+     * updates it. A plaintext-free patch cannot set or clear `book_id`: the content tag includes
+     * that id, and without plaintext the patch can neither recompute the tag nor safely retain it.
+     * Full writes may clear a `?? null` column by naming it in `clear_nullable_fields` (notes:
      * `book_id`/`chapter`/`image_path`/`ink_crop_path`/`source_id` — [`clearable_columns`]).
      * `page` is `|| ''`, not NULL-clearable — clearing it is `Some("")`. `text` (sealed) and
      * `content_tag` (derived) are never clearable; a bad/contradictory clear list is rejected and
@@ -2210,7 +2212,9 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
      * On a full write, `source` is the one exception — `None` → `"manual"` (the PWA's
      * `|| 'manual'` / the prior hardcode). On a plaintext-free patch, `source: None` is omitted
      * like every other optional so it cannot clobber an existing source; `Some` explicitly
-     * updates it. To clear a `?? null` column to NULL name it in `clear_nullable_fields` (notes:
+     * updates it. A plaintext-free patch cannot set or clear `book_id`: the content tag includes
+     * that id, and without plaintext the patch can neither recompute the tag nor safely retain it.
+     * Full writes may clear a `?? null` column by naming it in `clear_nullable_fields` (notes:
      * `book_id`/`chapter`/`image_path`/`ink_crop_path`/`source_id` — [`clearable_columns`]).
      * `page` is `|| ''`, not NULL-clearable — clearing it is `Some("")`. `text` (sealed) and
      * `content_tag` (derived) are never clearable; a bad/contradictory clear list is rejected and
