@@ -3,10 +3,11 @@
 //! tokio) don't compile to wasm32, where the PWA keeps its own `supabase.js` flush.
 //!
 //! Founder-decided model (resolved at the Phase-2 gates):
-//!   - **Seal at write.** [`SyncEngine::enqueue_note`] seals `text` (enc:v2, bound to the note
-//!     id) and computes `content_tag` FROM PLAINTEXT, both at enqueue. The outbox row holds
-//!     ciphertext + the tag; no plaintext note text is ever persisted. The flush sends the
-//!     ciphertext as-is (`isEncrypted` guard, mirroring the JS double-encrypt guard).
+//!   - **Seal at plaintext-bearing write.** [`SyncEngine::enqueue_note`] seals `text` (enc:v2,
+//!     bound to the note id) and computes `content_tag` FROM PLAINTEXT when plaintext is supplied.
+//!     A plaintext-absent patch never calls the Vault and preserves both sealed columns. The outbox
+//!     never persists plaintext; flush sends ciphertext as-is (`isEncrypted` guard, mirroring the
+//!     JS double-encrypt guard).
 //!   - **`updated_at` in epoch MILLISECONDS**, stamped at enqueue (matching the PWA `Date.now()`
 //!     and the existing cloud data; the migration default is 0, there is no server trigger).
 //!   - **`bookIdRemap` persisted in `meta`** (not in-memory) so an offline book-merge survives a
@@ -32,7 +33,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{json, Map, Value};
 
 use crate::search::SearchHit;
-use crate::store::{synced_table_names, Store};
+use crate::store::{synced_table_names, StageExistingWriteError, Store};
 use crate::vault::Vault;
 use http::{user_id_from_jwt, PostgrestClient};
 use read::{
@@ -41,9 +42,9 @@ use read::{
 use reconcile::BookMergeUndo;
 
 /// Errors that cross the FFI from the sync engine. Coarse like [`crate::CryptoError`]: enough
-/// for a host to distinguish store failures, network/sync failures, and invalid snapshot input,
-/// never leaking key material or per-record server detail. Invalid snapshot-input reasons are
-/// additionally sanitized so they never echo archive content.
+/// for a host to distinguish store failures, network/sync failures, invalid snapshot input, and
+/// an expected note-patch target race, never leaking key material or per-record server detail.
+/// Invalid snapshot-input reasons are additionally sanitized so they never echo archive content.
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum SyncError {
     #[error("store error: {0}")]
@@ -52,6 +53,10 @@ pub enum SyncError {
     Flush(String),
     #[error("invalid import: {0}")]
     InvalidImport(String),
+    /// A plaintext-free note patch lost its live local target between the host's read and write.
+    /// Bulk patch flows may skip this note and re-query; this is not a generic store corruption.
+    #[error("note patch requires an existing live row")]
+    PatchTargetMissing,
 }
 
 /// Per-table row counts reported by a snapshot import.
@@ -162,13 +167,15 @@ pub struct SyncSummary {
 /// same class of defect). A record lowers as a SINGLE `RustBuffer` (3 FFI slots, all in registers),
 /// so nothing spills. x86-64 (SysV) tolerated the wide call, so the `:core-roundtrip` desktop jar
 /// never caught it — the arm64 regression net is braird-android's on-device `EnqueueNoteOnDeviceTest`.
-/// Field semantics are byte-for-byte the old positional signature (see [`SyncEngine::enqueue_note`]).
-/// Named to pair with the read model [`NoteRecord`] — `NoteUpsert` in, `NoteRecord` out.
+/// `plaintext: Some` retains the prior full-write semantics. `plaintext: None` is a narrow patch
+/// for an existing live note and deliberately omits sealed text, content tag, and `created_at`
+/// (see [`SyncEngine::enqueue_note`]). Named to pair with the read model [`NoteRecord`] —
+/// `NoteUpsert` in, `NoteRecord` out.
 #[derive(Debug, uniffi::Record)]
 pub struct NoteUpsert {
     pub id: String,
     pub book_id: Option<String>,
-    pub plaintext: String,
+    pub plaintext: Option<String>,
     pub page: Option<String>,
     pub tags: Vec<String>,
     pub source: Option<String>,
@@ -309,10 +316,14 @@ impl SyncEngine {
         self.stage_write("books", &id, row)
     }
 
-    /// Enqueue a note upsert — the seal-at-write path. `plaintext` is the note text; it is sealed
-    /// here (enc:v2, AAD = note id) and `content_tag` is computed here FROM the plaintext (both
-    /// while the plaintext is in hand). The stored outbox payload holds only the ciphertext + the
-    /// tag. Column NAMES mirror `upsertNote` in surfc `src/supabase.js` exactly.
+    /// Enqueue a full note write or a plaintext-free patch. `plaintext: Some` is the existing
+    /// seal-at-write path: the text is sealed here (enc:v2, AAD = note id), `content_tag` is
+    /// computed from the plaintext, and the outbox holds only ciphertext plus the tag.
+    /// `plaintext: None` is valid only for an existing live local row: it makes no Vault call and
+    /// omits `text`, `content_tag`, and `created_at`, preserving their stored bytes. A missing or
+    /// already-tombstoned target returns [`SyncError::PatchTargetMissing`]. Bulk patch hosts should
+    /// treat that typed error as a normal per-note race, skip the note, and re-query their live
+    /// work list. Column NAMES mirror `upsertNote` in surfc `src/supabase.js` exactly.
     ///
     /// WIDENED (SUR-741). Carries the full authoring surface: `source`/`source_id`/`source_meta`/
     /// `chapter`/`image_path`/`ink_crop_path`. `source_meta_json` takes a serialized JSON **object**
@@ -320,24 +331,30 @@ impl SyncEngine {
     /// param that crosses the FFI as a serialized-JSON string (UniFFI has no jsonb type; the type
     /// alone can't say "this String is JSON, not a scalar"). It is parse-validated up front — invalid
     /// JSON or a non-object → `SyncError::Store` and **nothing is staged** (no seal, no write). None of
-    /// the new fields touch the Vault — only `plaintext` is ever sealed.
+    /// the new fields touch the Vault — only a supplied `plaintext` is ever sealed.
     ///
     /// TRI-STATE PATCH SEMANTICS (SUR-741 keep/set + SUR-775 clear): every optional is `None` →
     /// column OMITTED (patch, never clobbers a pulled-only column; see [`SyncEngine::enqueue_book`]).
-    /// `source` is the one exception — `None` → `"manual"` (the PWA's `|| 'manual'` / the prior
-    /// hardcode), always sent, so it is not clearable. To clear a `?? null` column to NULL name it
-    /// in `clear_nullable_fields` (notes: `book_id`/`chapter`/`image_path`/`ink_crop_path`/`source_id` —
-    /// [`clearable_columns`]). `page` is `|| ''`, not NULL-clearable — clearing it is `Some("")`.
-    /// `text` (sealed) and `content_tag` (derived) are never clearable; a bad/contradictory
-    /// `clear_nullable_fields` is rejected and nothing is staged.
+    /// On a full write, `source` is the one exception — `None` → `"manual"` (the PWA's
+    /// `|| 'manual'` / the prior hardcode). On a plaintext-free patch, `source: None` is omitted
+    /// like every other optional so it cannot clobber an existing source; `Some` explicitly
+    /// updates it. A plaintext-free patch cannot set or clear `book_id`: the content tag includes
+    /// that id, and without plaintext the patch can neither recompute the tag nor safely retain it.
+    /// Full writes may clear a `?? null` column by naming it in `clear_nullable_fields` (notes:
+    /// `book_id`/`chapter`/`image_path`/`ink_crop_path`/`source_id` — [`clearable_columns`]).
+    /// `page` is `|| ''`, not NULL-clearable — clearing it is `Some("")`. `text` (sealed) and
+    /// `content_tag` (derived) are never clearable; a bad/contradictory clear list is rejected and
+    /// nothing is staged. Patch-mode `created_at` is ignored and immutable; both paths stamp a
+    /// fresh `updated_at`.
     ///
     /// STALE-TAG EDGE (deliberate, mirrors surfc — do not "fix"): the content_tag bakes in the
     /// note's `book_id`, but the flush repoints `book_id` via `bookIdRemap` after an offline
     /// book-merge. So a merged note's tag reflects the PRE-merge book_id. The JS never recomputes
     /// the tag at flush (`flushOutbox` doesn't touch it), and we CAN'T recompute at flush anyway —
     /// under seal-at-write there is no plaintext left. We leave the tag as-is: the rare
-    /// stale-tag-after-offline-merge self-heals on the note's next edit (which re-enqueues with a
-    /// freshly-computed tag). The tag is never NULL because it is computed pre-seal, from plaintext.
+    /// stale-tag-after-offline-merge self-heals on the note's next plaintext-bearing edit (which
+    /// re-enqueues with a freshly-computed tag). The tag is never NULL because it is computed
+    /// pre-seal, from plaintext.
     pub fn enqueue_note(&self, draft: NoteUpsert) -> Result<(), SyncError> {
         let NoteUpsert {
             id,
@@ -374,21 +391,11 @@ impl SyncEngine {
         };
 
         let now = epoch_ms();
-        // Seal-at-write: enc:v2 ciphertext (AAD = note id) + the tag from PLAINTEXT.
-        let ciphertext = self.vault.encrypt_note(Some(id.clone()), plaintext.clone());
-        let content_tag = self.vault.content_tag(plaintext, book_id.clone());
-
         let mut row = Map::new();
         row.insert("id".into(), json!(id));
-        insert_opt(&mut row, "book_id", book_id);
-        row.insert("text".into(), json!(ciphertext)); // ciphertext, never plaintext
+        insert_opt(&mut row, "book_id", book_id.clone());
         insert_opt(&mut row, "page", page);
         row.insert("tags".into(), json!(tags));
-        // source is the one always-sent optional: None → "manual" (PWA's `|| 'manual'`).
-        row.insert(
-            "source".into(),
-            json!(source.unwrap_or_else(|| "manual".into())),
-        );
         insert_opt(&mut row, "source_id", source_id);
         if let Some(v) = source_meta {
             row.insert("source_meta".into(), v);
@@ -396,14 +403,39 @@ impl SyncEngine {
         insert_opt(&mut row, "chapter", chapter);
         insert_opt(&mut row, "image_path", image_path);
         insert_opt(&mut row, "ink_crop_path", ink_crop_path);
-        row.insert("content_tag".into(), json!(content_tag));
-        row.insert("created_at".into(), json!(created_at));
         row.insert("updated_at".into(), json!(now));
         row.insert("deleted".into(), json!(deleted));
-        // Tri-state clears — validated against the clearable allowlist; on reject nothing is staged
-        // (the seal above is discarded, never persisted). `text`/`content_tag` aren't clearable.
+        // Validate clears before either stage path. `text`/`content_tag` remain non-clearable.
         apply_clears("notes", &mut row, &clear_nullable_fields)?;
-        self.stage_write("notes", &id, row)
+        match plaintext {
+            Some(plaintext) => {
+                // Full write: seal/tag and keep the PWA's create-time source default.
+                let ciphertext = self.vault.encrypt_note(Some(id.clone()), plaintext.clone());
+                let content_tag = self.vault.content_tag(plaintext, book_id);
+                row.insert("text".into(), json!(ciphertext));
+                row.insert("content_tag".into(), json!(content_tag));
+                row.insert(
+                    "source".into(),
+                    json!(source.unwrap_or_else(|| "manual".into())),
+                );
+                row.insert("created_at".into(), json!(created_at));
+                self.stage_write("notes", &id, row)
+            }
+            None => {
+                // Existing-row patch: no Vault call; absent source means keep.
+                if book_id.is_some()
+                    || clear_nullable_fields
+                        .iter()
+                        .any(|column| column == "book_id")
+                {
+                    return Err(SyncError::Store(
+                        "plaintext-free note patches cannot change book_id".into(),
+                    ));
+                }
+                insert_opt(&mut row, "source", source);
+                self.stage_existing_live_note_patch(&id, row)
+            }
+        }
     }
 
     /// Enqueue a custom-idea upsert (SUR-726). Plaintext metadata only (mirrors `upsertIdea`);
@@ -933,6 +965,19 @@ impl SyncEngine {
         lock!(self.store)
             .stage_local_write(table, record_id, row, epoch_ms())
             .map_err(|e| SyncError::Store(e.to_string()))
+    }
+
+    fn stage_existing_live_note_patch(
+        &self,
+        record_id: &str,
+        row: Map<String, Value>,
+    ) -> Result<(), SyncError> {
+        lock!(self.store)
+            .stage_local_write_existing_live("notes", record_id, row, epoch_ms())
+            .map_err(|error| match error {
+                StageExistingWriteError::TargetMissing => SyncError::PatchTargetMissing,
+                StageExistingWriteError::Sql(error) => SyncError::Store(error.to_string()),
+            })
     }
 }
 
@@ -1523,6 +1568,267 @@ mod tests {
     }
 
     #[test]
+    fn note_patch_preserves_sealed_and_immutable_fields_and_queues_a_narrow_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let original_text = "enc:v2:foreign-ciphertext";
+        let original_tag = "foreign-content-tag";
+        {
+            let store = Store::open(db_path).unwrap();
+            store
+                .apply_row(
+                    "notes",
+                    json!({
+                        "id": "n1",
+                        "text": original_text,
+                        "tags": ["before"],
+                        "source": "kindle",
+                        "content_tag": original_tag,
+                        "created_at": 10,
+                        "updated_at": 1,
+                        "deleted": false
+                    })
+                    .as_object()
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        let engine = engine_at(db_path);
+        assert!(
+            engine
+                .get_note("n1".into())
+                .unwrap()
+                .unwrap()
+                .decrypt_failed,
+            "the seeded foreign ciphertext must be undecryptable before the patch"
+        );
+
+        engine
+            .enqueue_note(NoteUpsert {
+                tags: vec!["after".into()],
+                created_at: 999,
+                ..note_patch("n1")
+            })
+            .unwrap();
+
+        let store = Store::open(db_path).unwrap();
+        let row = store.get_row("notes", "n1").unwrap().unwrap();
+        assert_eq!(row["text"], json!(original_text));
+        assert_eq!(row["content_tag"], json!(original_tag));
+        assert_eq!(row["source"], json!("kindle"));
+        assert_eq!(row["created_at"], json!(10));
+        assert_eq!(row["tags"], json!(["after"]));
+        assert!(row["updated_at"].as_i64().unwrap() > 1);
+        assert!(
+            engine
+                .get_note("n1".into())
+                .unwrap()
+                .unwrap()
+                .decrypt_failed,
+            "the patch must not replace foreign ciphertext with synthesized plaintext"
+        );
+
+        let queued = store.outbox_items().unwrap();
+        assert_eq!(queued.len(), 1);
+        let payload: Value = serde_json::from_str(&queued[0].3).unwrap();
+        let object = payload.as_object().unwrap();
+        for key in ["text", "content_tag", "source", "created_at"] {
+            assert!(
+                !object.contains_key(key),
+                "{key} must be absent from a plaintext-free patch"
+            );
+        }
+        assert_eq!(payload["tags"], json!(["after"]));
+        assert!(payload["updated_at"].as_i64().unwrap() > 1);
+    }
+
+    #[test]
+    fn note_patch_rejects_missing_and_tombstoned_targets_with_typed_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+
+        let missing = engine.enqueue_note(note_patch("missing")).unwrap_err();
+        assert!(matches!(&missing, SyncError::PatchTargetMissing));
+        assert_eq!(
+            missing.to_string(),
+            "note patch requires an existing live row"
+        );
+        assert!(Store::open(db_path)
+            .unwrap()
+            .outbox_items()
+            .unwrap()
+            .is_empty());
+        assert!(Store::open(db_path)
+            .unwrap()
+            .get_row("notes", "missing")
+            .unwrap()
+            .is_none());
+
+        {
+            let store = Store::open(db_path).unwrap();
+            store
+                .apply_row(
+                    "notes",
+                    json!({
+                        "id": "dead",
+                        "text": "enc:v2:foreign-ciphertext",
+                        "tags": ["before"],
+                        "source": "kindle",
+                        "content_tag": "foreign-content-tag",
+                        "created_at": 10,
+                        "updated_at": 1,
+                        "deleted": true
+                    })
+                    .as_object()
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        let before = Store::open(db_path)
+            .unwrap()
+            .get_row("notes", "dead")
+            .unwrap()
+            .unwrap();
+        let tombstoned = engine
+            .enqueue_note(NoteUpsert {
+                tags: vec!["after".into()],
+                ..note_patch("dead")
+            })
+            .unwrap_err();
+        assert!(matches!(&tombstoned, SyncError::PatchTargetMissing));
+        assert_eq!(
+            tombstoned.to_string(),
+            "note patch requires an existing live row"
+        );
+        let store = Store::open(db_path).unwrap();
+        assert_eq!(store.get_row("notes", "dead").unwrap().unwrap(), before);
+        assert!(store.outbox_items().unwrap().is_empty());
+    }
+
+    #[test]
+    fn note_patch_can_tombstone_a_live_undecryptable_note_without_resealing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let original_text = "enc:v2:foreign-ciphertext";
+        let original_tag = "foreign-content-tag";
+        {
+            let store = Store::open(db_path).unwrap();
+            store
+                .apply_row(
+                    "notes",
+                    json!({
+                        "id": "n1",
+                        "text": original_text,
+                        "tags": ["before"],
+                        "source": "kindle",
+                        "content_tag": original_tag,
+                        "created_at": 10,
+                        "updated_at": 1,
+                        "deleted": false
+                    })
+                    .as_object()
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        let engine = engine_at(db_path);
+        assert!(
+            engine
+                .get_note("n1".into())
+                .unwrap()
+                .unwrap()
+                .decrypt_failed
+        );
+
+        engine
+            .enqueue_note(NoteUpsert {
+                deleted: true,
+                ..note_patch("n1")
+            })
+            .unwrap();
+
+        let store = Store::open(db_path).unwrap();
+        let row = store.get_row("notes", "n1").unwrap().unwrap();
+        assert_eq!(row["deleted"], json!(true));
+        assert_eq!(row["text"], json!(original_text));
+        assert_eq!(row["content_tag"], json!(original_tag));
+        let payload: Value = serde_json::from_str(&store.outbox_items().unwrap()[0].3).unwrap();
+        assert_eq!(payload["deleted"], json!(true));
+        assert!(payload.get("text").is_none());
+        assert!(payload.get("content_tag").is_none());
+    }
+
+    #[test]
+    fn note_patch_rejects_book_moves_that_would_stale_the_content_tag() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        {
+            let store = Store::open(db_path).unwrap();
+            for id in ["set-book", "clear-book"] {
+                store
+                    .apply_row(
+                        "notes",
+                        json!({
+                            "id": id,
+                            "book_id": "b1",
+                            "text": "enc:v2:foreign-ciphertext",
+                            "tags": ["before"],
+                            "source": "kindle",
+                            "content_tag": "book-b1-content-tag",
+                            "created_at": 10,
+                            "updated_at": 1,
+                            "deleted": false
+                        })
+                        .as_object()
+                        .unwrap(),
+                    )
+                    .unwrap();
+            }
+        }
+        let engine = engine_at(db_path);
+
+        let set_error = engine
+            .enqueue_note(NoteUpsert {
+                book_id: Some("b2".into()),
+                tags: vec!["after".into()],
+                ..note_patch("set-book")
+            })
+            .unwrap_err();
+        assert!(matches!(set_error, SyncError::Store(_)));
+        assert_eq!(
+            set_error.to_string(),
+            "store error: plaintext-free note patches cannot change book_id"
+        );
+
+        let clear_error = engine
+            .enqueue_note(NoteUpsert {
+                tags: vec!["after".into()],
+                clear_nullable_fields: vec!["book_id".into()],
+                ..note_patch("clear-book")
+            })
+            .unwrap_err();
+        assert!(matches!(clear_error, SyncError::Store(_)));
+        assert_eq!(
+            clear_error.to_string(),
+            "store error: plaintext-free note patches cannot change book_id"
+        );
+
+        let store = Store::open(db_path).unwrap();
+        for id in ["set-book", "clear-book"] {
+            let row = store.get_row("notes", id).unwrap().unwrap();
+            assert_eq!(row["book_id"], json!("b1"));
+            assert_eq!(row["content_tag"], json!("book-b1-content-tag"));
+            assert_eq!(row["tags"], json!(["before"]));
+        }
+        assert!(store.outbox_items().unwrap().is_empty());
+    }
+
+    #[test]
     fn enqueue_note_invalid_source_meta_json_is_rejected_atomically() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.sqlite");
@@ -1809,7 +2115,26 @@ mod tests {
         NoteUpsert {
             id: id.into(),
             book_id: None,
-            plaintext: plaintext.into(),
+            plaintext: Some(plaintext.into()),
+            page: None,
+            tags: vec![],
+            source: None,
+            source_id: None,
+            source_meta_json: None,
+            chapter: None,
+            image_path: None,
+            ink_crop_path: None,
+            created_at: 0,
+            deleted: false,
+            clear_nullable_fields: vec![],
+        }
+    }
+
+    fn note_patch(id: &str) -> NoteUpsert {
+        NoteUpsert {
+            id: id.into(),
+            book_id: None,
+            plaintext: None,
             page: None,
             tags: vec![],
             source: None,

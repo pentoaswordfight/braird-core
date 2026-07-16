@@ -25,6 +25,15 @@ use serde_json::{Map, Value};
 /// keeps clippy's `type_complexity` lint happy).
 pub type OutboxRow = (i64, String, Option<String>, String, i64);
 
+/// Failure modes for staging a partial write that is valid only for an existing live row.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum StageExistingWriteError {
+    #[error("patch target missing")]
+    TargetMissing,
+    #[error(transparent)]
+    Sql(#[from] rusqlite::Error),
+}
+
 /// One fully prepared snapshot-import write. Callers complete the row to its descriptor and seal
 /// note text before constructing this value; [`Store::stage_import_batch`] persists the identical
 /// row locally and in the outbox in one transaction.
@@ -766,8 +775,8 @@ impl Store {
     /// has no queued outbox row (which would silently never flush yet still win an LWW compare).
     ///
     /// The synced row is the MERGED row (a partial edit can't null pulled-only columns like a book
-    /// cover); the outbox payload is the PARTIAL row as supplied (the server upsert `merge-duplicates`
-    /// patches only the changed columns — sending the merged full row could clobber a newer field).
+    /// cover); the outbox payload is the PARTIAL row as supplied (the server write applies only the
+    /// changed columns — sending the merged full row could clobber a newer field).
     pub fn stage_local_write(
         &self,
         table: &str,
@@ -781,6 +790,34 @@ impl Store {
         let tx = self.conn.unchecked_transaction()?;
         self.stage_write_inner(table, record_id, partial, created_at)?;
         tx.commit()
+    }
+
+    /// Atomically stage a partial write only when its target exists and is currently live.
+    ///
+    /// The precondition check and the local-row/outbox write share one transaction. This prevents
+    /// a stale patch from creating a missing row or resurrecting a soft-deleted row between a
+    /// separate preflight read and the stage.
+    pub(crate) fn stage_local_write_existing_live(
+        &self,
+        table: &str,
+        record_id: &str,
+        partial: Map<String, Value>,
+        created_at: i64,
+    ) -> Result<(), StageExistingWriteError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let existing = self
+            .get_row(table, record_id)?
+            .ok_or(StageExistingWriteError::TargetMissing)?;
+        if existing
+            .get("deleted")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            return Err(StageExistingWriteError::TargetMissing);
+        }
+        self.stage_write_inner(table, record_id, partial, created_at)?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Non-transactional core of [`stage_local_write`]: merge `partial` onto the existing row,
@@ -1071,6 +1108,95 @@ mod tests {
             store.get_row("books", "b1").unwrap().is_none(),
             "apply_row must roll back when the outbox enqueue fails (atomic stage)"
         );
+    }
+
+    #[test]
+    fn stage_existing_live_write_rejects_missing_and_tombstoned_rows() {
+        use serde_json::json;
+
+        let store = Store::open_in_memory().unwrap();
+        let partial = json!({
+            "id": "n1",
+            "tags": ["after"],
+            "updated_at": 2,
+            "deleted": false
+        });
+
+        let missing = store.stage_local_write_existing_live(
+            "notes",
+            "n1",
+            partial.as_object().unwrap().clone(),
+            100,
+        );
+        assert!(matches!(
+            missing,
+            Err(StageExistingWriteError::TargetMissing)
+        ));
+        assert!(store.get_row("notes", "n1").unwrap().is_none());
+        assert!(store.outbox_items().unwrap().is_empty());
+
+        let tombstone = json!({
+            "id": "n1",
+            "text": "enc:v2:foreign",
+            "tags": ["before"],
+            "content_tag": "tag-before",
+            "created_at": 1,
+            "updated_at": 1,
+            "deleted": true
+        });
+        store
+            .apply_row("notes", tombstone.as_object().unwrap())
+            .unwrap();
+        let before = store.get_row("notes", "n1").unwrap().unwrap();
+
+        let deleted = store.stage_local_write_existing_live(
+            "notes",
+            "n1",
+            partial.as_object().unwrap().clone(),
+            101,
+        );
+        assert!(matches!(
+            deleted,
+            Err(StageExistingWriteError::TargetMissing)
+        ));
+        assert_eq!(store.get_row("notes", "n1").unwrap().unwrap(), before);
+        assert!(store.outbox_items().unwrap().is_empty());
+    }
+
+    #[test]
+    fn stage_existing_live_write_rolls_back_when_outbox_insert_fails() {
+        use serde_json::json;
+
+        let store = Store::open_in_memory().unwrap();
+        let row = json!({
+            "id": "n1",
+            "text": "enc:v2:foreign",
+            "tags": ["before"],
+            "content_tag": "tag-before",
+            "created_at": 1,
+            "updated_at": 1,
+            "deleted": false
+        });
+        store.apply_row("notes", row.as_object().unwrap()).unwrap();
+        store.conn.execute_batch("DROP TABLE outbox").unwrap();
+
+        let partial = json!({
+            "id": "n1",
+            "tags": ["after"],
+            "updated_at": 2,
+            "deleted": false
+        });
+        let result = store.stage_local_write_existing_live(
+            "notes",
+            "n1",
+            partial.as_object().unwrap().clone(),
+            100,
+        );
+
+        assert!(matches!(result, Err(StageExistingWriteError::Sql(_))));
+        let stored = store.get_row("notes", "n1").unwrap().unwrap();
+        assert_eq!(stored["tags"], json!(["before"]));
+        assert_eq!(stored["updated_at"], json!(1));
     }
 
     #[test]

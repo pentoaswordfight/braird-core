@@ -1,5 +1,5 @@
-//! The PostgREST client (SUR-724 / SUR-659b). One authenticated upsert primitive that
-//! mirrors what surfc's `supabase.from(table).upsert(...)` does on the wire:
+//! The PostgREST client (SUR-724 / SUR-659b). Authenticated upsert plus targeted existing-row
+//! patch primitives mirroring supabase-js on the wire:
 //!
 //!   POST {SUPABASE_URL}/rest/v1/{table}?on_conflict={pk}
 //!   apikey: <anon>
@@ -7,6 +7,11 @@
 //!   Content-Type: application/json
 //!   Prefer: resolution=merge-duplicates
 //!   body: [ {row}, ... ]
+//!
+//!   PATCH {SUPABASE_URL}/rest/v1/{table}?{pk}=eq.{record_id}
+//!   apikey / Authorization / Content-Type as above
+//!   Prefer: return=minimal
+//!   body: {partial row without the primary key}
 //!
 //! `user_id` is stamped onto each row by the caller (from the JWT `sub`), never stored in
 //! the outbox — exactly as the PWA injects the auth user id at write.
@@ -102,6 +107,52 @@ impl PostgrestClient {
             .post(&url)
             .headers(headers)
             .json(rows)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(Box::new(PostgrestError {
+                status: status.as_u16(),
+                body,
+            }));
+        }
+        Ok(())
+    }
+
+    /// Patch one existing row selected by `primary_key = record_id`. Unlike an upsert, PostgREST
+    /// does not construct an INSERT candidate, so a narrow notes patch may omit NOT-NULL `text`.
+    pub async fn patch_existing(
+        &self,
+        table: &str,
+        primary_key: &str,
+        record_id: &str,
+        row: &Value,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let token = self
+            .access_token
+            .as_deref()
+            .ok_or("no access token set — call set_access_token before flush")?;
+
+        let mut url = reqwest::Url::parse(&format!("{}/rest/v1/{}", self.base_url, table))?;
+        url.query_pairs_mut()
+            .append_pair(primary_key, &format!("eq.{record_id}"));
+
+        let mut headers = HeaderMap::new();
+        headers.insert("apikey", HeaderValue::from_str(&self.anon_key)?);
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}"))?,
+        );
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers.insert("Prefer", HeaderValue::from_static("return=minimal"));
+
+        let resp = self
+            .http
+            .patch(url)
+            .headers(headers)
+            .json(row)
             .send()
             .await?;
 
@@ -336,6 +387,18 @@ fn by_ids_url(
 pub trait PostgrestSink {
     async fn upsert(&self, table: &str, on_conflict: &str, rows: &Value) -> Result<(), String>;
 
+    /// Patch one existing row by primary key. Default failure keeps non-push test sinks honest if
+    /// a new code path unexpectedly attempts a server mutation they do not model.
+    async fn patch(
+        &self,
+        _table: &str,
+        _primary_key: &str,
+        _record_id: &str,
+        _row: &Value,
+    ) -> Result<(), String> {
+        Err("targeted patch is not supported by this sink".into())
+    }
+
     /// Fetch one page of `table` rows with `change_seq > after_seq`, ordered by `change_seq` asc,
     /// capped at `limit` (keyset incremental pull, SUR-739 / SUR-652).
     async fn fetch_page(
@@ -382,6 +445,18 @@ impl PostgrestSink for PostgrestClient {
         limit: i64,
     ) -> Result<Vec<Value>, String> {
         self.get_page(table, after_seq, limit)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn patch(
+        &self,
+        table: &str,
+        primary_key: &str,
+        record_id: &str,
+        row: &Value,
+    ) -> Result<(), String> {
+        self.patch_existing(table, primary_key, record_id, row)
             .await
             .map_err(|e| e.to_string())
     }

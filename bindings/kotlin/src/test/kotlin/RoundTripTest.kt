@@ -213,6 +213,84 @@ class RoundTripTest {
         }
     }
 
+    /** SUR-921: null plaintext reaches the existing-row patch path, so a Vault that cannot
+     * decrypt the note can still retag it without replacing its ciphertext. */
+    @Test
+    fun tagsOnlyNotePatchOverFfi() {
+        val db = File.createTempFile("braird-rt", ".sqlite").apply { deleteOnExit() }
+        val vaultA = Vault.generate()
+        val writer = SyncEngine.open(db.absolutePath, "https://x.supabase.co", "anon", vaultA)
+        writer.enqueueNote(NoteUpsert(
+            id = "n1",
+            bookId = null,
+            plaintext = "secret from vault A",
+            page = null,
+            tags = listOf("before"),
+            source = "kindle",
+            sourceId = null,
+            sourceMetaJson = null,
+            chapter = null,
+            imagePath = null,
+            inkCropPath = null,
+            createdAt = 10L,
+            deleted = false,
+            clearNullableFields = emptyList(),
+        ))
+
+        val foreign = SyncEngine.open(
+            db.absolutePath, "https://x.supabase.co", "anon", Vault.generate())
+        val before = foreign.getNote("n1")!!
+        assertTrue(before.decryptFailed)
+        assertEquals(null, before.text)
+
+        foreign.enqueueNote(NoteUpsert(
+            id = "n1",
+            bookId = null,
+            plaintext = null,
+            page = null,
+            tags = listOf("after"),
+            source = null,
+            sourceId = null,
+            sourceMetaJson = null,
+            chapter = null,
+            imagePath = null,
+            inkCropPath = null,
+            createdAt = 999L,
+            deleted = false,
+            clearNullableFields = emptyList(),
+        ))
+        val stillForeign = foreign.getNote("n1")!!
+        assertTrue(stillForeign.decryptFailed)
+        assertEquals(listOf("after"), stillForeign.tags)
+
+        val recovered = SyncEngine.open(
+            db.absolutePath, "https://x.supabase.co", "anon", vaultA).getNote("n1")!!
+        assertFalse(recovered.decryptFailed)
+        assertEquals("secret from vault A", recovered.text)
+        assertEquals(listOf("after"), recovered.tags)
+        assertEquals("kindle", recovered.source)
+        assertEquals(10L, recovered.createdAt)
+
+        assertThrows(SyncException.PatchTargetMissing::class.java) {
+            foreign.enqueueNote(NoteUpsert(
+                id = "missing",
+                bookId = null,
+                plaintext = null,
+                page = null,
+                tags = listOf("after"),
+                source = null,
+                sourceId = null,
+                sourceMetaJson = null,
+                chapter = null,
+                imagePath = null,
+                inkCropPath = null,
+                createdAt = 999L,
+                deleted = false,
+                clearNullableFields = emptyList(),
+            ))
+        }
+    }
+
     /** SUR-744: the read/query surface over the FFI — list/get/counts/search against a populated
      * store. Proves note text crosses the binding as decrypted PLAINTEXT (never an `enc:` sentinel,
      * AC #2), the Library note-count badge, newest-first ordering, and lexical-search parity as an

@@ -1169,7 +1169,7 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_lens() != 60504.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_note() != 35159.toShort()) {
+    if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_note() != 9431.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_note_link() != 53465.toShort()) {
@@ -1747,10 +1747,14 @@ public interface SyncEngineInterface {
     fun `enqueueLens`(`id`: kotlin.String, `name`: kotlin.String, `leafIds`: List<kotlin.String>, `combinator`: kotlin.String?, `threshold`: kotlin.Long?, `createdAt`: kotlin.Long, `deleted`: kotlin.Boolean)
     
     /**
-     * Enqueue a note upsert — the seal-at-write path. `plaintext` is the note text; it is sealed
-     * here (enc:v2, AAD = note id) and `content_tag` is computed here FROM the plaintext (both
-     * while the plaintext is in hand). The stored outbox payload holds only the ciphertext + the
-     * tag. Column NAMES mirror `upsertNote` in surfc `src/supabase.js` exactly.
+     * Enqueue a full note write or a plaintext-free patch. `plaintext: Some` is the existing
+     * seal-at-write path: the text is sealed here (enc:v2, AAD = note id), `content_tag` is
+     * computed from the plaintext, and the outbox holds only ciphertext plus the tag.
+     * `plaintext: None` is valid only for an existing live local row: it makes no Vault call and
+     * omits `text`, `content_tag`, and `created_at`, preserving their stored bytes. A missing or
+     * already-tombstoned target returns [`SyncError::PatchTargetMissing`]. Bulk patch hosts should
+     * treat that typed error as a normal per-note race, skip the note, and re-query their live
+     * work list. Column NAMES mirror `upsertNote` in surfc `src/supabase.js` exactly.
      *
      * WIDENED (SUR-741). Carries the full authoring surface: `source`/`source_id`/`source_meta`/
      * `chapter`/`image_path`/`ink_crop_path`. `source_meta_json` takes a serialized JSON **object**
@@ -1758,24 +1762,30 @@ public interface SyncEngineInterface {
      * param that crosses the FFI as a serialized-JSON string (UniFFI has no jsonb type; the type
      * alone can't say "this String is JSON, not a scalar"). It is parse-validated up front — invalid
      * JSON or a non-object → `SyncError::Store` and **nothing is staged** (no seal, no write). None of
-     * the new fields touch the Vault — only `plaintext` is ever sealed.
+     * the new fields touch the Vault — only a supplied `plaintext` is ever sealed.
      *
      * TRI-STATE PATCH SEMANTICS (SUR-741 keep/set + SUR-775 clear): every optional is `None` →
      * column OMITTED (patch, never clobbers a pulled-only column; see [`SyncEngine::enqueue_book`]).
-     * `source` is the one exception — `None` → `"manual"` (the PWA's `|| 'manual'` / the prior
-     * hardcode), always sent, so it is not clearable. To clear a `?? null` column to NULL name it
-     * in `clear_nullable_fields` (notes: `book_id`/`chapter`/`image_path`/`ink_crop_path`/`source_id` —
-     * [`clearable_columns`]). `page` is `|| ''`, not NULL-clearable — clearing it is `Some("")`.
-     * `text` (sealed) and `content_tag` (derived) are never clearable; a bad/contradictory
-     * `clear_nullable_fields` is rejected and nothing is staged.
+     * On a full write, `source` is the one exception — `None` → `"manual"` (the PWA's
+     * `|| 'manual'` / the prior hardcode). On a plaintext-free patch, `source: None` is omitted
+     * like every other optional so it cannot clobber an existing source; `Some` explicitly
+     * updates it. A plaintext-free patch cannot set or clear `book_id`: the content tag includes
+     * that id, and without plaintext the patch can neither recompute the tag nor safely retain it.
+     * Full writes may clear a `?? null` column by naming it in `clear_nullable_fields` (notes:
+     * `book_id`/`chapter`/`image_path`/`ink_crop_path`/`source_id` — [`clearable_columns`]).
+     * `page` is `|| ''`, not NULL-clearable — clearing it is `Some("")`. `text` (sealed) and
+     * `content_tag` (derived) are never clearable; a bad/contradictory clear list is rejected and
+     * nothing is staged. Patch-mode `created_at` is ignored and immutable; both paths stamp a
+     * fresh `updated_at`.
      *
      * STALE-TAG EDGE (deliberate, mirrors surfc — do not "fix"): the content_tag bakes in the
      * note's `book_id`, but the flush repoints `book_id` via `bookIdRemap` after an offline
      * book-merge. So a merged note's tag reflects the PRE-merge book_id. The JS never recomputes
      * the tag at flush (`flushOutbox` doesn't touch it), and we CAN'T recompute at flush anyway —
      * under seal-at-write there is no plaintext left. We leave the tag as-is: the rare
-     * stale-tag-after-offline-merge self-heals on the note's next edit (which re-enqueues with a
-     * freshly-computed tag). The tag is never NULL because it is computed pre-seal, from plaintext.
+     * stale-tag-after-offline-merge self-heals on the note's next plaintext-bearing edit (which
+     * re-enqueues with a freshly-computed tag). The tag is never NULL because it is computed
+     * pre-seal, from plaintext.
      */
     fun `enqueueNote`(`draft`: NoteUpsert)
     
@@ -2180,10 +2190,14 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
 
     
     /**
-     * Enqueue a note upsert — the seal-at-write path. `plaintext` is the note text; it is sealed
-     * here (enc:v2, AAD = note id) and `content_tag` is computed here FROM the plaintext (both
-     * while the plaintext is in hand). The stored outbox payload holds only the ciphertext + the
-     * tag. Column NAMES mirror `upsertNote` in surfc `src/supabase.js` exactly.
+     * Enqueue a full note write or a plaintext-free patch. `plaintext: Some` is the existing
+     * seal-at-write path: the text is sealed here (enc:v2, AAD = note id), `content_tag` is
+     * computed from the plaintext, and the outbox holds only ciphertext plus the tag.
+     * `plaintext: None` is valid only for an existing live local row: it makes no Vault call and
+     * omits `text`, `content_tag`, and `created_at`, preserving their stored bytes. A missing or
+     * already-tombstoned target returns [`SyncError::PatchTargetMissing`]. Bulk patch hosts should
+     * treat that typed error as a normal per-note race, skip the note, and re-query their live
+     * work list. Column NAMES mirror `upsertNote` in surfc `src/supabase.js` exactly.
      *
      * WIDENED (SUR-741). Carries the full authoring surface: `source`/`source_id`/`source_meta`/
      * `chapter`/`image_path`/`ink_crop_path`. `source_meta_json` takes a serialized JSON **object**
@@ -2191,24 +2205,30 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
      * param that crosses the FFI as a serialized-JSON string (UniFFI has no jsonb type; the type
      * alone can't say "this String is JSON, not a scalar"). It is parse-validated up front — invalid
      * JSON or a non-object → `SyncError::Store` and **nothing is staged** (no seal, no write). None of
-     * the new fields touch the Vault — only `plaintext` is ever sealed.
+     * the new fields touch the Vault — only a supplied `plaintext` is ever sealed.
      *
      * TRI-STATE PATCH SEMANTICS (SUR-741 keep/set + SUR-775 clear): every optional is `None` →
      * column OMITTED (patch, never clobbers a pulled-only column; see [`SyncEngine::enqueue_book`]).
-     * `source` is the one exception — `None` → `"manual"` (the PWA's `|| 'manual'` / the prior
-     * hardcode), always sent, so it is not clearable. To clear a `?? null` column to NULL name it
-     * in `clear_nullable_fields` (notes: `book_id`/`chapter`/`image_path`/`ink_crop_path`/`source_id` —
-     * [`clearable_columns`]). `page` is `|| ''`, not NULL-clearable — clearing it is `Some("")`.
-     * `text` (sealed) and `content_tag` (derived) are never clearable; a bad/contradictory
-     * `clear_nullable_fields` is rejected and nothing is staged.
+     * On a full write, `source` is the one exception — `None` → `"manual"` (the PWA's
+     * `|| 'manual'` / the prior hardcode). On a plaintext-free patch, `source: None` is omitted
+     * like every other optional so it cannot clobber an existing source; `Some` explicitly
+     * updates it. A plaintext-free patch cannot set or clear `book_id`: the content tag includes
+     * that id, and without plaintext the patch can neither recompute the tag nor safely retain it.
+     * Full writes may clear a `?? null` column by naming it in `clear_nullable_fields` (notes:
+     * `book_id`/`chapter`/`image_path`/`ink_crop_path`/`source_id` — [`clearable_columns`]).
+     * `page` is `|| ''`, not NULL-clearable — clearing it is `Some("")`. `text` (sealed) and
+     * `content_tag` (derived) are never clearable; a bad/contradictory clear list is rejected and
+     * nothing is staged. Patch-mode `created_at` is ignored and immutable; both paths stamp a
+     * fresh `updated_at`.
      *
      * STALE-TAG EDGE (deliberate, mirrors surfc — do not "fix"): the content_tag bakes in the
      * note's `book_id`, but the flush repoints `book_id` via `bookIdRemap` after an offline
      * book-merge. So a merged note's tag reflects the PRE-merge book_id. The JS never recomputes
      * the tag at flush (`flushOutbox` doesn't touch it), and we CAN'T recompute at flush anyway —
      * under seal-at-write there is no plaintext left. We leave the tag as-is: the rare
-     * stale-tag-after-offline-merge self-heals on the note's next edit (which re-enqueues with a
-     * freshly-computed tag). The tag is never NULL because it is computed pre-seal, from plaintext.
+     * stale-tag-after-offline-merge self-heals on the note's next plaintext-bearing edit (which
+     * re-enqueues with a freshly-computed tag). The tag is never NULL because it is computed
+     * pre-seal, from plaintext.
      */
     @Throws(SyncException::class)override fun `enqueueNote`(`draft`: NoteUpsert)
         = 
@@ -3855,13 +3875,15 @@ public object FfiConverterTypeNoteRecord: FfiConverterRustBuffer<NoteRecord> {
  * same class of defect). A record lowers as a SINGLE `RustBuffer` (3 FFI slots, all in registers),
  * so nothing spills. x86-64 (SysV) tolerated the wide call, so the `:core-roundtrip` desktop jar
  * never caught it — the arm64 regression net is braird-android's on-device `EnqueueNoteOnDeviceTest`.
- * Field semantics are byte-for-byte the old positional signature (see [`SyncEngine::enqueue_note`]).
- * Named to pair with the read model [`NoteRecord`] — `NoteUpsert` in, `NoteRecord` out.
+ * `plaintext: Some` retains the prior full-write semantics. `plaintext: None` is a narrow patch
+ * for an existing live note and deliberately omits sealed text, content tag, and `created_at`
+ * (see [`SyncEngine::enqueue_note`]). Named to pair with the read model [`NoteRecord`] —
+ * `NoteUpsert` in, `NoteRecord` out.
  */
 data class NoteUpsert (
     var `id`: kotlin.String, 
     var `bookId`: kotlin.String?, 
-    var `plaintext`: kotlin.String, 
+    var `plaintext`: kotlin.String?, 
     var `page`: kotlin.String?, 
     var `tags`: List<kotlin.String>, 
     var `source`: kotlin.String?, 
@@ -3886,7 +3908,7 @@ public object FfiConverterTypeNoteUpsert: FfiConverterRustBuffer<NoteUpsert> {
         return NoteUpsert(
             FfiConverterString.read(buf),
             FfiConverterOptionalString.read(buf),
-            FfiConverterString.read(buf),
+            FfiConverterOptionalString.read(buf),
             FfiConverterOptionalString.read(buf),
             FfiConverterSequenceString.read(buf),
             FfiConverterOptionalString.read(buf),
@@ -3904,7 +3926,7 @@ public object FfiConverterTypeNoteUpsert: FfiConverterRustBuffer<NoteUpsert> {
     override fun allocationSize(value: NoteUpsert) = (
             FfiConverterString.allocationSize(value.`id`) +
             FfiConverterOptionalString.allocationSize(value.`bookId`) +
-            FfiConverterString.allocationSize(value.`plaintext`) +
+            FfiConverterOptionalString.allocationSize(value.`plaintext`) +
             FfiConverterOptionalString.allocationSize(value.`page`) +
             FfiConverterSequenceString.allocationSize(value.`tags`) +
             FfiConverterOptionalString.allocationSize(value.`source`) +
@@ -3921,7 +3943,7 @@ public object FfiConverterTypeNoteUpsert: FfiConverterRustBuffer<NoteUpsert> {
     override fun write(value: NoteUpsert, buf: ByteBuffer) {
             FfiConverterString.write(value.`id`, buf)
             FfiConverterOptionalString.write(value.`bookId`, buf)
-            FfiConverterString.write(value.`plaintext`, buf)
+            FfiConverterOptionalString.write(value.`plaintext`, buf)
             FfiConverterOptionalString.write(value.`page`, buf)
             FfiConverterSequenceString.write(value.`tags`, buf)
             FfiConverterOptionalString.write(value.`source`, buf)
@@ -4390,9 +4412,9 @@ public object FfiConverterTypeSearchDocKind: FfiConverterRustBuffer<SearchDocKin
 
 /**
  * Errors that cross the FFI from the sync engine. Coarse like [`crate::CryptoError`]: enough
- * for a host to distinguish store failures, network/sync failures, and invalid snapshot input,
- * never leaking key material or per-record server detail. Invalid snapshot-input reasons are
- * additionally sanitized so they never echo archive content.
+ * for a host to distinguish store failures, network/sync failures, invalid snapshot input, and
+ * an expected note-patch target race, never leaking key material or per-record server detail.
+ * Invalid snapshot-input reasons are additionally sanitized so they never echo archive content.
  */
 sealed class SyncException: kotlin.Exception() {
     
@@ -4420,6 +4442,16 @@ sealed class SyncException: kotlin.Exception() {
             get() = "v1=${ v1 }"
     }
     
+    /**
+     * A plaintext-free note patch lost its live local target between the host's read and write.
+     * Bulk patch flows may skip this note and re-query; this is not a generic store corruption.
+     */
+    class PatchTargetMissing(
+        ) : SyncException() {
+        override val message
+            get() = ""
+    }
+    
 
     companion object ErrorHandler : UniffiRustCallStatusErrorHandler<SyncException> {
         override fun lift(error_buf: RustBuffer.ByValue): SyncException = FfiConverterTypeSyncError.lift(error_buf)
@@ -4445,6 +4477,7 @@ public object FfiConverterTypeSyncError : FfiConverterRustBuffer<SyncException> 
             3 -> SyncException.InvalidImport(
                 FfiConverterString.read(buf),
                 )
+            4 -> SyncException.PatchTargetMissing()
             else -> throw RuntimeException("invalid error enum value, something is very wrong!!")
         }
     }
@@ -4466,6 +4499,10 @@ public object FfiConverterTypeSyncError : FfiConverterRustBuffer<SyncException> 
                 4UL
                 + FfiConverterString.allocationSize(value.v1)
             )
+            is SyncException.PatchTargetMissing -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL
+            )
         }
     }
 
@@ -4484,6 +4521,10 @@ public object FfiConverterTypeSyncError : FfiConverterRustBuffer<SyncException> 
             is SyncException.InvalidImport -> {
                 buf.putInt(3)
                 FfiConverterString.write(value.v1, buf)
+                Unit
+            }
+            is SyncException.PatchTargetMissing -> {
+                buf.putInt(4)
                 Unit
             }
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }

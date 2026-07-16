@@ -94,7 +94,7 @@ fn enqueue_full_graph(dev: &SyncEngine, user_id: &str) -> Ids {
     dev.enqueue_note(NoteUpsert {
         id: n1.clone(),
         book_id: Some(book.clone()),
-        plaintext: "first".into(),
+        plaintext: Some("first".into()),
         page: None,
         tags: vec![],
         source: None,
@@ -111,7 +111,7 @@ fn enqueue_full_graph(dev: &SyncEngine, user_id: &str) -> Ids {
     dev.enqueue_note(NoteUpsert {
         id: n2.clone(),
         book_id: Some(book.clone()),
-        plaintext: "second".into(),
+        plaintext: Some("second".into()),
         page: None,
         tags: vec![],
         source: None,
@@ -520,7 +520,7 @@ fn concurrent_membership_add_converges_to_one_row() {
         .enqueue_note(NoteUpsert {
             id: note.clone(),
             book_id: None,
-            plaintext: "n".into(),
+            plaintext: Some("n".into()),
             page: None,
             tags: vec![],
             source: None,
@@ -729,7 +729,7 @@ fn native_authors_cover_and_source_metadata_to_the_server() {
         .enqueue_note(NoteUpsert {
             id: note.clone(),
             book_id: Some(book.clone()),
-            plaintext: "a highlighted line".into(),
+            plaintext: Some("a highlighted line".into()),
             page: Some("12".into()),
             tags: vec!["stoicism".into()],
             source: Some("readwise".into()),

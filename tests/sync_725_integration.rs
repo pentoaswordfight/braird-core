@@ -77,7 +77,7 @@ fn pull_roundtrips_notes_and_books_from_the_server() {
         .enqueue_note(NoteUpsert {
             id: note_id.clone(),
             book_id: Some(book_id.clone()),
-            plaintext: plaintext.to_string(),
+            plaintext: Some(plaintext.to_string()),
             page: Some("38a".into()),
             tags: vec!["philosophy".into()],
             source: None,
@@ -185,7 +185,7 @@ fn pull_applies_tombstone_and_never_resurrects() {
         .enqueue_note(NoteUpsert {
             id: note_id.clone(),
             book_id: Some(book_id.clone()),
-            plaintext: "to be deleted".into(),
+            plaintext: Some("to be deleted".into()),
             page: None,
             tags: vec![],
             source: None,
@@ -216,7 +216,7 @@ fn pull_applies_tombstone_and_never_resurrects() {
         .enqueue_note(NoteUpsert {
             id: note_id.clone(),
             book_id: Some(book_id.clone()),
-            plaintext: "to be deleted".into(),
+            plaintext: Some("to be deleted".into()),
             page: None,
             tags: vec![],
             source: None,

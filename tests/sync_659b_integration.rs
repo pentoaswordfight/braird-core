@@ -107,7 +107,7 @@ fn flush_seals_text_and_upserts_via_token_handoff() {
         .enqueue_note(NoteUpsert {
             id: note_id.clone(),
             book_id: Some(book_id.clone()),
-            plaintext: plaintext.to_string(),
+            plaintext: Some(plaintext.to_string()),
             page: Some("38a".into()),
             tags: vec!["philosophy".into()],
             source: None,
@@ -141,7 +141,7 @@ fn flush_seals_text_and_upserts_via_token_handoff() {
         .as_array()
         .and_then(|a| a.first())
         .expect("note row present");
-    let server_text = row["text"].as_str().expect("text is a string");
+    let server_text = row["text"].as_str().expect("text is a string").to_string();
     assert!(
         server_text.starts_with("enc:v2:"),
         "text must be enc:v2 ciphertext, got: {server_text}"
@@ -152,13 +152,20 @@ fn flush_seals_text_and_upserts_via_token_handoff() {
     );
 
     // (c) content_tag present + correct: recompute from the plaintext and compare (64-hex HMAC).
-    let server_tag = row["content_tag"].as_str().expect("content_tag present");
+    let server_tag = row["content_tag"]
+        .as_str()
+        .expect("content_tag present")
+        .to_string();
     let expected_tag = vault.content_tag(plaintext.to_string(), Some(book_id.clone()));
     assert_eq!(
         server_tag, expected_tag,
         "content_tag must match the plaintext-derived HMAC"
     );
     assert_eq!(server_tag.len(), 64, "content_tag is 64-hex");
+    let server_created_at = row["created_at"].clone();
+    let server_updated_at = row["updated_at"]
+        .as_i64()
+        .expect("updated_at is an integer");
 
     // (d) token handoff already proven by the successful upsert; also assert the book landed.
     let books = test_support::select(
@@ -178,6 +185,66 @@ fn flush_seals_text_and_upserts_via_token_handoff() {
         store.outbox_items().expect("outbox").is_empty(),
         "outbox cleared after successful flush"
     );
+
+    // SUR-921: a plaintext-free targeted PATCH must be accepted without a text key, and the
+    // server's sealed/immutable columns must survive byte-for-byte.
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    engine
+        .enqueue_note(NoteUpsert {
+            id: note_id.clone(),
+            book_id: None,
+            plaintext: None,
+            page: None,
+            tags: vec!["ethics".into()],
+            source: None,
+            source_id: None,
+            source_meta_json: None,
+            chapter: None,
+            image_path: None,
+            ink_crop_path: None,
+            created_at: 9_999_999_999_999,
+            deleted: false,
+            clear_nullable_fields: vec![],
+        })
+        .expect("enqueue plaintext-free note patch");
+
+    let store = Store::open(&db_path).expect("inspect patch outbox");
+    let queued = store.outbox_items().expect("patch outbox");
+    assert_eq!(queued.len(), 1, "one tags-only patch queued");
+    let patch_payload: serde_json::Value =
+        serde_json::from_str(&queued[0].3).expect("patch payload JSON");
+    for key in ["text", "content_tag", "created_at"] {
+        assert!(
+            patch_payload.get(key).is_none(),
+            "{key} must be absent from the outgoing patch"
+        );
+    }
+
+    let patch_summary = engine.flush().expect("flush plaintext-free patch");
+    assert_eq!(patch_summary.pushed, 1);
+    assert_eq!(patch_summary.still_queued, 0);
+
+    let patched_notes = test_support::select(
+        &env,
+        &user.access_token,
+        "notes",
+        &format!("id=eq.{note_id}"),
+    );
+    let patched = patched_notes
+        .as_array()
+        .and_then(|rows| rows.first())
+        .expect("patched note row present");
+    assert_eq!(patched["tags"], json!(["ethics"]));
+    assert!(
+        patched["updated_at"]
+            .as_i64()
+            .expect("patched updated_at is an integer")
+            > server_updated_at,
+        "the patch must advance server updated_at"
+    );
+    assert_eq!(patched["text"], json!(server_text));
+    assert_eq!(patched["content_tag"], json!(server_tag));
+    assert_eq!(patched["created_at"], server_created_at);
 
     let _ = std::fs::remove_file(&db_path);
 }

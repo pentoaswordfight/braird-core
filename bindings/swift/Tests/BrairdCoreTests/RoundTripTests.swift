@@ -286,6 +286,56 @@ final class RoundTripTests: XCTestCase {
                 clearNullableFields: [])))
     }
 
+    /// SUR-921: nil plaintext reaches the existing-row patch path, so a Vault that cannot
+    /// decrypt the note can still retag it without replacing its ciphertext.
+    func testTagsOnlyNotePatchOverFfi() throws {
+        let db = FileManager.default.temporaryDirectory
+            .appendingPathComponent("braird-rt-\(UUID().uuidString).sqlite")
+        let vaultA = Vault.generate()
+        let writer = try SyncEngine.open(
+            dbPath: db.path, supabaseUrl: "https://x.supabase.co", anonKey: "anon",
+            vault: vaultA)
+        try writer.enqueueNote(draft: NoteUpsert(
+            id: "n1", bookId: nil, plaintext: "secret from vault A", page: nil,
+            tags: ["before"], source: "kindle", sourceId: nil, sourceMetaJson: nil,
+            chapter: nil, imagePath: nil, inkCropPath: nil, createdAt: 10, deleted: false,
+            clearNullableFields: []))
+
+        let foreign = try SyncEngine.open(
+            dbPath: db.path, supabaseUrl: "https://x.supabase.co", anonKey: "anon",
+            vault: Vault.generate())
+        let before = try XCTUnwrap(try foreign.getNote(id: "n1"))
+        XCTAssertTrue(before.decryptFailed)
+        XCTAssertNil(before.text)
+
+        try foreign.enqueueNote(draft: NoteUpsert(
+            id: "n1", bookId: nil, plaintext: nil, page: nil, tags: ["after"],
+            source: nil, sourceId: nil, sourceMetaJson: nil, chapter: nil, imagePath: nil,
+            inkCropPath: nil, createdAt: 999, deleted: false, clearNullableFields: []))
+        let stillForeign = try XCTUnwrap(try foreign.getNote(id: "n1"))
+        XCTAssertTrue(stillForeign.decryptFailed)
+        XCTAssertEqual(stillForeign.tags, ["after"])
+
+        let reader = try SyncEngine.open(
+            dbPath: db.path, supabaseUrl: "https://x.supabase.co", anonKey: "anon",
+            vault: vaultA)
+        let recovered = try XCTUnwrap(try reader.getNote(id: "n1"))
+        XCTAssertFalse(recovered.decryptFailed)
+        XCTAssertEqual(recovered.text, "secret from vault A")
+        XCTAssertEqual(recovered.tags, ["after"])
+        XCTAssertEqual(recovered.source, "kindle")
+        XCTAssertEqual(recovered.createdAt, 10)
+
+        XCTAssertThrowsError(
+            try foreign.enqueueNote(draft: NoteUpsert(
+                id: "missing", bookId: nil, plaintext: nil, page: nil, tags: ["after"],
+                source: nil, sourceId: nil, sourceMetaJson: nil, chapter: nil, imagePath: nil,
+                inkCropPath: nil, createdAt: 999, deleted: false, clearNullableFields: []))
+        ) { error in
+            XCTAssertEqual(error as? SyncError, SyncError.PatchTargetMissing)
+        }
+    }
+
     /// SUR-744: the read/query surface over the FFI — list/get/counts/search against a populated
     /// store. Proves note text crosses the binding as decrypted PLAINTEXT (never an `enc:` sentinel,
     /// AC #2), the Library note-count badge, newest-first ordering, and lexical-search parity

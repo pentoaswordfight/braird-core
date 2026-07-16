@@ -9,7 +9,9 @@
 //!   4. a row whose FK points at a failed/held parent this run stays queued (no server FK
 //!      violation); on success a book records temp→server in the persisted remap, saved after the
 //!      books pass and before any child table needs it;
-//!   5. clear only the succeeded outbox ids; failed/held groups stay queued for the next flush.
+//!   5. a collapsed notes group with no `text` uses targeted PATCH, because PostgREST upsert checks
+//!      the NOT-NULL insert shape before conflict update; a group carrying `text` still upserts;
+//!   6. clear only the succeeded outbox ids; failed/held groups stay queued for the next flush.
 //!
 //! One ordered pass replaces SUR-724's hard-coded books-then-notes loops. It also closes a latent
 //! bug that pre-dated the fan-out: the old flush dispatched ONLY `books`/`notes` groups, so a queued
@@ -141,7 +143,12 @@ pub async fn flush<S: PostgrestSink>(
                 continue;
             }
 
-            match upsert_group(sink, &group, user_id).await {
+            let write_result = if table == "notes" && !group.payload.contains_key("text") {
+                patch_group(sink, &group, on_conflict_for(table), &record_id).await
+            } else {
+                upsert_group(sink, &group, user_id).await
+            };
+            match write_result {
                 Ok(()) => {
                     result.ok.extend(&group.ids);
                     // A book that flushed under a temp id and carries its server id maps temp→server
@@ -193,6 +200,21 @@ async fn upsert_group<S: PostgrestSink>(
         .await
 }
 
+/// Patch one existing row without constructing an INSERT candidate. This is required for a
+/// plaintext-free notes partial: `notes.text` is NOT NULL, so PostgREST upsert rejects a sparse
+/// payload before its conflict UPDATE can preserve the existing ciphertext.
+async fn patch_group<S: PostgrestSink>(
+    sink: &S,
+    group: &Collapsed,
+    primary_key: &str,
+    record_id: &str,
+) -> Result<(), String> {
+    let mut row = group.payload.clone();
+    row.remove(primary_key);
+    sink.patch(&group.table, primary_key, record_id, &Value::Object(row))
+        .await
+}
+
 fn load_remap(store: &Store) -> Result<BTreeMap<String, String>, String> {
     match store
         .meta_get(BOOK_ID_REMAP_KEY)
@@ -227,6 +249,7 @@ mod tests {
     struct VecSink {
         calls: RefCell<Vec<String>>,
         conflicts: RefCell<Vec<(String, String)>>,
+        patches: RefCell<Vec<(String, String, String, Value)>>,
         fail_table: Option<String>,
     }
 
@@ -241,6 +264,25 @@ mod tests {
             self.conflicts
                 .borrow_mut()
                 .push((table.to_string(), on_conflict.to_string()));
+            match &self.fail_table {
+                Some(t) if t == table => Err(format!("{table} sink error")),
+                _ => Ok(()),
+            }
+        }
+
+        async fn patch(
+            &self,
+            table: &str,
+            primary_key: &str,
+            record_id: &str,
+            row: &Value,
+        ) -> Result<(), String> {
+            self.patches.borrow_mut().push((
+                table.to_string(),
+                primary_key.to_string(),
+                record_id.to_string(),
+                row.clone(),
+            ));
             match &self.fail_table {
                 Some(t) if t == table => Err(format!("{table} sink error")),
                 _ => Ok(()),
@@ -262,6 +304,7 @@ mod tests {
         VecSink {
             calls: RefCell::new(Vec::new()),
             conflicts: RefCell::new(Vec::new()),
+            patches: RefCell::new(Vec::new()),
             fail_table: fail_table.map(String::from),
         }
     }
@@ -304,6 +347,68 @@ mod tests {
         );
         assert_eq!(res.ok.len(), 2);
         assert!(res.failed.is_empty());
+    }
+
+    #[test]
+    fn plaintext_free_note_flush_uses_targeted_patch() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .enqueue(
+                "notes",
+                "n1",
+                r#"{"id":"n1","tags":["after"],"updated_at":20,"deleted":false}"#,
+                100,
+            )
+            .unwrap();
+
+        let sink = sink(None);
+        let result = block(flush(&store, &sink, "user-1")).unwrap();
+
+        assert!(
+            sink.calls.borrow().is_empty(),
+            "sparse note must not upsert"
+        );
+        let patches = sink.patches.borrow();
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0].0, "notes");
+        assert_eq!(patches[0].1, "id");
+        assert_eq!(patches[0].2, "n1");
+        assert_eq!(patches[0].3["tags"], json!(["after"]));
+        assert!(patches[0].3.get("id").is_none());
+        assert!(patches[0].3.get("user_id").is_none());
+        assert!(patches[0].3.get("text").is_none());
+        assert!(patches[0].3.get("content_tag").is_none());
+        assert_eq!(result.ok.len(), 1);
+        assert!(result.failed.is_empty());
+    }
+
+    #[test]
+    fn unflushed_note_create_then_patch_still_upserts_the_collapsed_full_row() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .enqueue(
+                "notes",
+                "n1",
+                r#"{"id":"n1","text":"enc:v2:create","content_tag":"tag","created_at":10,"tags":["before"],"updated_at":10,"deleted":false}"#,
+                100,
+            )
+            .unwrap();
+        store
+            .enqueue(
+                "notes",
+                "n1",
+                r#"{"id":"n1","tags":["after"],"updated_at":20,"deleted":false}"#,
+                200,
+            )
+            .unwrap();
+
+        let sink = sink(None);
+        let result = block(flush(&store, &sink, "user-1")).unwrap();
+
+        assert_eq!(*sink.calls.borrow(), vec!["notes".to_string()]);
+        assert!(sink.patches.borrow().is_empty());
+        assert_eq!(result.ok.len(), 2);
+        assert!(result.failed.is_empty());
     }
 
     #[test]
