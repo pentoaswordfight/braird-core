@@ -6,6 +6,14 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-07-16
+
+Eleventh release batch. **SUR-921** adds the true tags-only note patch required by the native
+idea-merge flows: hosts can omit plaintext for an existing live note, preserving its sealed text
+and content tag byte-for-byte while changing tags and other safe partial fields. The breaking
+pre-1.0 FFI record/error change ships with regenerated Swift and Kotlin bindings, typed
+missing-target recovery, and a targeted server PATCH path for sparse note writes.
+
 ### Added
 
 - **SUR-921 — true tags-only note patches with optional plaintext.** Change
@@ -18,8 +26,8 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   `SyncError::PatchTargetMissing` host contract. Patch mode rejects setting or clearing `book_id`,
   because the content tag is book-scoped and cannot be recomputed without plaintext. Sparse note
   groups flush through a targeted server `PATCH`; collapsed create-then-patch groups still carry
-  `text` and use the normal upsert path. This is a breaking pre-1.0 FFI record/error change intended
-  for the separately cut v0.7.0 release; this change does not cut or publish it.
+  `text` and use the normal upsert path. This is a breaking pre-1.0 FFI record/error change released
+  in v0.7.0.
 
 ## [0.6.0] - 2026-07-15
 
