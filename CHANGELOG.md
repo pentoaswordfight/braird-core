@@ -6,6 +6,18 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+### Added
+
+- **SUR-921 — true tags-only note patches with optional plaintext.** Change
+  `NoteUpsert.plaintext` to an optional field across Rust and the regenerated Kotlin/Swift
+  bindings. `Some` retains the existing seal-at-write behavior; `None` patches only an existing
+  live note, makes no Vault call, and omits `text`, `content_tag`, and `created_at` so ciphertext,
+  its tag, and the immutable creation stamp remain byte-identical. Patch-mode `source: None`
+  likewise means keep instead of defaulting to `"manual"`, enabling decrypt-failed notes to be
+  retagged safely. Missing or already-tombstoned targets surface as the dedicated
+  `SyncError::PatchTargetMissing` host contract. This is a breaking pre-1.0 FFI record/error
+  change intended for the separately cut v0.7.0 release; this change does not cut or publish it.
+
 ## [0.6.0] - 2026-07-15
 
 Tenth release batch. **SUR-918** publishes the checksum-pinned paired canon assets, and **SUR-911**
