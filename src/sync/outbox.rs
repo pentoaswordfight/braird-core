@@ -179,6 +179,88 @@ mod tests {
     }
 
     #[test]
+    fn later_tags_only_patch_keeps_earlier_note_sealed_columns() {
+        let items = vec![
+            item(
+                1,
+                "notes",
+                "n1",
+                100,
+                json!({
+                    "id": "n1",
+                    "text": "enc:v2:create",
+                    "content_tag": "tag-create",
+                    "created_at": 10,
+                    "tags": ["before"],
+                    "updated_at": 10,
+                    "deleted": false
+                }),
+            ),
+            item(
+                2,
+                "notes",
+                "n1",
+                200,
+                json!({
+                    "id": "n1",
+                    "tags": ["after"],
+                    "updated_at": 20,
+                    "deleted": false
+                }),
+            ),
+        ];
+
+        let out = collapse(items, &BTreeMap::new());
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].payload["text"], json!("enc:v2:create"));
+        assert_eq!(out[0].payload["content_tag"], json!("tag-create"));
+        assert_eq!(out[0].payload["created_at"], json!(10));
+        assert_eq!(out[0].payload["tags"], json!(["after"]));
+        assert_eq!(out[0].payload["updated_at"], json!(20));
+    }
+
+    #[test]
+    fn later_full_note_write_replaces_earlier_patch_sealed_columns() {
+        let items = vec![
+            item(
+                1,
+                "notes",
+                "n1",
+                100,
+                json!({
+                    "id": "n1",
+                    "tags": ["patch"],
+                    "updated_at": 10,
+                    "deleted": false
+                }),
+            ),
+            item(
+                2,
+                "notes",
+                "n1",
+                200,
+                json!({
+                    "id": "n1",
+                    "text": "enc:v2:full",
+                    "content_tag": "tag-full",
+                    "created_at": 30,
+                    "tags": ["full"],
+                    "updated_at": 30,
+                    "deleted": false
+                }),
+            ),
+        ];
+
+        let out = collapse(items, &BTreeMap::new());
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].payload["text"], json!("enc:v2:full"));
+        assert_eq!(out[0].payload["content_tag"], json!("tag-full"));
+        assert_eq!(out[0].payload["created_at"], json!(30));
+        assert_eq!(out[0].payload["tags"], json!(["full"]));
+        assert_eq!(out[0].payload["updated_at"], json!(30));
+    }
+
+    #[test]
     fn out_of_order_arrival_still_resolves_by_created_at() {
         // Enqueued out of order (higher id is older): created_at, not id, decides LWW.
         let items = vec![
