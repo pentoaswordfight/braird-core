@@ -37,7 +37,8 @@ use crate::store::{synced_table_names, StageExistingWriteError, Store};
 use crate::vault::Vault;
 use http::{user_id_from_jwt, PostgrestClient};
 use read::{
-    BookRecord, CollectionRecord, CustomIdeaRecord, IdeaCount, LensRecord, NoteRecord, StoreCounts,
+    BookRecord, CollectionNoteCount, CollectionRecord, CustomIdeaRecord, IdeaCount, LensRecord,
+    NoteLinkRecord, NoteRecord, StoreCounts,
 };
 use reconcile::BookMergeUndo;
 
@@ -903,6 +904,47 @@ impl SyncEngine {
     pub fn untagged_notes_count(&self) -> Result<u32, SyncError> {
         let store = lock!(self.store);
         read::untagged_notes_count(&store).map_err(store_err)
+    }
+
+    // ── relation reads (SUR-923) ─────────────────────────────────────────────
+    // Extension #3 of the read surface: the membership + note-link relations, traversed in both
+    // directions, for the note action sheets (Add-to-collection, Add-the-margins) and the Lexicon
+    // manage flows (collection delete cascade, per-collection counts). Same soft-delete-excluding
+    // contract; no decryption anywhere — no note text is involved.
+
+    /// Ids of the live collections containing the note (SUR-923) — the AddToCollectionSheet's
+    /// member set. Live membership rows only; no collection-liveness or notes join (the PWA
+    /// `memberIds` oracle — the sheet filters its rendered rows to live collections itself).
+    pub fn collection_ids_for_note(&self, note_id: String) -> Result<Vec<String>, SyncError> {
+        let store = lock!(self.store);
+        read::collection_ids_for_note(&store, &note_id).map_err(store_err)
+    }
+
+    /// Live note-link edges where the note is either endpoint (SUR-923) — one hop, both
+    /// directions; the host filters direction ("children of this parent" = the note is the
+    /// link's `from` side; "parent of this child" = it is the `to` side) and by relation type
+    /// (Add-the-margins / parent-aware sheet options).
+    pub fn note_links_for_note(&self, note_id: String) -> Result<Vec<NoteLinkRecord>, SyncError> {
+        let store = lock!(self.store);
+        read::note_links_for_note(&store, &note_id).map_err(store_err)
+    }
+
+    /// Live member note ids of a collection (SUR-923) — feeds the host-side collection-delete
+    /// cascade (which must see memberships of already-deleted notes, so: deliberately no notes
+    /// join) and the collection-scoped note list (which re-checks note liveness host-side, as
+    /// the PWA's `notesInCollection` does).
+    pub fn note_ids_for_collection(&self, collection_id: String) -> Result<Vec<String>, SyncError> {
+        let store = lock!(self.store);
+        read::note_ids_for_collection(&store, &collection_id).map_err(store_err)
+    }
+
+    /// Per-collection live-note counts (SUR-923) — the Lexicon Collections tab subtitles, one
+    /// row per collection sorted by collection id, only counts ≥ 1. Counts memberships
+    /// whose note is present and live — a founder-decided (2026-07-17) divergence from the PWA's
+    /// raw membership tally, keeping the subtitle consistent with the scoped note list.
+    pub fn collection_note_counts(&self) -> Result<Vec<CollectionNoteCount>, SyncError> {
+        let store = lock!(self.store);
+        read::collection_note_counts(&store).map_err(store_err)
     }
 
     // ── duplicate-resolution merge contract (SUR-915) ─────────────────────────

@@ -488,6 +488,62 @@ final class RoundTripTests: XCTestCase {
         XCTAssertEqual(lens.threshold, 75)
     }
 
+    /// SUR-923: the relation reads over the FFI — memberships traversed in both directions,
+    /// note-link edges (both endpoints), and the per-collection live-note counts (which join live
+    /// notes by founder decision, while note-ids stays join-free for the delete cascade).
+    func testRelationReadsOverFfi() throws {
+        let db = FileManager.default.temporaryDirectory
+            .appendingPathComponent("braird-rel-\(UUID().uuidString).sqlite")
+        let engine = try SyncEngine.open(
+            dbPath: db.path, supabaseUrl: "https://x.supabase.co", anonKey: "anon",
+            vault: Vault.generate())
+
+        func note(_ id: String, _ createdAt: Int64, deleted: Bool = false) -> NoteUpsert {
+            NoteUpsert(
+                id: id, bookId: nil, plaintext: "text-\(id)", page: nil, tags: [],
+                source: nil, sourceId: nil, sourceMetaJson: nil, chapter: nil, imagePath: nil,
+                inkCropPath: nil, createdAt: createdAt, deleted: deleted, clearNullableFields: [])
+        }
+        try engine.enqueueNote(draft: note("n1", 10))
+        try engine.enqueueNote(draft: note("n2", 20))
+        try engine.enqueueNote(draft: note("ndead", 30, deleted: true))
+
+        try engine.enqueueCollection(id: "beta", name: "Beta", createdAt: 1, deleted: false)
+        try engine.enqueueCollectionMembership(noteId: "n1", collectionId: "beta", createdAt: 100, deleted: false)
+        try engine.enqueueCollectionMembership(noteId: "n2", collectionId: "beta", createdAt: 200, deleted: false)
+        try engine.enqueueCollectionMembership(noteId: "ndead", collectionId: "beta", createdAt: 300, deleted: false)
+        try engine.enqueueCollectionMembership(noteId: "n1", collectionId: "alpha", createdAt: 400, deleted: false)
+        try engine.enqueueCollectionMembership(noteId: "n1", collectionId: "gone", createdAt: 500, deleted: true)
+
+        // collection-ids-for-note: live membership rows only, newest-first, no collection/notes join.
+        XCTAssertEqual(try engine.collectionIdsForNote(noteId: "n1"), ["alpha", "beta"])
+
+        // note-ids-for-collection: join-free — ndead's membership stays visible for the cascade.
+        XCTAssertEqual(try engine.noteIdsForCollection(collectionId: "beta"), ["ndead", "n2", "n1"])
+
+        // collection-note-counts: joins live notes (ndead excluded), collection-id asc, count ≥ 1.
+        let counts = try engine.collectionNoteCounts().map { [$0.collectionId: $0.count] }
+        XCTAssertEqual(counts, [["alpha": 1], ["beta": 2]])
+
+        // note links: both endpoints returned; relation_type defaulted by enqueue when nil.
+        try engine.enqueueNoteLink(
+            id: "e1", fromNoteId: "parent", toNoteId: "n1", relationType: nil,
+            createdAt: 100, deleted: false)
+        try engine.enqueueNoteLink(
+            id: "e2", fromNoteId: "n1", toNoteId: "child", relationType: "handwritten_annotation",
+            createdAt: 200, deleted: false)
+        try engine.enqueueNoteLink(
+            id: "e3", fromNoteId: "a", toNoteId: "b", relationType: nil,
+            createdAt: 300, deleted: false)
+
+        let links = try engine.noteLinksForNote(noteId: "n1")
+        XCTAssertEqual(links.map { $0.id }, ["e2", "e1"])
+        let e1 = links.first { $0.id == "e1" }!
+        XCTAssertEqual(e1.fromNoteId, "parent")
+        XCTAssertEqual(e1.toNoteId, "n1")
+        XCTAssertEqual(e1.relationType, "handwritten_annotation")
+    }
+
     /// SUR-915: the duplicate-resolution merge verbs over the FFI — merge_books (+ undo) and the
     /// content-merge wrapper. Proves the undo token round-trips as a record, book merge rehomes
     /// notes + tombstones the loser, undo restores, and merge_content_duplicates collapses into a

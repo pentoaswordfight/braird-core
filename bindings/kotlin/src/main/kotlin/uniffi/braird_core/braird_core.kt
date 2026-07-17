@@ -808,6 +808,14 @@ internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
 
 
 
+
+
+
+
+
+
+
+
 // A JNA Library to expose the extern-C FFI definitions.
 // This is an implementation detail which will be called internally by the public API.
 
@@ -833,6 +841,10 @@ internal interface UniffiLib : Library {
     ): Unit
     fun uniffi_braird_core_fn_constructor_syncengine_open(`dbPath`: RustBuffer.ByValue,`supabaseUrl`: RustBuffer.ByValue,`anonKey`: RustBuffer.ByValue,`vault`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Pointer
+    fun uniffi_braird_core_fn_method_syncengine_collection_ids_for_note(`ptr`: Pointer,`noteId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_braird_core_fn_method_syncengine_collection_note_counts(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_syncengine_counts(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_syncengine_enqueue_book(`ptr`: Pointer,`draft`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -877,6 +889,10 @@ internal interface UniffiLib : Library {
     ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_syncengine_merge_content_duplicates(`ptr`: Pointer,`survivorId`: RustBuffer.ByValue,`loserIds`: RustBuffer.ByValue,`allowCrossCluster`: Byte,uniffi_out_err: UniffiRustCallStatus, 
     ): Int
+    fun uniffi_braird_core_fn_method_syncengine_note_ids_for_collection(`ptr`: Pointer,`collectionId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_braird_core_fn_method_syncengine_note_links_for_note(`ptr`: Pointer,`noteId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_syncengine_notes_by_idea(`ptr`: Pointer,`idea`: RustBuffer.ByValue,`limit`: Int,`offset`: Int,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_syncengine_notes_this_week(`ptr`: Pointer,`nowMs`: Long,uniffi_out_err: UniffiRustCallStatus, 
@@ -1041,6 +1057,10 @@ internal interface UniffiLib : Library {
     ): Unit
     fun uniffi_braird_core_checksum_func_membership_id(
     ): Short
+    fun uniffi_braird_core_checksum_method_syncengine_collection_ids_for_note(
+    ): Short
+    fun uniffi_braird_core_checksum_method_syncengine_collection_note_counts(
+    ): Short
     fun uniffi_braird_core_checksum_method_syncengine_counts(
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_enqueue_book(
@@ -1084,6 +1104,10 @@ internal interface UniffiLib : Library {
     fun uniffi_braird_core_checksum_method_syncengine_merge_books(
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_merge_content_duplicates(
+    ): Short
+    fun uniffi_braird_core_checksum_method_syncengine_note_ids_for_collection(
+    ): Short
+    fun uniffi_braird_core_checksum_method_syncengine_note_links_for_note(
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_notes_by_idea(
     ): Short
@@ -1151,6 +1175,12 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_braird_core_checksum_func_membership_id() != 9610.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_braird_core_checksum_method_syncengine_collection_ids_for_note() != 41507.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_braird_core_checksum_method_syncengine_collection_note_counts() != 26206.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_braird_core_checksum_method_syncengine_counts() != 34830.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1215,6 +1245,12 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_merge_content_duplicates() != 26022.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_braird_core_checksum_method_syncengine_note_ids_for_collection() != 25011.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_braird_core_checksum_method_syncengine_note_links_for_note() != 10271.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_notes_by_idea() != 21049.toShort()) {
@@ -1695,6 +1731,21 @@ private class JavaLangRefCleanable(
 public interface SyncEngineInterface {
     
     /**
+     * Ids of the live collections containing the note (SUR-923) — the AddToCollectionSheet's
+     * member set. Live membership rows only; no collection-liveness or notes join (the PWA
+     * `memberIds` oracle — the sheet filters its rendered rows to live collections itself).
+     */
+    fun `collectionIdsForNote`(`noteId`: kotlin.String): List<kotlin.String>
+    
+    /**
+     * Per-collection live-note counts (SUR-923) — the Lexicon Collections tab subtitles, one
+     * row per collection sorted by collection id, only counts ≥ 1. Counts memberships
+     * whose note is present and live — a founder-decided (2026-07-17) divergence from the PWA's
+     * raw membership tally, keeping the subtitle consistent with the scoped note list.
+     */
+    fun `collectionNoteCounts`(): List<CollectionNoteCount>
+    
+    /**
      * Live (non-deleted) row totals for books / notes / custom ideas, plus `active_ideas` — the
      * count of distinct idea tags on live notes (the Home stat row, SUR-806).
      */
@@ -1897,6 +1948,22 @@ public interface SyncEngineInterface {
     fun `mergeContentDuplicates`(`survivorId`: kotlin.String, `loserIds`: List<kotlin.String>, `allowCrossCluster`: kotlin.Boolean): kotlin.UInt
     
     /**
+     * Live member note ids of a collection (SUR-923) — feeds the host-side collection-delete
+     * cascade (which must see memberships of already-deleted notes, so: deliberately no notes
+     * join) and the collection-scoped note list (which re-checks note liveness host-side, as
+     * the PWA's `notesInCollection` does).
+     */
+    fun `noteIdsForCollection`(`collectionId`: kotlin.String): List<kotlin.String>
+    
+    /**
+     * Live note-link edges where the note is either endpoint (SUR-923) — one hop, both
+     * directions; the host filters direction ("children of this parent" = the note is the
+     * link's `from` side; "parent of this child" = it is the `to` side) and by relation type
+     * (Add-the-margins / parent-aware sheet options).
+     */
+    fun `noteLinksForNote`(`noteId`: kotlin.String): List<NoteLinkRecord>
+    
+    /**
      * Live notes carrying `idea` as an idea tag, newest-first, decrypted in core (SUR-858) — the
      * Commonplace idea filter / IdeaDetail / RelatedNotes. `idea` is the raw tag string (== a
      * `CustomIdeaRecord.name`, == an `IdeaCount.idea`); the match is exact.
@@ -2074,6 +2141,43 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
             UniffiLib.INSTANCE.uniffi_braird_core_fn_clone_syncengine(pointer!!, status)
         }
     }
+
+    
+    /**
+     * Ids of the live collections containing the note (SUR-923) — the AddToCollectionSheet's
+     * member set. Live membership rows only; no collection-liveness or notes join (the PWA
+     * `memberIds` oracle — the sheet filters its rendered rows to live collections itself).
+     */
+    @Throws(SyncException::class)override fun `collectionIdsForNote`(`noteId`: kotlin.String): List<kotlin.String> {
+            return FfiConverterSequenceString.lift(
+    callWithPointer {
+    uniffiRustCallWithError(SyncException) { _status ->
+    UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_collection_ids_for_note(
+        it, FfiConverterString.lower(`noteId`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * Per-collection live-note counts (SUR-923) — the Lexicon Collections tab subtitles, one
+     * row per collection sorted by collection id, only counts ≥ 1. Counts memberships
+     * whose note is present and live — a founder-decided (2026-07-17) divergence from the PWA's
+     * raw membership tally, keeping the subtitle consistent with the scoped note list.
+     */
+    @Throws(SyncException::class)override fun `collectionNoteCounts`(): List<CollectionNoteCount> {
+            return FfiConverterSequenceTypeCollectionNoteCount.lift(
+    callWithPointer {
+    uniffiRustCallWithError(SyncException) { _status ->
+    UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_collection_note_counts(
+        it, _status)
+}
+    }
+    )
+    }
+    
 
     
     /**
@@ -2505,6 +2609,44 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
     uniffiRustCallWithError(SyncException) { _status ->
     UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_merge_content_duplicates(
         it, FfiConverterString.lower(`survivorId`),FfiConverterSequenceString.lower(`loserIds`),FfiConverterBoolean.lower(`allowCrossCluster`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * Live member note ids of a collection (SUR-923) — feeds the host-side collection-delete
+     * cascade (which must see memberships of already-deleted notes, so: deliberately no notes
+     * join) and the collection-scoped note list (which re-checks note liveness host-side, as
+     * the PWA's `notesInCollection` does).
+     */
+    @Throws(SyncException::class)override fun `noteIdsForCollection`(`collectionId`: kotlin.String): List<kotlin.String> {
+            return FfiConverterSequenceString.lift(
+    callWithPointer {
+    uniffiRustCallWithError(SyncException) { _status ->
+    UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_note_ids_for_collection(
+        it, FfiConverterString.lower(`collectionId`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * Live note-link edges where the note is either endpoint (SUR-923) — one hop, both
+     * directions; the host filters direction ("children of this parent" = the note is the
+     * link's `from` side; "parent of this child" = it is the `to` side) and by relation type
+     * (Add-the-margins / parent-aware sheet options).
+     */
+    @Throws(SyncException::class)override fun `noteLinksForNote`(`noteId`: kotlin.String): List<NoteLinkRecord> {
+            return FfiConverterSequenceTypeNoteLinkRecord.lift(
+    callWithPointer {
+    uniffiRustCallWithError(SyncException) { _status ->
+    UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_note_links_for_note(
+        it, FfiConverterString.lower(`noteId`),_status)
 }
     }
     )
@@ -3418,6 +3560,47 @@ public object FfiConverterTypeBookUpsert: FfiConverterRustBuffer<BookUpsert> {
 
 
 /**
+ * One row of the per-collection live-note tally (SUR-923) — the Lexicon Collections tab's
+ * "N notes" subtitles, shaped like [`IdeaCount`]. Founder decision (2026-07-17): a membership
+ * counts only when its note row is **present and live** — a deliberate divergence from the PWA's
+ * `noteCountByCollection` (a raw live-membership tally, no notes join), matching the read-time
+ * scope resolver `notesInCollection` and this core's [`idea_counts`] instead, so the subtitle
+ * agrees with what the collection-scoped note list shows. Only `count ≥ 1` rows appear (hosts
+ * default a missing collection to 0). No decryption: ids are plaintext.
+ */
+data class CollectionNoteCount (
+    var `collectionId`: kotlin.String, 
+    var `count`: kotlin.UInt
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeCollectionNoteCount: FfiConverterRustBuffer<CollectionNoteCount> {
+    override fun read(buf: ByteBuffer): CollectionNoteCount {
+        return CollectionNoteCount(
+            FfiConverterString.read(buf),
+            FfiConverterUInt.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: CollectionNoteCount) = (
+            FfiConverterString.allocationSize(value.`collectionId`) +
+            FfiConverterUInt.allocationSize(value.`count`)
+    )
+
+    override fun write(value: CollectionNoteCount, buf: ByteBuffer) {
+            FfiConverterString.write(value.`collectionId`, buf)
+            FfiConverterUInt.write(value.`count`, buf)
+    }
+}
+
+
+
+/**
  * A collection for the Lexicon list (SUR-858). A **bare** descriptor row — no membership count
  * (the consuming screen doesn't render one yet; add it only when it does). No crypto: every column
  * is plaintext metadata.
@@ -3770,6 +3953,62 @@ public object FfiConverterTypeNoteBookAssignment: FfiConverterRustBuffer<NoteBoo
     override fun write(value: NoteBookAssignment, buf: ByteBuffer) {
             FfiConverterString.write(value.`noteId`, buf)
             FfiConverterOptionalString.write(value.`priorBookId`, buf)
+    }
+}
+
+
+
+/**
+ * One live `note_links` edge (SUR-923) — the parent↔margin relation for the note action sheets.
+ * `from_note_id` is the parent (the printed/typed source note), `to_note_id` the margin child —
+ * exactly the PWA's row shape (`saveNoteLink`, `db.js`). `relation_type` is always written by
+ * `enqueue_note_link` (defaults `handwritten_annotation`, the only value in existence) but read
+ * defensively as `Option`, like [`LensRecord`]'s `combinator`. No crypto: link rows are plaintext
+ * metadata — the note text they relate stays in `notes`.
+ */
+data class NoteLinkRecord (
+    var `id`: kotlin.String, 
+    var `fromNoteId`: kotlin.String, 
+    var `toNoteId`: kotlin.String, 
+    var `relationType`: kotlin.String?, 
+    var `createdAt`: kotlin.Long, 
+    var `updatedAt`: kotlin.Long
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeNoteLinkRecord: FfiConverterRustBuffer<NoteLinkRecord> {
+    override fun read(buf: ByteBuffer): NoteLinkRecord {
+        return NoteLinkRecord(
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterLong.read(buf),
+            FfiConverterLong.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: NoteLinkRecord) = (
+            FfiConverterString.allocationSize(value.`id`) +
+            FfiConverterString.allocationSize(value.`fromNoteId`) +
+            FfiConverterString.allocationSize(value.`toNoteId`) +
+            FfiConverterOptionalString.allocationSize(value.`relationType`) +
+            FfiConverterLong.allocationSize(value.`createdAt`) +
+            FfiConverterLong.allocationSize(value.`updatedAt`)
+    )
+
+    override fun write(value: NoteLinkRecord, buf: ByteBuffer) {
+            FfiConverterString.write(value.`id`, buf)
+            FfiConverterString.write(value.`fromNoteId`, buf)
+            FfiConverterString.write(value.`toNoteId`, buf)
+            FfiConverterOptionalString.write(value.`relationType`, buf)
+            FfiConverterLong.write(value.`createdAt`, buf)
+            FfiConverterLong.write(value.`updatedAt`, buf)
     }
 }
 
@@ -4722,6 +4961,34 @@ public object FfiConverterSequenceTypeBookRecord: FfiConverterRustBuffer<List<Bo
 /**
  * @suppress
  */
+public object FfiConverterSequenceTypeCollectionNoteCount: FfiConverterRustBuffer<List<CollectionNoteCount>> {
+    override fun read(buf: ByteBuffer): List<CollectionNoteCount> {
+        val len = buf.getInt()
+        return List<CollectionNoteCount>(len) {
+            FfiConverterTypeCollectionNoteCount.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<CollectionNoteCount>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeCollectionNoteCount.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<CollectionNoteCount>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeCollectionNoteCount.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
 public object FfiConverterSequenceTypeCollectionRecord: FfiConverterRustBuffer<List<CollectionRecord>> {
     override fun read(buf: ByteBuffer): List<CollectionRecord> {
         val len = buf.getInt()
@@ -4852,6 +5119,34 @@ public object FfiConverterSequenceTypeNoteBookAssignment: FfiConverterRustBuffer
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterTypeNoteBookAssignment.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeNoteLinkRecord: FfiConverterRustBuffer<List<NoteLinkRecord>> {
+    override fun read(buf: ByteBuffer): List<NoteLinkRecord> {
+        val len = buf.getInt()
+        return List<NoteLinkRecord>(len) {
+            FfiConverterTypeNoteLinkRecord.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<NoteLinkRecord>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeNoteLinkRecord.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<NoteLinkRecord>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeNoteLinkRecord.write(it, buf)
         }
     }
 }

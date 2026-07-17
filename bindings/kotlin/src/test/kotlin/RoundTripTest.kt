@@ -450,6 +450,56 @@ class RoundTripTest {
         assertEquals(75L, lens.threshold)
     }
 
+    /** SUR-923: the relation reads over the FFI — memberships traversed in both directions,
+     * note-link edges (both endpoints), and the per-collection live-note counts (which join live
+     * notes by founder decision, while note-ids stays join-free for the delete cascade). */
+    @Test
+    fun relationReadsOverFfi() {
+        val db = File.createTempFile("braird-rel", ".sqlite").apply { deleteOnExit() }
+        val engine = SyncEngine.open(db.absolutePath, "https://x.supabase.co", "anon", Vault.generate())
+
+        fun note(id: String, createdAt: Long, deleted: Boolean = false) = NoteUpsert(
+            id = id, bookId = null, plaintext = "text-$id", page = null, tags = emptyList(),
+            source = null, sourceId = null, sourceMetaJson = null, chapter = null, imagePath = null,
+            inkCropPath = null, createdAt = createdAt, deleted = deleted,
+            clearNullableFields = emptyList(),
+        )
+        engine.enqueueNote(note("n1", 10L))
+        engine.enqueueNote(note("n2", 20L))
+        engine.enqueueNote(note("ndead", 30L, deleted = true))
+
+        engine.enqueueCollection(id = "beta", name = "Beta", createdAt = 1L, deleted = false)
+        engine.enqueueCollectionMembership(noteId = "n1", collectionId = "beta", createdAt = 100L, deleted = false)
+        engine.enqueueCollectionMembership(noteId = "n2", collectionId = "beta", createdAt = 200L, deleted = false)
+        engine.enqueueCollectionMembership(noteId = "ndead", collectionId = "beta", createdAt = 300L, deleted = false)
+        engine.enqueueCollectionMembership(noteId = "n1", collectionId = "alpha", createdAt = 400L, deleted = false)
+        engine.enqueueCollectionMembership(noteId = "n1", collectionId = "gone", createdAt = 500L, deleted = true)
+
+        // collection-ids-for-note: live membership rows only, newest-first, no collection/notes join.
+        assertEquals(listOf("alpha", "beta"), engine.collectionIdsForNote("n1"))
+
+        // note-ids-for-collection: join-free — ndead's membership stays visible for the cascade.
+        assertEquals(listOf("ndead", "n2", "n1"), engine.noteIdsForCollection("beta"))
+
+        // collection-note-counts: joins live notes (ndead excluded), collection-id asc, count ≥ 1.
+        assertEquals(
+            listOf("alpha" to 1u, "beta" to 2u),
+            engine.collectionNoteCounts().map { it.collectionId to it.count },
+        )
+
+        // note links: both endpoints returned; relation_type defaulted by enqueue when null.
+        engine.enqueueNoteLink(id = "e1", fromNoteId = "parent", toNoteId = "n1", relationType = null, createdAt = 100L, deleted = false)
+        engine.enqueueNoteLink(id = "e2", fromNoteId = "n1", toNoteId = "child", relationType = "handwritten_annotation", createdAt = 200L, deleted = false)
+        engine.enqueueNoteLink(id = "e3", fromNoteId = "a", toNoteId = "b", relationType = null, createdAt = 300L, deleted = false)
+
+        val links = engine.noteLinksForNote("n1")
+        assertEquals(listOf("e2", "e1"), links.map { it.id })
+        val e1 = links.single { it.id == "e1" }
+        assertEquals("parent", e1.fromNoteId)
+        assertEquals("n1", e1.toNoteId)
+        assertEquals("handwritten_annotation", e1.relationType)
+    }
+
     /** SUR-915: the duplicate-resolution merge verbs over the FFI — merge_books (+ undo) and the
      * content-merge wrapper. Proves the undo token round-trips as a record, book merge rehomes notes
      * + tombstones the loser, undo restores, and merge_content_duplicates collapses into a

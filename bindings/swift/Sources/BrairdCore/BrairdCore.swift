@@ -555,6 +555,21 @@ fileprivate struct FfiConverterData: FfiConverterRustBuffer {
 public protocol SyncEngineProtocol : AnyObject {
     
     /**
+     * Ids of the live collections containing the note (SUR-923) — the AddToCollectionSheet's
+     * member set. Live membership rows only; no collection-liveness or notes join (the PWA
+     * `memberIds` oracle — the sheet filters its rendered rows to live collections itself).
+     */
+    func collectionIdsForNote(noteId: String) throws  -> [String]
+    
+    /**
+     * Per-collection live-note counts (SUR-923) — the Lexicon Collections tab subtitles, one
+     * row per collection sorted by collection id, only counts ≥ 1. Counts memberships
+     * whose note is present and live — a founder-decided (2026-07-17) divergence from the PWA's
+     * raw membership tally, keeping the subtitle consistent with the scoped note list.
+     */
+    func collectionNoteCounts() throws  -> [CollectionNoteCount]
+    
+    /**
      * Live (non-deleted) row totals for books / notes / custom ideas, plus `active_ideas` — the
      * count of distinct idea tags on live notes (the Home stat row, SUR-806).
      */
@@ -757,6 +772,22 @@ public protocol SyncEngineProtocol : AnyObject {
     func mergeContentDuplicates(survivorId: String, loserIds: [String], allowCrossCluster: Bool) throws  -> UInt32
     
     /**
+     * Live member note ids of a collection (SUR-923) — feeds the host-side collection-delete
+     * cascade (which must see memberships of already-deleted notes, so: deliberately no notes
+     * join) and the collection-scoped note list (which re-checks note liveness host-side, as
+     * the PWA's `notesInCollection` does).
+     */
+    func noteIdsForCollection(collectionId: String) throws  -> [String]
+    
+    /**
+     * Live note-link edges where the note is either endpoint (SUR-923) — one hop, both
+     * directions; the host filters direction ("children of this parent" = the note is the
+     * link's `from` side; "parent of this child" = it is the `to` side) and by relation type
+     * (Add-the-margins / parent-aware sheet options).
+     */
+    func noteLinksForNote(noteId: String) throws  -> [NoteLinkRecord]
+    
+    /**
      * Live notes carrying `idea` as an idea tag, newest-first, decrypted in core (SUR-858) — the
      * Commonplace idea filter / IdeaDetail / RelatedNotes. `idea` is the raw tag string (== a
      * `CustomIdeaRecord.name`, == an `IdeaCount.idea`); the match is exact.
@@ -919,6 +950,32 @@ public static func `open`(dbPath: String, supabaseUrl: String, anonKey: String, 
 }
     
 
+    
+    /**
+     * Ids of the live collections containing the note (SUR-923) — the AddToCollectionSheet's
+     * member set. Live membership rows only; no collection-liveness or notes join (the PWA
+     * `memberIds` oracle — the sheet filters its rendered rows to live collections itself).
+     */
+open func collectionIdsForNote(noteId: String)throws  -> [String] {
+    return try  FfiConverterSequenceString.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_braird_core_fn_method_syncengine_collection_ids_for_note(self.uniffiClonePointer(),
+        FfiConverterString.lower(noteId),$0
+    )
+})
+}
+    
+    /**
+     * Per-collection live-note counts (SUR-923) — the Lexicon Collections tab subtitles, one
+     * row per collection sorted by collection id, only counts ≥ 1. Counts memberships
+     * whose note is present and live — a founder-decided (2026-07-17) divergence from the PWA's
+     * raw membership tally, keeping the subtitle consistent with the scoped note list.
+     */
+open func collectionNoteCounts()throws  -> [CollectionNoteCount] {
+    return try  FfiConverterSequenceTypeCollectionNoteCount.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_braird_core_fn_method_syncengine_collection_note_counts(self.uniffiClonePointer(),$0
+    )
+})
+}
     
     /**
      * Live (non-deleted) row totals for books / notes / custom ideas, plus `active_ideas` — the
@@ -1277,6 +1334,34 @@ open func mergeContentDuplicates(survivorId: String, loserIds: [String], allowCr
         FfiConverterString.lower(survivorId),
         FfiConverterSequenceString.lower(loserIds),
         FfiConverterBool.lower(allowCrossCluster),$0
+    )
+})
+}
+    
+    /**
+     * Live member note ids of a collection (SUR-923) — feeds the host-side collection-delete
+     * cascade (which must see memberships of already-deleted notes, so: deliberately no notes
+     * join) and the collection-scoped note list (which re-checks note liveness host-side, as
+     * the PWA's `notesInCollection` does).
+     */
+open func noteIdsForCollection(collectionId: String)throws  -> [String] {
+    return try  FfiConverterSequenceString.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_braird_core_fn_method_syncengine_note_ids_for_collection(self.uniffiClonePointer(),
+        FfiConverterString.lower(collectionId),$0
+    )
+})
+}
+    
+    /**
+     * Live note-link edges where the note is either endpoint (SUR-923) — one hop, both
+     * directions; the host filters direction ("children of this parent" = the note is the
+     * link's `from` side; "parent of this child" = it is the `to` side) and by relation type
+     * (Add-the-margins / parent-aware sheet options).
+     */
+open func noteLinksForNote(noteId: String)throws  -> [NoteLinkRecord] {
+    return try  FfiConverterSequenceTypeNoteLinkRecord.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_braird_core_fn_method_syncengine_note_links_for_note(self.uniffiClonePointer(),
+        FfiConverterString.lower(noteId),$0
     )
 })
 }
@@ -2165,6 +2250,81 @@ public func FfiConverterTypeBookUpsert_lower(_ value: BookUpsert) -> RustBuffer 
 
 
 /**
+ * One row of the per-collection live-note tally (SUR-923) — the Lexicon Collections tab's
+ * "N notes" subtitles, shaped like [`IdeaCount`]. Founder decision (2026-07-17): a membership
+ * counts only when its note row is **present and live** — a deliberate divergence from the PWA's
+ * `noteCountByCollection` (a raw live-membership tally, no notes join), matching the read-time
+ * scope resolver `notesInCollection` and this core's [`idea_counts`] instead, so the subtitle
+ * agrees with what the collection-scoped note list shows. Only `count ≥ 1` rows appear (hosts
+ * default a missing collection to 0). No decryption: ids are plaintext.
+ */
+public struct CollectionNoteCount {
+    public var collectionId: String
+    public var count: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(collectionId: String, count: UInt32) {
+        self.collectionId = collectionId
+        self.count = count
+    }
+}
+
+
+
+extension CollectionNoteCount: Equatable, Hashable {
+    public static func ==(lhs: CollectionNoteCount, rhs: CollectionNoteCount) -> Bool {
+        if lhs.collectionId != rhs.collectionId {
+            return false
+        }
+        if lhs.count != rhs.count {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(collectionId)
+        hasher.combine(count)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCollectionNoteCount: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CollectionNoteCount {
+        return
+            try CollectionNoteCount(
+                collectionId: FfiConverterString.read(from: &buf), 
+                count: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CollectionNoteCount, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.collectionId, into: &buf)
+        FfiConverterUInt32.write(value.count, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCollectionNoteCount_lift(_ buf: RustBuffer) throws -> CollectionNoteCount {
+    return try FfiConverterTypeCollectionNoteCount.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCollectionNoteCount_lower(_ value: CollectionNoteCount) -> RustBuffer {
+    return FfiConverterTypeCollectionNoteCount.lower(value)
+}
+
+
+/**
  * A collection for the Lexicon list (SUR-858). A **bare** descriptor row — no membership count
  * (the consuming screen doesn't render one yet; add it only when it does). No crypto: every column
  * is plaintext metadata.
@@ -2859,6 +3019,112 @@ public func FfiConverterTypeNoteBookAssignment_lift(_ buf: RustBuffer) throws ->
 #endif
 public func FfiConverterTypeNoteBookAssignment_lower(_ value: NoteBookAssignment) -> RustBuffer {
     return FfiConverterTypeNoteBookAssignment.lower(value)
+}
+
+
+/**
+ * One live `note_links` edge (SUR-923) — the parent↔margin relation for the note action sheets.
+ * `from_note_id` is the parent (the printed/typed source note), `to_note_id` the margin child —
+ * exactly the PWA's row shape (`saveNoteLink`, `db.js`). `relation_type` is always written by
+ * `enqueue_note_link` (defaults `handwritten_annotation`, the only value in existence) but read
+ * defensively as `Option`, like [`LensRecord`]'s `combinator`. No crypto: link rows are plaintext
+ * metadata — the note text they relate stays in `notes`.
+ */
+public struct NoteLinkRecord {
+    public var id: String
+    public var fromNoteId: String
+    public var toNoteId: String
+    public var relationType: String?
+    public var createdAt: Int64
+    public var updatedAt: Int64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(id: String, fromNoteId: String, toNoteId: String, relationType: String?, createdAt: Int64, updatedAt: Int64) {
+        self.id = id
+        self.fromNoteId = fromNoteId
+        self.toNoteId = toNoteId
+        self.relationType = relationType
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+    }
+}
+
+
+
+extension NoteLinkRecord: Equatable, Hashable {
+    public static func ==(lhs: NoteLinkRecord, rhs: NoteLinkRecord) -> Bool {
+        if lhs.id != rhs.id {
+            return false
+        }
+        if lhs.fromNoteId != rhs.fromNoteId {
+            return false
+        }
+        if lhs.toNoteId != rhs.toNoteId {
+            return false
+        }
+        if lhs.relationType != rhs.relationType {
+            return false
+        }
+        if lhs.createdAt != rhs.createdAt {
+            return false
+        }
+        if lhs.updatedAt != rhs.updatedAt {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(id)
+        hasher.combine(fromNoteId)
+        hasher.combine(toNoteId)
+        hasher.combine(relationType)
+        hasher.combine(createdAt)
+        hasher.combine(updatedAt)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeNoteLinkRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> NoteLinkRecord {
+        return
+            try NoteLinkRecord(
+                id: FfiConverterString.read(from: &buf), 
+                fromNoteId: FfiConverterString.read(from: &buf), 
+                toNoteId: FfiConverterString.read(from: &buf), 
+                relationType: FfiConverterOptionString.read(from: &buf), 
+                createdAt: FfiConverterInt64.read(from: &buf), 
+                updatedAt: FfiConverterInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: NoteLinkRecord, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.id, into: &buf)
+        FfiConverterString.write(value.fromNoteId, into: &buf)
+        FfiConverterString.write(value.toNoteId, into: &buf)
+        FfiConverterOptionString.write(value.relationType, into: &buf)
+        FfiConverterInt64.write(value.createdAt, into: &buf)
+        FfiConverterInt64.write(value.updatedAt, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeNoteLinkRecord_lift(_ buf: RustBuffer) throws -> NoteLinkRecord {
+    return try FfiConverterTypeNoteLinkRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeNoteLinkRecord_lower(_ value: NoteLinkRecord) -> RustBuffer {
+    return FfiConverterTypeNoteLinkRecord.lower(value)
 }
 
 
@@ -4226,6 +4492,31 @@ fileprivate struct FfiConverterSequenceTypeBookRecord: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeCollectionNoteCount: FfiConverterRustBuffer {
+    typealias SwiftType = [CollectionNoteCount]
+
+    public static func write(_ value: [CollectionNoteCount], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeCollectionNoteCount.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [CollectionNoteCount] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [CollectionNoteCount]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeCollectionNoteCount.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeCollectionRecord: FfiConverterRustBuffer {
     typealias SwiftType = [CollectionRecord]
 
@@ -4343,6 +4634,31 @@ fileprivate struct FfiConverterSequenceTypeNoteBookAssignment: FfiConverterRustB
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeNoteBookAssignment.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeNoteLinkRecord: FfiConverterRustBuffer {
+    typealias SwiftType = [NoteLinkRecord]
+
+    public static func write(_ value: [NoteLinkRecord], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeNoteLinkRecord.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [NoteLinkRecord] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [NoteLinkRecord]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeNoteLinkRecord.read(from: &buf))
         }
         return seq
     }
@@ -4480,6 +4796,12 @@ private var initializationResult: InitializationResult = {
     if (uniffi_braird_core_checksum_func_membership_id() != 9610) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_braird_core_checksum_method_syncengine_collection_ids_for_note() != 41507) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_braird_core_checksum_method_syncengine_collection_note_counts() != 26206) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_braird_core_checksum_method_syncengine_counts() != 34830) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -4544,6 +4866,12 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_merge_content_duplicates() != 26022) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_braird_core_checksum_method_syncengine_note_ids_for_collection() != 25011) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_braird_core_checksum_method_syncengine_note_links_for_note() != 10271) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_notes_by_idea() != 21049) {

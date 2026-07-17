@@ -13,7 +13,7 @@
 //! 2. **Plaintext never reaches disk.** Decryption happens per-read into the returned DTO / the
 //!    in-memory `SearchDoc`; nothing is written back to the store (ADR 0003 preserved).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::{Map, Value};
 
@@ -122,6 +122,35 @@ pub struct LensRecord {
     pub threshold: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+/// One live `note_links` edge (SUR-923) — the parent↔margin relation for the note action sheets.
+/// `from_note_id` is the parent (the printed/typed source note), `to_note_id` the margin child —
+/// exactly the PWA's row shape (`saveNoteLink`, `db.js`). `relation_type` is always written by
+/// `enqueue_note_link` (defaults `handwritten_annotation`, the only value in existence) but read
+/// defensively as `Option`, like [`LensRecord`]'s `combinator`. No crypto: link rows are plaintext
+/// metadata — the note text they relate stays in `notes`.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct NoteLinkRecord {
+    pub id: String,
+    pub from_note_id: String,
+    pub to_note_id: String,
+    pub relation_type: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// One row of the per-collection live-note tally (SUR-923) — the Lexicon Collections tab's
+/// "N notes" subtitles, shaped like [`IdeaCount`]. Founder decision (2026-07-17): a membership
+/// counts only when its note row is **present and live** — a deliberate divergence from the PWA's
+/// `noteCountByCollection` (a raw live-membership tally, no notes join), matching the read-time
+/// scope resolver `notesInCollection` and this core's [`idea_counts`] instead, so the subtitle
+/// agrees with what the collection-scoped note list shows. Only `count ≥ 1` rows appear (hosts
+/// default a missing collection to 0). No decryption: ids are plaintext.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct CollectionNoteCount {
+    pub collection_id: String,
+    pub count: u32,
 }
 
 // ── store reads → DTOs ───────────────────────────────────────────────────────
@@ -306,6 +335,112 @@ pub fn idea_counts(store: &Store) -> rusqlite::Result<Vec<IdeaCount>> {
     Ok(out)
 }
 
+// ── relation reads (SUR-923) ─────────────────────────────────────────────────
+// Extension #3 of the read surface: the membership + note-link relations, both directions.
+// No decryption anywhere — no note text is involved in any of these.
+
+/// Ids of the live collections whose membership row pairs with `note_id` (SUR-923) — the
+/// AddToCollectionSheet's `memberIds`, mirroring the PWA derivation exactly (`new Set(
+/// collectionMemberships.filter(m => !m.deleted && m.noteId === noteId).map(m => m.collectionId))`,
+/// `NoteActionOverlay.jsx`): live **membership** rows only — no collection-liveness check and no
+/// notes join (the sheet filters its rendered rows to live collections itself). Deduped like the
+/// oracle's `Set`, for the same reason [`note_ids_for_collection`] dedups: a foreign row under a
+/// rogue random pk can pair the same (collection, note) twice, and a host rendering these as chips
+/// would show the collection twice until that row is tombstoned. Store scan order (membership
+/// `created_at` DESC). No pagination: a note belongs to a handful of collections.
+pub fn collection_ids_for_note(store: &Store, note_id: &str) -> rusqlite::Result<Vec<String>> {
+    let mut seen = HashSet::new();
+    Ok(store
+        .list_live("collection_memberships", Some(("note_id", note_id)), -1, 0)?
+        .iter()
+        .filter_map(|row| string_field(row, "collection_id"))
+        .filter(|id| seen.insert(id.clone()))
+        .collect())
+}
+
+/// Live `note_links` edges touching `note_id` on either end (SUR-923) — one hop, both directions,
+/// the PWA's cascade query (`where('fromNoteId').equals(noteId).or('toNoteId').equals(noteId)`,
+/// `db.js`). The host filters by direction ("children of this parent" = rows where the note is
+/// `from`; "parent of this child" = rows where it is `to`) and by `relation_type`, as every PWA
+/// read does. Scan-then-filter like [`notes_by_idea`] (the store's scalar filter is a single
+/// equality — no OR); store scan order (`created_at` DESC — PWA display sorts ascending
+/// host-side, and hosts have the timestamps). No pagination: per-note links are small.
+pub fn note_links_for_note(store: &Store, note_id: &str) -> rusqlite::Result<Vec<NoteLinkRecord>> {
+    Ok(store
+        .list_live("note_links", None, -1, 0)?
+        .iter()
+        .filter(|row| {
+            string_field(row, "from_note_id").as_deref() == Some(note_id)
+                || string_field(row, "to_note_id").as_deref() == Some(note_id)
+        })
+        .map(note_link_record)
+        .collect())
+}
+
+/// Live member note ids of one collection (SUR-923) — the PWA's `memberNoteIds`
+/// (`lib/collections.js`): live **membership** rows only, deduped like the oracle's `Set`.
+/// Deliberately **no notes join** — the host-side collection-delete cascade consumes this and
+/// must see every live membership, including one whose note is already soft-deleted, to
+/// tombstone them all (`useCollections.removeCollection`); the collection-scoped note *list*
+/// re-checks note liveness host-side, as the PWA's `notesInCollection` does. The deterministic
+/// `membership_id` pk makes a live duplicate pair impossible via `enqueue_*`; the dedup guards
+/// against a foreign row under a rogue random pk. Store scan order (`created_at` DESC).
+pub fn note_ids_for_collection(
+    store: &Store,
+    collection_id: &str,
+) -> rusqlite::Result<Vec<String>> {
+    let mut seen = HashSet::new();
+    Ok(store
+        .list_live(
+            "collection_memberships",
+            Some(("collection_id", collection_id)),
+            -1,
+            0,
+        )?
+        .iter()
+        .filter_map(|row| string_field(row, "note_id"))
+        .filter(|id| seen.insert(id.clone()))
+        .collect())
+}
+
+/// Per-collection live-note counts (SUR-923) — the Lexicon Collections tab subtitles, shaped like
+/// [`idea_counts`]: one pass over live memberships, sorted by `collection_id` **ascending**, only
+/// `count ≥ 1` rows. Per the founder decision recorded on [`CollectionNoteCount`], a membership
+/// counts only when its note is present and live, and a distinct (collection, note) pair counts
+/// once — so the subtitle always equals the length of the host's liveness-filtered
+/// [`note_ids_for_collection`] list. No collection-liveness join (matches both PWA counts — a
+/// deleted collection's tally simply never renders). No decryption.
+pub fn collection_note_counts(store: &Store) -> rusqlite::Result<Vec<CollectionNoteCount>> {
+    let live_notes: HashSet<String> = store
+        .list_live("notes", None, -1, 0)?
+        .iter()
+        .filter_map(|row| string_field(row, "id"))
+        .collect();
+    let mut seen_pairs = HashSet::new();
+    let mut tally: HashMap<String, u32> = HashMap::new();
+    for row in store.list_live("collection_memberships", None, -1, 0)? {
+        let (Some(cid), Some(nid)) = (
+            string_field(&row, "collection_id"),
+            string_field(&row, "note_id"),
+        ) else {
+            continue;
+        };
+        if !live_notes.contains(&nid) || !seen_pairs.insert((cid.clone(), nid)) {
+            continue;
+        }
+        *tally.entry(cid).or_insert(0) += 1;
+    }
+    let mut out: Vec<CollectionNoteCount> = tally
+        .into_iter()
+        .map(|(collection_id, count)| CollectionNoteCount {
+            collection_id,
+            count,
+        })
+        .collect();
+    out.sort_by(|a, b| a.collection_id.cmp(&b.collection_id));
+    Ok(out)
+}
+
 /// The PWA Home "this week" set (`App.jsx` `useMemo`): live notes created within the last
 /// [`WEEK_MS`] whose **decrypted** text is non-empty, newest-first. Both `notes_this_week` (its
 /// size) and `recent_note` (a pick from it) derive from this one set — exactly as the PWA computes
@@ -458,6 +593,17 @@ fn collection_record(row: &Map<String, Value>) -> CollectionRecord {
     CollectionRecord {
         id: string_field(row, "id").unwrap_or_default(),
         name: string_field(row, "name"),
+        created_at: int_field(row, "created_at"),
+        updated_at: int_field(row, "updated_at"),
+    }
+}
+
+fn note_link_record(row: &Map<String, Value>) -> NoteLinkRecord {
+    NoteLinkRecord {
+        id: string_field(row, "id").unwrap_or_default(),
+        from_note_id: string_field(row, "from_note_id").unwrap_or_default(),
+        to_note_id: string_field(row, "to_note_id").unwrap_or_default(),
+        relation_type: string_field(row, "relation_type"),
         created_at: int_field(row, "created_at"),
         updated_at: int_field(row, "updated_at"),
     }
@@ -1088,5 +1234,222 @@ mod tests {
         let empty = Store::open_in_memory().unwrap();
         assert!(list_collections(&empty, 50, 0).unwrap().is_empty());
         assert!(list_lenses(&empty, 50, 0).unwrap().is_empty());
+    }
+
+    // ── SUR-923: relation reads ──────────────────────────────────────────────
+
+    fn membership_row(collection_id: &str, note_id: &str, created_at: i64) -> Map<String, Value> {
+        let mut r = Map::new();
+        r.insert(
+            "id".into(),
+            json!(crate::store::membership_id(collection_id, note_id)),
+        );
+        r.insert("collection_id".into(), json!(collection_id));
+        r.insert("note_id".into(), json!(note_id));
+        r.insert("created_at".into(), json!(created_at));
+        r.insert("updated_at".into(), json!(created_at));
+        r.insert("deleted".into(), json!(false));
+        r
+    }
+
+    fn link_row(id: &str, from: &str, to: &str, created_at: i64) -> Map<String, Value> {
+        let mut r = Map::new();
+        r.insert("id".into(), json!(id));
+        r.insert("from_note_id".into(), json!(from));
+        r.insert("to_note_id".into(), json!(to));
+        r.insert("relation_type".into(), json!("handwritten_annotation"));
+        r.insert("created_at".into(), json!(created_at));
+        r.insert("updated_at".into(), json!(created_at));
+        r.insert("deleted".into(), json!(false));
+        r
+    }
+
+    #[test]
+    fn collection_ids_for_note_mirrors_the_member_ids_oracle() {
+        // PWA memberIds: live MEMBERSHIP rows only — a deleted membership is out, but there is
+        // no collection-liveness check (a membership into a dead/never-pulled collection still
+        // appears; the sheet's own live-collections filter is what hides it). Note that no
+        // `collections` rows are inserted at all — the read must never look at that table.
+        let store = Store::open_in_memory().unwrap();
+        store
+            .apply_row("collection_memberships", &membership_row("c1", "n1", 100))
+            .unwrap();
+        let mut mdel = membership_row("c2", "n1", 200);
+        mdel.insert("deleted".into(), json!(true));
+        store.apply_row("collection_memberships", &mdel).unwrap(); // deleted membership → out
+        store
+            .apply_row(
+                "collection_memberships",
+                &membership_row("c1", "other", 300),
+            )
+            .unwrap(); // other note → out
+        store
+            .apply_row(
+                "collection_memberships",
+                &membership_row("cdead", "n1", 400),
+            )
+            .unwrap(); // collection has no row anywhere → still IN (oracle fidelity)
+        let mut dup = membership_row("c1", "n1", 500);
+        dup.insert("id".into(), json!("rogue-random-pk"));
+        store.apply_row("collection_memberships", &dup).unwrap(); // foreign dup pair → deduped
+
+        // store scan order: created_at DESC — the rogue dup (500) takes c1's slot, then dedup.
+        assert_eq!(
+            collection_ids_for_note(&store, "n1").unwrap(),
+            vec!["c1", "cdead"]
+        );
+        assert!(collection_ids_for_note(&store, "unknown")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn note_links_for_note_returns_both_directions_live_only() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .apply_row("note_links", &link_row("e1", "parent", "n1", 100))
+            .unwrap(); // n1 is the child (to-side)
+        store
+            .apply_row("note_links", &link_row("e2", "n1", "child", 200))
+            .unwrap(); // n1 is the parent (from-side)
+        store
+            .apply_row("note_links", &link_row("e3", "a", "b", 300))
+            .unwrap(); // unrelated → out
+        let mut edel = link_row("e4", "n1", "gone", 400);
+        edel.insert("deleted".into(), json!(true));
+        store.apply_row("note_links", &edel).unwrap(); // deleted → out
+
+        let links = note_links_for_note(&store, "n1").unwrap();
+        assert_eq!(
+            links.iter().map(|l| l.id.as_str()).collect::<Vec<_>>(),
+            vec!["e2", "e1"], // created_at DESC
+        );
+        let e1 = links.iter().find(|l| l.id == "e1").unwrap();
+        assert_eq!(
+            (e1.from_note_id.as_str(), e1.to_note_id.as_str()),
+            ("parent", "n1")
+        );
+        assert_eq!(e1.relation_type.as_deref(), Some("handwritten_annotation"));
+        assert_eq!((e1.created_at, e1.updated_at), (100, 100));
+    }
+
+    #[test]
+    fn note_ids_for_collection_stays_join_free_for_the_cascade() {
+        // The host-side collection-delete cascade tombstones every LIVE membership row —
+        // including one whose note is already soft-deleted. A notes join here would hide that
+        // row and the cascade would leave it live forever; the PWA's removeCollection sees it,
+        // so must we. (The scoped note LIST re-checks note liveness host-side instead.)
+        let store = Store::open_in_memory().unwrap();
+        let vault = Vault::generate();
+        store
+            .apply_row(
+                "notes",
+                &note_row("nlive", None, &seal(&vault, "nlive", "t"), 10),
+            )
+            .unwrap();
+        let mut ndel = note_row("ndead", None, &seal(&vault, "ndead", "t"), 20);
+        ndel.insert("deleted".into(), json!(true));
+        store.apply_row("notes", &ndel).unwrap();
+
+        store
+            .apply_row(
+                "collection_memberships",
+                &membership_row("c1", "nlive", 100),
+            )
+            .unwrap();
+        store
+            .apply_row(
+                "collection_memberships",
+                &membership_row("c1", "ndead", 200),
+            )
+            .unwrap(); // note dead, membership LIVE → in
+        let mut mdel = membership_row("c1", "mgone", 300);
+        mdel.insert("deleted".into(), json!(true));
+        store.apply_row("collection_memberships", &mdel).unwrap(); // membership dead → out
+        store
+            .apply_row(
+                "collection_memberships",
+                &membership_row("c2", "nlive", 400),
+            )
+            .unwrap(); // other collection → out
+        let mut dup = membership_row("c1", "nlive", 500);
+        dup.insert("id".into(), json!("rogue-random-pk"));
+        store.apply_row("collection_memberships", &dup).unwrap(); // foreign duplicate pair → deduped
+
+        // created_at DESC; the rogue duplicate (500) wins the first "nlive" slot, then dedup.
+        assert_eq!(
+            note_ids_for_collection(&store, "c1").unwrap(),
+            vec!["nlive", "ndead"]
+        );
+    }
+
+    #[test]
+    fn collection_note_counts_joins_live_notes_by_founder_decision() {
+        // Founder decision (2026-07-17): count only memberships whose note is present AND live —
+        // a recorded divergence from the PWA's raw `noteCountByCollection` tally, so the subtitle
+        // agrees with the collection-scoped note list (`notesInCollection`, which joins live
+        // notes). No `collections` rows are inserted: the tally never reads that table.
+        let store = Store::open_in_memory().unwrap();
+        let vault = Vault::generate();
+        store
+            .apply_row("notes", &note_row("n1", None, &seal(&vault, "n1", "t"), 10))
+            .unwrap();
+        store
+            .apply_row("notes", &note_row("n2", None, &seal(&vault, "n2", "t"), 20))
+            .unwrap();
+        let mut ndel = note_row("ndead", None, &seal(&vault, "ndead", "t"), 30);
+        ndel.insert("deleted".into(), json!(true));
+        store.apply_row("notes", &ndel).unwrap();
+
+        // beta: two live notes + a dead-note membership + a duplicate pair → 2.
+        store
+            .apply_row("collection_memberships", &membership_row("beta", "n1", 100))
+            .unwrap();
+        store
+            .apply_row("collection_memberships", &membership_row("beta", "n2", 200))
+            .unwrap();
+        store
+            .apply_row(
+                "collection_memberships",
+                &membership_row("beta", "ndead", 300),
+            )
+            .unwrap();
+        let mut dup = membership_row("beta", "n1", 400);
+        dup.insert("id".into(), json!("rogue"));
+        store.apply_row("collection_memberships", &dup).unwrap();
+        // alpha: one live note; a deleted membership and a never-pulled note contribute nothing.
+        store
+            .apply_row(
+                "collection_memberships",
+                &membership_row("alpha", "n1", 500),
+            )
+            .unwrap();
+        let mut mdel = membership_row("alpha", "n2", 600);
+        mdel.insert("deleted".into(), json!(true));
+        store.apply_row("collection_memberships", &mdel).unwrap();
+        store
+            .apply_row(
+                "collection_memberships",
+                &membership_row("alpha", "never-pulled", 700),
+            )
+            .unwrap();
+        // ghost: only a dead-note membership → absent entirely (count ≥ 1 rule).
+        store
+            .apply_row(
+                "collection_memberships",
+                &membership_row("ghost", "ndead", 800),
+            )
+            .unwrap();
+
+        let tally = collection_note_counts(&store).unwrap();
+        let as_pairs: Vec<(&str, u32)> = tally
+            .iter()
+            .map(|c| (c.collection_id.as_str(), c.count))
+            .collect();
+        assert_eq!(
+            as_pairs,
+            vec![("alpha", 1), ("beta", 2)],
+            "collection-id asc; dead/absent notes and dead memberships excluded; pair deduped"
+        );
     }
 }
