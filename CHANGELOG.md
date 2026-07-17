@@ -6,6 +6,16 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-07-17
+
+Thirteenth release batch. This **SUR-934** patch release makes `export_snapshot` usable on a real
+corpus: it aborted the entire archive on any note with **nothing to decrypt** — an image-only,
+empty, or legacy-unsealed body — because the exporter decrypted note text unconditionally instead of
+applying the read path's rule, where only one of four cases is a decryption. Export was impossible
+for essentially every real account; a single such note was enough. Fixing it also exposed that the
+core could not re-import its own export, so both halves of the snapshot round-trip land here.
+Found on-device against a real 1,638-note account (SUR-882) — no unit test could reach it.
+
 ### Fixed
 - **`export_snapshot` no longer fails on a note with nothing to decrypt (SUR-934).** `map_note`
   decrypted `text` unconditionally, coercing an absent value to `""` via `unwrap_or_default`, so the
