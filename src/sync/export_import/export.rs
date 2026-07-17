@@ -5,6 +5,7 @@ use serde_json::{json, Map, Value};
 use time::{macros::format_description, OffsetDateTime};
 
 use crate::store::Store;
+use crate::sync::read::decrypt_note_text;
 use crate::sync::SyncError;
 use crate::vault::Vault;
 
@@ -185,17 +186,33 @@ fn map_fields(row: &Map<String, Value>, fields: &[(&str, &str)]) -> Value {
     Value::Object(mapped)
 }
 
+/// Map one live note row to its PWA shape, resolving `text` through the SAME rule the read path uses
+/// ([`decrypt_note_text`]) rather than a second, weaker copy of it (SUR-934).
+///
+/// Only ONE of that rule's four cases is a decryption. A `text` that is NULL, empty, or simply not
+/// sealed (no `enc:` sentinel — a supported legacy shape) has nothing to decrypt and must map straight
+/// through. The previous code decrypted unconditionally, coercing NULL to `""` via `unwrap_or_default`,
+/// so those three shapes each raised a *manufactured* decryption error that aborted the entire archive —
+/// a corpus could read perfectly on every screen and still be impossible to export.
+///
+/// Fail-closed is preserved exactly where it belongs: a genuinely undecryptable note (sealed, wrong key
+/// or corrupt) still fails the WHOLE export. Never a partial archive, never ciphertext in place of
+/// plaintext, and never a silently dropped row — see `docs/snapshots.md`.
 fn map_note(row: &Map<String, Value>, vault: &Vault) -> Result<Value, SyncError> {
     let id = row.get("id").and_then(Value::as_str).unwrap_or_default();
-    let ciphertext = row.get("text").and_then(Value::as_str).unwrap_or_default();
-    let plaintext = vault
-        .decrypt_note(Some(id.to_string()), ciphertext.to_string())
-        .map_err(|_| SyncError::Store("snapshot export note decryption failed".into()))?;
+    let (text, decrypt_failed) = decrypt_note_text(row, id, vault);
+    if decrypt_failed {
+        return Err(SyncError::Store(
+            "snapshot export note decryption failed".into(),
+        ));
+    }
     let mut mapped = map_fields(row, NOTE_FIELDS);
     mapped
         .as_object_mut()
         .expect("mapped note is an object")
-        .insert("text".into(), Value::String(plaintext));
+        // A note with no text exports `text: null` — the shape import already contracts for ("a
+        // supported legacy note with omitted text remains null"), so this round-trips.
+        .insert("text".into(), text.map_or(Value::Null, Value::String));
     Ok(mapped)
 }
 
@@ -326,6 +343,95 @@ mod tests {
 
     fn snapshot_at(store: &Store, vault: &Vault, now_ms: i64) -> String {
         super::build_snapshot_at(store, vault, now_ms).unwrap()
+    }
+
+    /// A note row whose `text` is whatever the caller says — NOT sealed. [`note_row`] always encrypts,
+    /// which is exactly why the cases below were never covered.
+    fn raw_note_row(id: &str, text: Value, created_at: i64) -> Value {
+        json!({
+            "id": id,
+            "book_id": null,
+            "text": text,
+            "page": "",
+            "tags": [],
+            "image_path": null,
+            "ink_crop_path": null,
+            "source": "manual",
+            "source_id": null,
+            "source_meta": {},
+            "chapter": null,
+            "content_tag": null,
+            "created_at": created_at,
+            "updated_at": created_at,
+            "deleted": false,
+        })
+    }
+
+    /// REGRESSION (SUR-934, found on-device by SUR-882): `map_note` used to decrypt `text`
+    /// unconditionally, so the three shapes `read.rs::decrypt_note_text` explicitly treats as
+    /// NOT-a-failure each aborted the WHOLE export:
+    ///
+    /// - `text` NULL — `unwrap_or_default()` coerced it to `""`, then `decrypt("")` → Err
+    /// - `text` empty — `decrypt("")` → Err
+    /// - `text` unsealed — no `enc:` sentinel, so `decrypt(plaintext)` → Err
+    ///
+    /// The read path passes all three through happily (`decrypt_failed = false`), so a corpus can read
+    /// perfectly and still be impossible to export — observed on a real 1,638-note account.
+    /// Each case is asserted independently so a failure names the shape.
+    #[test]
+    fn exports_notes_whose_text_is_null_empty_or_unsealed() {
+        for (case, text) in [
+            ("null", Value::Null),
+            ("empty", json!("")),
+            ("unsealed", json!("a legacy note stored as plaintext")),
+        ] {
+            let store = Store::open_in_memory().unwrap();
+            let vault = Vault::generate();
+            put(&store, "notes", raw_note_row("n1", text, 1));
+
+            let snapshot = super::build_snapshot_at(&store, &vault, 0);
+
+            assert!(
+                snapshot.is_ok(),
+                "a {case} note must not fail the export: {:?}",
+                snapshot.err(),
+            );
+        }
+    }
+
+    /// The sealed note must still survive an export that also contains an unsealed one — a partial
+    /// archive is never acceptable, so the fix must skip decryption for the unsealed row, not the export.
+    #[test]
+    fn an_unsealed_note_does_not_take_a_sealed_note_down_with_it() {
+        let store = Store::open_in_memory().unwrap();
+        let vault = Vault::generate();
+        put(
+            &store,
+            "notes",
+            note_row(&vault, "sealed", "the sealed body", 1, false),
+        );
+        put(
+            &store,
+            "notes",
+            raw_note_row("unsealed", json!("a plaintext body"), 2),
+        );
+
+        let snapshot = super::build_snapshot_at(&store, &vault, 0).expect("export must survive");
+        let root: Value = serde_json::from_str(&snapshot).unwrap();
+        let notes = root["notes"].as_array().unwrap();
+
+        assert_eq!(notes.len(), 2, "both notes are exported");
+        let by_id = |id: &str| notes.iter().find(|n| n["id"] == id).unwrap().clone();
+        assert_eq!(
+            by_id("sealed")["text"],
+            "the sealed body",
+            "sealed text decrypts"
+        );
+        assert_eq!(
+            by_id("unsealed")["text"],
+            "a plaintext body",
+            "unsealed text passes through verbatim"
+        );
     }
 
     #[test]

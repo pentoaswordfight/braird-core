@@ -58,9 +58,26 @@ The exporter emits the top-level keys in this exact order. All eight store names
 `exportedAt` is an ISO-8601 UTC timestamp. Every array contains live rows only; soft-deleted rows
 are excluded, and exported live rows carry the PWA-compatible `deleted: 0` shape.
 
-Note `text` is plaintext. For handwritten-annotation edges, the exporter also reconstructs
+Note `text` is plaintext. The exporter resolves it with the same rule the read path uses, and only
+one of that rule's four cases is a decryption:
+
+| stored `notes.text` | exported `text` |
+| --- | --- |
+| sealed (`enc:v1`/`enc:v2` sentinel) | the decrypted plaintext |
+| unsealed (no sentinel — a supported legacy shape) | passed through verbatim |
+| empty string | empty string |
+| NULL / absent | `null` |
+
+Only a *sealed* row that fails to decrypt is a decryption failure, and that still fails the whole
+export (below). A row with nothing to decrypt must never be treated as one: coercing an absent
+`text` into `""` and decrypting it would abort every export for any corpus holding a single
+image-only, empty, or legacy-unsealed note — while every screen in the app reads that same corpus
+fine (SUR-934).
+
+For handwritten-annotation edges, the exporter also reconstructs
 `user_metadata.user_annotation` on the parent note from child-note plaintext, ordered by edge
-`createdAt` and then edge id. The authoritative synced `noteLinks` rows remain in `noteLinks`.
+`createdAt` and then edge id. A child with no text contributes nothing. The authoritative synced
+`noteLinks` rows remain in `noteLinks`.
 
 Synced `imagePath` and `inkCropPath` values are retained, but device-local preview payloads
 `imageDataUrl` and `inkCropDataUrl` are never exported. No local-only table is exported: `meta`,
