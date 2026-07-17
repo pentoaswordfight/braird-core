@@ -551,6 +551,24 @@ impl SyncEngine {
     ) -> Result<(), SyncError> {
         let now = epoch_ms();
         let id = crate::store::membership_id(&collection_id, &note_id);
+        // A tombstone PRESERVES the membership's original `created_at`, mirroring surfc's
+        // `removeNoteFromCollection` → `softDeleteMembershipRows` (which tombstones the *stored* row,
+        // `{ ...m, deleted: 1 }`, rather than reconstructing it from the two ids). The pushed payload
+        // IS the outbox partial and the server column is NOT NULL, so a reconstruct-from-ids tombstone
+        // would carry the host clock, not the filed-at instant — and the host can't supply the real
+        // one (`collection_ids_for_note` exposes no timestamp). Read it from the local mirror here;
+        // fall back to the host value only when no row exists (parity with the PWA's
+        // `?? { createdAt: now }`). An active add/re-add keeps the host value — `addNoteToCollection`
+        // stamps `now` too. Same preserve reconcile's `repoint_memberships` already does.
+        let created_at = if deleted {
+            lock!(self.store)
+                .get_row("collection_memberships", &id)
+                .map_err(|e| SyncError::Store(e.to_string()))?
+                .and_then(|r| r.get("created_at").and_then(Value::as_i64))
+                .unwrap_or(created_at)
+        } else {
+            created_at
+        };
         let mut row = Map::new();
         row.insert("id".into(), json!(id));
         row.insert("note_id".into(), json!(note_id));
@@ -2294,7 +2312,7 @@ mod tests {
     /// field of the sole `collection_memberships` upsert. The tests assert the COLLAPSED OUTBOX (what
     /// push sends) rather than a `collection_ids_for_note` read, because the local synced mirror is
     /// correct under the SUR-940 bug — only the pushed payload was wrong.
-    fn collapsed_membership_deleted(db_path: &str) -> Value {
+    fn collapsed_membership_payload(db_path: &str) -> Map<String, Value> {
         let items: Vec<crate::sync::outbox::OutboxItem> = Store::open(db_path)
             .unwrap()
             .outbox_items()
@@ -2314,8 +2332,25 @@ mod tests {
             .iter()
             .find(|c| c.table == "collection_memberships")
             .expect("a membership upsert is queued")
-            .payload["deleted"]
+            .payload
             .clone()
+    }
+
+    fn collapsed_membership_deleted(db_path: &str) -> Value {
+        collapsed_membership_payload(db_path)["deleted"].clone()
+    }
+
+    /// The `created_at` the local synced mirror holds for the sole membership (what a reconcile or an
+    /// export would read), distinct from the pushed outbox payload.
+    fn membership_mirror_created_at(db_path: &str, id: &str) -> i64 {
+        Store::open(db_path)
+            .unwrap()
+            .get_row("collection_memberships", id)
+            .unwrap()
+            .expect("the membership row exists in the local mirror")
+            .get("created_at")
+            .and_then(Value::as_i64)
+            .expect("created_at is a number")
     }
 
     #[test]
@@ -2367,6 +2402,87 @@ mod tests {
             json!(true),
             "a genuine remove must still win the collapse — the sticky-delete is intact",
         );
+    }
+
+    #[test]
+    fn membership_tombstone_preserves_the_filed_at_created_at() {
+        // The host toggle-off can't supply the original `created_at` (SUR-927): `collection_ids_for_note`
+        // exposes no timestamp, so it passes the wall clock. Core must preserve the filed-at value on
+        // the tombstone (parity with surfc's `removeNoteFromCollection`, which tombstones the stored
+        // row). Both the local mirror AND the pushed outbox payload must carry it — the server column
+        // is NOT NULL and the pushed value is what other devices see.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+
+        engine
+            .enqueue_collection_membership("n1".into(), "c1".into(), 100, false)
+            .unwrap(); // filed at 100
+        engine
+            .enqueue_collection_membership("n1".into(), "c1".into(), 200, true)
+            .unwrap(); // removed at 200 (host clock)
+
+        assert_eq!(
+            membership_mirror_created_at(db_path, "c1:n1"),
+            100,
+            "the local mirror keeps the filed-at created_at, not the removal clock",
+        );
+        assert_eq!(
+            collapsed_membership_payload(db_path)["created_at"],
+            json!(100),
+            "the pushed tombstone carries the filed-at created_at, not the removal clock",
+        );
+    }
+
+    #[test]
+    fn membership_tombstone_of_absent_row_falls_back_to_the_host_clock() {
+        // No prior row (remove of something never filed locally — e.g. removed on another device):
+        // there is nothing to preserve, so the host clock stands in and the NOT-NULL column is still
+        // satisfied. Parity with the PWA's `?? { createdAt: now }` fallback.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        engine_at(db_path)
+            .enqueue_collection_membership("n1".into(), "c1".into(), 200, true)
+            .unwrap();
+
+        assert_eq!(membership_mirror_created_at(db_path, "c1:n1"), 200);
+        assert_eq!(
+            collapsed_membership_payload(db_path)["created_at"],
+            json!(200),
+        );
+    }
+
+    #[test]
+    fn membership_add_off_re_add_converges_to_one_live_row_with_its_created_at() {
+        // file → toggle-off → toggle-on, all in one un-flushed batch (SUR-940 resurrection + the
+        // SUR-927 created_at preserve together): the collapse must yield ONE live row, and its
+        // created_at is intact end to end. An active re-add re-stamps the host clock (parity with
+        // `addNoteToCollection`); here every call shares ts=300 so the survivor's value is unambiguous.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+
+        engine
+            .enqueue_collection_membership("n1".into(), "c1".into(), 300, false)
+            .unwrap(); // file
+        engine
+            .enqueue_collection_membership("n1".into(), "c1".into(), 300, true)
+            .unwrap(); // off
+        engine
+            .enqueue_collection_membership("n1".into(), "c1".into(), 300, false)
+            .unwrap(); // on
+
+        let payload = collapsed_membership_payload(db_path);
+        assert_eq!(
+            payload["deleted"],
+            json!(false),
+            "re-add wins — one live row"
+        );
+        assert_eq!(payload["created_at"], json!(300));
+        assert_eq!(membership_mirror_created_at(db_path, "c1:n1"), 300);
     }
 
     #[test]

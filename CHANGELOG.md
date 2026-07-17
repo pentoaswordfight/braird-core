@@ -6,6 +6,21 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+### Fixed
+- **`enqueue_collection_membership` tombstone now preserves the membership's filed-at `created_at` (SUR-942).**
+  A toggle-off host can't supply the original `created_at` (`collection_ids_for_note` exposes no
+  timestamp), so it passes the wall clock — and the enqueue path wrote it unconditionally, clobbering
+  the filed-at instant on the pushed tombstone. The `deleted = true` path now reads the deterministic
+  `{collectionId}:{noteId}` row's stored `created_at` from the local mirror and preserves it, falling
+  back to the host value only when no row exists. This mirrors surfc's `removeNoteFromCollection` →
+  `softDeleteMembershipRows` (tombstone the stored row, not a reconstruct-from-ids) and its
+  `?? { createdAt: now }` fallback, and matches the preserve reconcile's `repoint_memberships` already
+  does — closing an internal inconsistency. Active add/re-add still stamps the host clock (parity with
+  `addNoteToCollection`). Cosmetic today (no membership read consumes `created_at`; whole-row LWW keys
+  on `updated_at`; the server NOT-NULL column is satisfied by any non-null value), so SUR-927 ships
+  correctly on v0.8.1 — but the host genuinely can't fix it, only core can. No FFI signature/docstring
+  change (internal staging only) — bindings unchanged.
+
 ## [0.8.1] - 2026-07-17
 
 Fifteenth release batch. Patch release: a silent lost-write on the collection-membership sync path,
