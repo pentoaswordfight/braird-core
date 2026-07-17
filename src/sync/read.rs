@@ -340,16 +340,21 @@ pub fn idea_counts(store: &Store) -> rusqlite::Result<Vec<IdeaCount>> {
 // No decryption anywhere — no note text is involved in any of these.
 
 /// Ids of the live collections whose membership row pairs with `note_id` (SUR-923) — the
-/// AddToCollectionSheet's `memberIds`, mirroring the PWA derivation exactly
-/// (`collectionMemberships.filter(m => !m.deleted && m.noteId === noteId).map(m => m.collectionId)`,
+/// AddToCollectionSheet's `memberIds`, mirroring the PWA derivation exactly (`new Set(
+/// collectionMemberships.filter(m => !m.deleted && m.noteId === noteId).map(m => m.collectionId))`,
 /// `NoteActionOverlay.jsx`): live **membership** rows only — no collection-liveness check and no
-/// notes join (the sheet filters its rendered rows to live collections itself). Store scan order
-/// (membership `created_at` DESC). No pagination: a note belongs to a handful of collections.
+/// notes join (the sheet filters its rendered rows to live collections itself). Deduped like the
+/// oracle's `Set`, for the same reason [`note_ids_for_collection`] dedups: a foreign row under a
+/// rogue random pk can pair the same (collection, note) twice, and a host rendering these as chips
+/// would show the collection twice until that row is tombstoned. Store scan order (membership
+/// `created_at` DESC). No pagination: a note belongs to a handful of collections.
 pub fn collection_ids_for_note(store: &Store, note_id: &str) -> rusqlite::Result<Vec<String>> {
+    let mut seen = HashSet::new();
     Ok(store
         .list_live("collection_memberships", Some(("note_id", note_id)), -1, 0)?
         .iter()
         .filter_map(|row| string_field(row, "collection_id"))
+        .filter(|id| seen.insert(id.clone()))
         .collect())
 }
 
@@ -1284,11 +1289,14 @@ mod tests {
                 &membership_row("cdead", "n1", 400),
             )
             .unwrap(); // collection has no row anywhere → still IN (oracle fidelity)
+        let mut dup = membership_row("c1", "n1", 500);
+        dup.insert("id".into(), json!("rogue-random-pk"));
+        store.apply_row("collection_memberships", &dup).unwrap(); // foreign dup pair → deduped
 
-        // store scan order: membership created_at DESC.
+        // store scan order: created_at DESC — the rogue dup (500) takes c1's slot, then dedup.
         assert_eq!(
             collection_ids_for_note(&store, "n1").unwrap(),
-            vec!["cdead", "c1"]
+            vec!["c1", "cdead"]
         );
         assert!(collection_ids_for_note(&store, "unknown")
             .unwrap()
