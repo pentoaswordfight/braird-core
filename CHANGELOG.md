@@ -6,6 +6,37 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-07-17
+
+Fourteenth release batch. This **SUR-923** minor release is Phase 2b read-API extension #3 —
+the **relation reads**: four additive `#[uniffi::export]` queries traversing the
+`collection_memberships` and `note_links` relations in both directions. They unblock the
+note-action-sheet twins (Add to collection SUR-924/927, Add the margins SUR-925/928), the
+Lexicon add/manage twins (SUR-930/931), and the scope-system twins (SUR-932/933). Additive,
+read-only, no schema change, and no decryption anywhere — no note text is involved. The version
+bump rides this PR (founder decision, 2026-07-17); consumers bump their pin to v0.8.0.
+
+### Added
+- **`collection_ids_for_note(note_id)` (SUR-923)** — ids of the live collections whose membership
+  row pairs with the note; the AddToCollectionSheet's `memberIds` derivation, mirrored exactly
+  (live membership rows only — no collection-liveness check, no notes join). Named for what it
+  returns, mirroring `note_ids_for_collection`.
+- **`note_links_for_note(note_id)` → `Vec<NoteLinkRecord>` (SUR-923)** — live note-link edges
+  where the note is either endpoint, one hop, both directions; the host filters direction and
+  `relation_type` exactly as every PWA read does. New `NoteLinkRecord`
+  (id, from/to note ids, relation_type, timestamps).
+- **`note_ids_for_collection(collection_id)` (SUR-923)** — live member note ids, deduped like the
+  PWA's `memberNoteIds` Set. Deliberately **join-free**: the host-side collection-delete cascade
+  must see every live membership — including one whose note is already soft-deleted — to
+  tombstone them all (`useCollections.removeCollection`); the scoped note list re-checks note
+  liveness host-side (`notesInCollection`).
+- **`collection_note_counts()` → `Vec<CollectionNoteCount>` (SUR-923)** — per-collection
+  live-note counts for the Lexicon Collections tab subtitles, shaped like `idea_counts`
+  (collection-id-asc, `count ≥ 1` only). **Founder-decided divergence (2026-07-17):** a
+  membership counts only when its note is present and live — the PWA's `noteCountByCollection`
+  counts raw live membership rows, but joining live notes keeps the subtitle consistent with the
+  scoped note list (`notesInCollection`) and this core's `idea_counts` convention.
+
 ## [0.7.2] - 2026-07-17
 
 Thirteenth release batch. This **SUR-934** patch release makes `export_snapshot` usable on a real
