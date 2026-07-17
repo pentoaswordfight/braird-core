@@ -947,8 +947,13 @@ mod tests {
         assert!(store.outbox_items().unwrap().is_empty());
     }
 
+    /// `n-legacy` OMITS `text`; `n-null-text` sets it explicitly to `null` — the shape the exporter
+    /// actually emits, since `map_fields` writes every note key (SUR-934). Both must import as a
+    /// text-less note with no invented content tag. Only the omitted form was covered before, which is
+    /// why `normalize_note` could reject an explicit null and nobody noticed the core was unable to
+    /// re-import its own export.
     #[test]
-    fn imported_notes_are_sealed_and_retagged_while_omitted_legacy_text_stays_null() {
+    fn imported_notes_are_sealed_and_retagged_while_omitted_or_null_legacy_text_stays_null() {
         let marker = "snapshot plaintext must never persist";
         let vault = Vault::generate();
         let dir = tempfile::tempdir().unwrap();
@@ -956,7 +961,8 @@ mod tests {
         let mut root: Value = serde_json::from_str(&archive_with("notes", Vec::new())).unwrap();
         root["notes"] = json!([
             {"id":"n-secret","bookId":"b1","text":marker,"contentTag":"foreign","updatedAt":50},
-            {"id":"n-legacy","bookId":null,"updatedAt":50}
+            {"id":"n-legacy","bookId":null,"updatedAt":50},
+            {"id":"n-null-text","bookId":null,"text":null,"updatedAt":50}
         ]);
         let parsed = parse_import_at(&root.to_string(), 10).unwrap();
         let store = Store::open(db.to_str().unwrap()).unwrap();
@@ -970,7 +976,7 @@ mod tests {
         ))
         .unwrap();
 
-        assert_eq!(summary.imported.notes, 2);
+        assert_eq!(summary.imported.notes, 3);
         let secret = store.get_row("notes", "n-secret").unwrap().unwrap();
         let ciphertext = secret["text"].as_str().unwrap();
         assert!(ciphertext.starts_with("enc:v2:"));
@@ -987,9 +993,15 @@ mod tests {
             json!(vault.content_tag(marker.into(), Some("b1".into())))
         );
         assert_ne!(secret["content_tag"], json!("foreign"));
-        let legacy = store.get_row("notes", "n-legacy").unwrap().unwrap();
-        assert!(legacy["text"].is_null());
-        assert!(legacy["content_tag"].is_null());
+        // Both text-less shapes — omitted key and explicit null — land as a null body with no invented tag.
+        for id in ["n-legacy", "n-null-text"] {
+            let legacy = store.get_row("notes", id).unwrap().unwrap();
+            assert!(legacy["text"].is_null(), "{id} kept a null body");
+            assert!(
+                legacy["content_tag"].is_null(),
+                "{id} was not given an invented tag"
+            );
+        }
 
         for (_, table, _, payload, _) in store.outbox_items().unwrap() {
             assert_eq!(table, "notes");

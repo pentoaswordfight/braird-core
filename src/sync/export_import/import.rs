@@ -288,7 +288,13 @@ fn normalize_note(
 ) -> Result<Map<String, Value>, SyncError> {
     let mut output = Map::new();
     copy_string(input, &mut output, "bookId", "book_id", true)?;
-    copy_string(input, &mut output, "text", "text", false)?;
+    // Nullable like every other string field here (SUR-934). A note legitimately has no text — an
+    // image-only capture, or a legacy row — and the exporter emits all note keys via `map_fields`, so
+    // it writes an explicit `"text": null` for one. Rejecting that made the core unable to re-import
+    // its OWN export, and `merge`'s `prepare_write` already contracts for it (`None | Some(Null)` →
+    // text + content_tag null, no invented tag). An omitted key was always accepted; an explicit null
+    // is the same fact stated out loud.
+    copy_string(input, &mut output, "text", "text", true)?;
     copy_string(input, &mut output, "page", "page", true)?;
     copy_string(input, &mut output, "imagePath", "image_path", true)?;
     copy_string(input, &mut output, "inkCropPath", "ink_crop_path", true)?;
