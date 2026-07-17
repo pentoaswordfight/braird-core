@@ -6,6 +6,22 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+### Fixed
+- **`enqueue_collection_membership` re-add now resurrects past the outbox sticky-delete (SUR-940).**
+  A `deleted = false` file/re-add routes through `stage_local_write_resurrecting` (dropping any
+  un-flushed tombstone for the deterministic `{collectionId}:{noteId}` id in the same transaction),
+  mirroring SUR-915 `unmerge_books`; a `deleted = true` soft-delete stays on the sticky
+  `stage_write` path. Without this, a **file → toggle-off → toggle-on of the same membership within
+  one un-flushed batch** (guaranteed offline; reachable online between sync intervals) collapsed to a
+  sticky `deleted: true` (the SUR-724 "delete wins, never resurrect" hardening) — the local mirror
+  showed the note filed while push sent a tombstone, silently dropping it from the collection on
+  every device. Surfaced by the SUR-927 (Android Add-to-collection) sync-reviewer gate, whose
+  toggle-off is the first host path to queue a membership tombstone. Membership-only: `note_links`
+  use random per-edge pks (a re-add is a new row) and collections/lenses have no re-add UI yet.
+  No FFI signature/docstring change (internal staging only) — bindings unchanged. A new engine-level
+  test collapses the store's outbox after add→off→on and asserts the pushed payload is `deleted:
+  false` (it fails without the fix).
+
 ## [0.8.0] - 2026-07-17
 
 Fourteenth release batch. This **SUR-923** minor release is Phase 2b read-API extension #3 —

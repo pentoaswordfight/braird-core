@@ -558,7 +558,21 @@ impl SyncEngine {
         row.insert("created_at".into(), json!(created_at));
         row.insert("updated_at".into(), json!(now));
         row.insert("deleted".into(), json!(deleted));
-        self.stage_write("collection_memberships", &id, row)
+        // A re-add (deleted=false) must RESURRECT: atomically drop any un-flushed tombstone for this
+        // deterministic membership id, so the outbox collapse can't eat the un-delete. Without it, an
+        // offline (or between-flush) file→off→on collapses to a sticky `deleted:true` (SUR-724 "delete
+        // wins") and the note is silently dropped from the collection on push, while the local mirror
+        // still shows it filed (SUR-940). A soft-delete (deleted=true) stays on the sticky path — a
+        // delete SHOULD win. Memberships are the only reachable resurrection case: note_links use a
+        // random per-edge pk (a re-add is a new row, not a same-pk un-delete), and collections/lenses
+        // have no re-add-after-delete host UI yet — extend here when they do.
+        if deleted {
+            self.stage_write("collection_memberships", &id, row)
+        } else {
+            lock!(self.store)
+                .stage_local_write_resurrecting("collection_memberships", &id, row, now)
+                .map_err(|e| SyncError::Store(e.to_string()))
+        }
     }
 
     /// Enqueue a note-signals upsert (SUR-726) — per-note behavioural counters, keyed by `note_id`
@@ -2270,6 +2284,57 @@ mod tests {
         assert_eq!(payload["id"], json!("colY:noteX"));
         assert_eq!(payload["note_id"], json!("noteX"));
         assert_eq!(payload["collection_id"], json!("colY"));
+    }
+
+    #[test]
+    fn membership_re_add_resurrects_past_the_outbox_sticky_delete() {
+        // SUR-940: file → toggle-off → toggle-on of the same membership within one un-flushed batch.
+        // The re-add must drop the queued tombstone so the COLLAPSED OUTBOX (what push sends) is
+        // deleted=false — otherwise the note is silently dropped from the collection server-side. The
+        // local synced mirror is deleted=false either way (last apply_row wins), which is exactly why
+        // this asserts the collapsed outbox and not a `collection_ids_for_note` read.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+
+        engine
+            .enqueue_collection_membership("n1".into(), "c1".into(), 100, false)
+            .unwrap(); // file
+        engine
+            .enqueue_collection_membership("n1".into(), "c1".into(), 100, true)
+            .unwrap(); // toggle off
+        engine
+            .enqueue_collection_membership("n1".into(), "c1".into(), 100, false)
+            .unwrap(); // toggle on
+
+        // Collapse the store's outbox exactly as the flush would.
+        let items: Vec<crate::sync::outbox::OutboxItem> = Store::open(db_path)
+            .unwrap()
+            .outbox_items()
+            .unwrap()
+            .into_iter()
+            .map(|(id, table_name, record_id, payload, created_at)| {
+                crate::sync::outbox::OutboxItem {
+                    id,
+                    table_name,
+                    record_id,
+                    payload: serde_json::from_str(&payload).unwrap(),
+                    created_at,
+                }
+            })
+            .collect();
+        let collapsed = crate::sync::outbox::collapse(items, &std::collections::BTreeMap::new());
+
+        let membership = collapsed
+            .iter()
+            .find(|c| c.table == "collection_memberships")
+            .expect("a membership upsert is queued");
+        assert_eq!(
+            membership.payload["deleted"],
+            json!(false),
+            "re-add wins: the collapsed push payload un-deletes the membership, not a sticky tombstone",
+        );
     }
 
     #[test]
