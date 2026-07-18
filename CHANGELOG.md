@@ -11,7 +11,7 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   for SUR-928).** A single FFI op that files a note's margins (handwritten annotations OCR'd from its
   source photo) as linked child notes, replacing any prior set — the transactional form of the PWA's
   `replaceHandwrittenAnnotations`. The host mints the child + link ids (via the new `MarginChild`
-  record `{ id, link_id, text }`) and trims the texts; core seals each child under the parent's LIVE
+  record `{ id, link_id, text, ink_crop_path }`) and trims the texts; core seals each child under the parent's LIVE
   `book_id` (read here, so children file where the parent lives now), creates the child notes +
   parent→child `handwritten_annotation` links, and tombstones the parent's prior handwritten children +
   their edges — **every row staged in ONE transaction** (`Store::stage_local_writes`, new). This
@@ -23,7 +23,13 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   (core never reads the parent's text — only its existence + book — and only the NEW child bodies are
   sealed). Children carry `source = "handwritten"`, empty tags, and `created_at` staggered by index so
   review order survives LWW. Note-links are a random-pk bag (host ids), so a re-run just adds a fresh
-  set and tombstones the prior one — no resurrect hazard. New FFI symbol + `MarginChild` record →
+  set and tombstones the prior one — no resurrect hazard. `MarginChild.ink_crop_path` (optional) carries
+  the uploaded ink-crop storage key for the capture-time handwriting path (iOS / PWA capture card) and is
+  stored verbatim on the child like `image_path`; Android's text-only action-sheet path passes `None`.
+  Retiring the prior set only ever tombstones this parent's edges — a child NOTE is tombstoned only when
+  it's a live handwritten note that no other live edge (any relation/direction) touches and that isn't
+  part of the new set (so a repointed regular survivor, a shared child, a child with a non-handwritten
+  edge, or an idempotent same-id retry can't lose data). New FFI symbol + `MarginChild` record →
   bindings regenerated; 2 args (`String` + `Vec<MarginChild>`), record lowers as one `RustBuffer`, so
   no arm64 >8-slot spill. Consumers bump their pin to pick it up.
 

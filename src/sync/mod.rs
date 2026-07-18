@@ -190,16 +190,23 @@ pub struct NoteUpsert {
     pub clear_nullable_fields: Vec<String>,
 }
 
-/// One margin to file under a parent note (SUR-952, the SUR-928 "Add the margins" feature). The host
-/// mints both ids and trims the text; core seals [`text`] under the parent's live book and stages the
-/// child note + its parent→child link atomically. [`id`] is the child note's id, [`link_id`] the
-/// parent→child `handwritten_annotation` edge's id — both host-supplied so core needs no uuid source,
-/// matching the note-link API where the host already owns id generation.
+/// One margin to file under a parent note (SUR-952, the "Add the margins" / capture-time handwriting
+/// features). The host mints both ids and trims the text; core seals [`text`] under the parent's live
+/// book and stages the child note + its parent→child link atomically. [`id`] is the child note's id,
+/// [`link_id`] the parent→child `handwritten_annotation` edge's id — both host-supplied so core needs no
+/// uuid source, matching the note-link API where the host already owns id generation.
+///
+/// [`ink_crop_path`] is the storage path of the handwriting's cropped image when the host has one (the
+/// capture-time detection path uploads the crop first, mirroring the PWA's `replaceHandwrittenAnnotations`
+/// `{text, cropDataUrl}` items → `inkCropPath`). It is plaintext metadata (a storage key, like
+/// `image_path` — not sealed), stored verbatim on the child. Android's action-sheet "Add the margins" is
+/// text-only (`transcribe_handwriting` returns no crops) and passes `None`.
 #[derive(Debug, uniffi::Record)]
 pub struct MarginChild {
     pub id: String,
     pub link_id: String,
     pub text: String,
+    pub ink_crop_path: Option<String>,
 }
 
 /// A book upsert draft (SUR-843) — the record form of [`SyncEngine::enqueue_book`]'s arguments.
@@ -518,8 +525,10 @@ impl SyncEngine {
     ///   the parent lives now, not where a host snapshot thought it did.
     /// - Allowed on a decrypt-failed parent: only the NEW child bodies are sealed; the parent's
     ///   ciphertext is never read or re-sealed.
-    /// - Children carry `source = "handwritten"`, empty tags, the parent's book, and `created_at`
-    ///   staggered by index so review order survives LWW. Note-links are a random-pk bag (host ids), so
+    /// - Children carry `source = "handwritten"`, empty tags, the parent's book, each
+    ///   [`MarginChild::ink_crop_path`] verbatim (`None` on Android's text-only path; a storage key on the
+    ///   capture-with-crops path), and `created_at` staggered by index so review order survives LWW.
+    ///   Note-links are a random-pk bag (host ids), so
     ///   a re-run with fresh ids adds a new set and tombstones the prior one; a retry re-sending the SAME
     ///   ids is idempotent — a row in the new set is NEVER retired, so the batch can't stage a create then
     ///   a sticky delete for it (SUR-724 collapse) and destroy the margins it meant to preserve.
@@ -585,6 +594,7 @@ impl SyncEngine {
             let mut note = Map::new();
             note.insert("id".into(), json!(child.id));
             insert_opt(&mut note, "book_id", book_id.clone());
+            insert_opt(&mut note, "ink_crop_path", child.ink_crop_path.clone());
             note.insert("tags".into(), json!(Vec::<String>::new()));
             note.insert("source".into(), json!("handwritten"));
             note.insert("text".into(), json!(ciphertext));
@@ -2704,6 +2714,7 @@ mod tests {
             id: id.into(),
             link_id: link_id.into(),
             text: text.into(),
+            ink_crop_path: None,
         }
     }
 
@@ -3045,6 +3056,46 @@ mod tests {
                 .into_iter()
                 .collect::<std::collections::HashSet<_>>(),
             "both edges stay live — no self-inflicted tombstone",
+        );
+    }
+
+    #[test]
+    fn replace_handwritten_annotations_stores_ink_crop_path_when_supplied() {
+        // Capture-time handwriting detection (iOS / PWA capture card) uploads the crop first and passes
+        // its storage path; core stores it verbatim on the child. Android's action-sheet path passes None.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine.enqueue_note(parent_with_book("p", "b1")).unwrap();
+
+        engine
+            .replace_handwritten_annotations(
+                "p".into(),
+                vec![
+                    MarginChild {
+                        id: "c1".into(),
+                        link_id: "e1".into(),
+                        text: "a scribble".into(),
+                        ink_crop_path: Some("userId/c1.jpg".into()),
+                    },
+                    margin("c2", "e2", "text-only margin"), // ink_crop_path None
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(
+            engine
+                .get_note("c1".into())
+                .unwrap()
+                .unwrap()
+                .ink_crop_path
+                .as_deref(),
+            Some("userId/c1.jpg")
+        );
+        assert_eq!(
+            engine.get_note("c2".into()).unwrap().unwrap().ink_crop_path,
+            None
         );
     }
 

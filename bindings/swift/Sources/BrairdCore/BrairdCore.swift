@@ -845,8 +845,10 @@ public protocol SyncEngineProtocol : AnyObject {
      * the parent lives now, not where a host snapshot thought it did.
      * - Allowed on a decrypt-failed parent: only the NEW child bodies are sealed; the parent's
      * ciphertext is never read or re-sealed.
-     * - Children carry `source = "handwritten"`, empty tags, the parent's book, and `created_at`
-     * staggered by index so review order survives LWW. Note-links are a random-pk bag (host ids), so
+     * - Children carry `source = "handwritten"`, empty tags, the parent's book, each
+     * [`MarginChild::ink_crop_path`] verbatim (`None` on Android's text-only path; a storage key on the
+     * capture-with-crops path), and `created_at` staggered by index so review order survives LWW.
+     * Note-links are a random-pk bag (host ids), so
      * a re-run with fresh ids adds a new set and tombstones the prior one; a retry re-sending the SAME
      * ids is idempotent — a row in the new set is NEVER retired, so the batch can't stage a create then
      * a sticky delete for it (SUR-724 collapse) and destroy the margins it meant to preserve.
@@ -1484,8 +1486,10 @@ open func recentNote(nowMs: Int64, seed: UInt64)throws  -> NoteRecord? {
      * the parent lives now, not where a host snapshot thought it did.
      * - Allowed on a decrypt-failed parent: only the NEW child bodies are sealed; the parent's
      * ciphertext is never read or re-sealed.
-     * - Children carry `source = "handwritten"`, empty tags, the parent's book, and `created_at`
-     * staggered by index so review order survives LWW. Note-links are a random-pk bag (host ids), so
+     * - Children carry `source = "handwritten"`, empty tags, the parent's book, each
+     * [`MarginChild::ink_crop_path`] verbatim (`None` on Android's text-only path; a storage key on the
+     * capture-with-crops path), and `created_at` staggered by index so review order survives LWW.
+     * Note-links are a random-pk bag (host ids), so
      * a re-run with fresh ids adds a new set and tombstones the prior one; a retry re-sending the SAME
      * ids is idempotent — a row in the new set is NEVER retired, so the batch can't stage a create then
      * a sticky delete for it (SUR-724 collapse) and destroy the margins it meant to preserve.
@@ -3027,23 +3031,31 @@ public func FfiConverterTypeLensRecord_lower(_ value: LensRecord) -> RustBuffer 
 
 
 /**
- * One margin to file under a parent note (SUR-952, the SUR-928 "Add the margins" feature). The host
- * mints both ids and trims the text; core seals [`text`] under the parent's live book and stages the
- * child note + its parent→child link atomically. [`id`] is the child note's id, [`link_id`] the
- * parent→child `handwritten_annotation` edge's id — both host-supplied so core needs no uuid source,
- * matching the note-link API where the host already owns id generation.
+ * One margin to file under a parent note (SUR-952, the "Add the margins" / capture-time handwriting
+ * features). The host mints both ids and trims the text; core seals [`text`] under the parent's live
+ * book and stages the child note + its parent→child link atomically. [`id`] is the child note's id,
+ * [`link_id`] the parent→child `handwritten_annotation` edge's id — both host-supplied so core needs no
+ * uuid source, matching the note-link API where the host already owns id generation.
+ *
+ * [`ink_crop_path`] is the storage path of the handwriting's cropped image when the host has one (the
+ * capture-time detection path uploads the crop first, mirroring the PWA's `replaceHandwrittenAnnotations`
+ * `{text, cropDataUrl}` items → `inkCropPath`). It is plaintext metadata (a storage key, like
+ * `image_path` — not sealed), stored verbatim on the child. Android's action-sheet "Add the margins" is
+ * text-only (`transcribe_handwriting` returns no crops) and passes `None`.
  */
 public struct MarginChild {
     public var id: String
     public var linkId: String
     public var text: String
+    public var inkCropPath: String?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(id: String, linkId: String, text: String) {
+    public init(id: String, linkId: String, text: String, inkCropPath: String?) {
         self.id = id
         self.linkId = linkId
         self.text = text
+        self.inkCropPath = inkCropPath
     }
 }
 
@@ -3060,6 +3072,9 @@ extension MarginChild: Equatable, Hashable {
         if lhs.text != rhs.text {
             return false
         }
+        if lhs.inkCropPath != rhs.inkCropPath {
+            return false
+        }
         return true
     }
 
@@ -3067,6 +3082,7 @@ extension MarginChild: Equatable, Hashable {
         hasher.combine(id)
         hasher.combine(linkId)
         hasher.combine(text)
+        hasher.combine(inkCropPath)
     }
 }
 
@@ -3080,7 +3096,8 @@ public struct FfiConverterTypeMarginChild: FfiConverterRustBuffer {
             try MarginChild(
                 id: FfiConverterString.read(from: &buf), 
                 linkId: FfiConverterString.read(from: &buf), 
-                text: FfiConverterString.read(from: &buf)
+                text: FfiConverterString.read(from: &buf), 
+                inkCropPath: FfiConverterOptionString.read(from: &buf)
         )
     }
 
@@ -3088,6 +3105,7 @@ public struct FfiConverterTypeMarginChild: FfiConverterRustBuffer {
         FfiConverterString.write(value.id, into: &buf)
         FfiConverterString.write(value.linkId, into: &buf)
         FfiConverterString.write(value.text, into: &buf)
+        FfiConverterOptionString.write(value.inkCropPath, into: &buf)
     }
 }
 
@@ -5067,7 +5085,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_braird_core_checksum_method_syncengine_recent_note() != 17557) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_braird_core_checksum_method_syncengine_replace_handwritten_annotations() != 37832) {
+    if (uniffi_braird_core_checksum_method_syncengine_replace_handwritten_annotations() != 41694) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_search() != 14411) {

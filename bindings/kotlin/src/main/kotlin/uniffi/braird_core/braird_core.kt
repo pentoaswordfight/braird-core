@@ -1271,7 +1271,7 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_braird_core_checksum_method_syncengine_recent_note() != 17557.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_braird_core_checksum_method_syncengine_replace_handwritten_annotations() != 37832.toShort()) {
+    if (lib.uniffi_braird_core_checksum_method_syncengine_replace_handwritten_annotations() != 41694.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_search() != 14411.toShort()) {
@@ -2030,8 +2030,10 @@ public interface SyncEngineInterface {
      * the parent lives now, not where a host snapshot thought it did.
      * - Allowed on a decrypt-failed parent: only the NEW child bodies are sealed; the parent's
      * ciphertext is never read or re-sealed.
-     * - Children carry `source = "handwritten"`, empty tags, the parent's book, and `created_at`
-     * staggered by index so review order survives LWW. Note-links are a random-pk bag (host ids), so
+     * - Children carry `source = "handwritten"`, empty tags, the parent's book, each
+     * [`MarginChild::ink_crop_path`] verbatim (`None` on Android's text-only path; a storage key on the
+     * capture-with-crops path), and `created_at` staggered by index so review order survives LWW.
+     * Note-links are a random-pk bag (host ids), so
      * a re-run with fresh ids adds a new set and tombstones the prior one; a retry re-sending the SAME
      * ids is idempotent — a row in the new set is NEVER retired, so the batch can't stage a create then
      * a sticky delete for it (SUR-724 collapse) and destroy the margins it meant to preserve.
@@ -2799,8 +2801,10 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
      * the parent lives now, not where a host snapshot thought it did.
      * - Allowed on a decrypt-failed parent: only the NEW child bodies are sealed; the parent's
      * ciphertext is never read or re-sealed.
-     * - Children carry `source = "handwritten"`, empty tags, the parent's book, and `created_at`
-     * staggered by index so review order survives LWW. Note-links are a random-pk bag (host ids), so
+     * - Children carry `source = "handwritten"`, empty tags, the parent's book, each
+     * [`MarginChild::ink_crop_path`] verbatim (`None` on Android's text-only path; a storage key on the
+     * capture-with-crops path), and `created_at` staggered by index so review order survives LWW.
+     * Note-links are a random-pk bag (host ids), so
      * a re-run with fresh ids adds a new set and tombstones the prior one; a retry re-sending the SAME
      * ids is idempotent — a row in the new set is NEVER retired, so the batch can't stage a create then
      * a sticky delete for it (SUR-724 collapse) and destroy the margins it meant to preserve.
@@ -4010,16 +4014,23 @@ public object FfiConverterTypeLensRecord: FfiConverterRustBuffer<LensRecord> {
 
 
 /**
- * One margin to file under a parent note (SUR-952, the SUR-928 "Add the margins" feature). The host
- * mints both ids and trims the text; core seals [`text`] under the parent's live book and stages the
- * child note + its parent→child link atomically. [`id`] is the child note's id, [`link_id`] the
- * parent→child `handwritten_annotation` edge's id — both host-supplied so core needs no uuid source,
- * matching the note-link API where the host already owns id generation.
+ * One margin to file under a parent note (SUR-952, the "Add the margins" / capture-time handwriting
+ * features). The host mints both ids and trims the text; core seals [`text`] under the parent's live
+ * book and stages the child note + its parent→child link atomically. [`id`] is the child note's id,
+ * [`link_id`] the parent→child `handwritten_annotation` edge's id — both host-supplied so core needs no
+ * uuid source, matching the note-link API where the host already owns id generation.
+ *
+ * [`ink_crop_path`] is the storage path of the handwriting's cropped image when the host has one (the
+ * capture-time detection path uploads the crop first, mirroring the PWA's `replaceHandwrittenAnnotations`
+ * `{text, cropDataUrl}` items → `inkCropPath`). It is plaintext metadata (a storage key, like
+ * `image_path` — not sealed), stored verbatim on the child. Android's action-sheet "Add the margins" is
+ * text-only (`transcribe_handwriting` returns no crops) and passes `None`.
  */
 data class MarginChild (
     var `id`: kotlin.String, 
     var `linkId`: kotlin.String, 
-    var `text`: kotlin.String
+    var `text`: kotlin.String, 
+    var `inkCropPath`: kotlin.String?
 ) {
     
     companion object
@@ -4034,19 +4045,22 @@ public object FfiConverterTypeMarginChild: FfiConverterRustBuffer<MarginChild> {
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
+            FfiConverterOptionalString.read(buf),
         )
     }
 
     override fun allocationSize(value: MarginChild) = (
             FfiConverterString.allocationSize(value.`id`) +
             FfiConverterString.allocationSize(value.`linkId`) +
-            FfiConverterString.allocationSize(value.`text`)
+            FfiConverterString.allocationSize(value.`text`) +
+            FfiConverterOptionalString.allocationSize(value.`inkCropPath`)
     )
 
     override fun write(value: MarginChild, buf: ByteBuffer) {
             FfiConverterString.write(value.`id`, buf)
             FfiConverterString.write(value.`linkId`, buf)
             FfiConverterString.write(value.`text`, buf)
+            FfiConverterOptionalString.write(value.`inkCropPath`, buf)
     }
 }
 
