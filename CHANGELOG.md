@@ -6,6 +6,66 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+### Added
+- **`replace_handwritten_annotations(parent_id, children)` — atomic "Add the margins" op (SUR-952,
+  for SUR-928).** A single FFI op that files a note's margins (handwritten annotations OCR'd from its
+  source photo) as linked child notes, replacing any prior set — the transactional form of the PWA's
+  `replaceHandwrittenAnnotations`. The host mints the child + link ids (via the new `MarginChild`
+  record `{ id, link_id, text, ink_crop_path }`) and trims the texts; core seals each child under the parent's LIVE
+  `book_id` (read here, so children file where the parent lives now), creates the child notes +
+  parent→child `handwritten_annotation` links, and tombstones the parent's prior handwritten children +
+  their edges — **every row staged in ONE transaction** (`Store::stage_local_writes`, new). This
+  exists because the host's per-item `enqueue_note` + `enqueue_note_link` were two separate
+  transactions: a crash between them orphaned a child note with no edge, which never converged (a
+  re-run reads prior children from live edges, so an edgeless orphan is invisible to cleanup). One
+  transaction closes that window. Empty `children` is a no-op that leaves existing margins intact (PWA
+  early-return parity); the parent must exist and be live; it's allowed on a decrypt-failed parent
+  (core never reads the parent's text — only its existence + book — and only the NEW child bodies are
+  sealed). Children carry `source = "handwritten"`, empty tags, and `created_at` staggered by index so
+  review order survives LWW. Note-links are a random-pk bag (host ids), so a re-run just adds a fresh
+  set and tombstones the prior one — no resurrect hazard. `MarginChild.ink_crop_path` (optional) carries
+  the uploaded ink-crop storage key for the capture-time handwriting path (iOS / PWA capture card) and is
+  stored verbatim on the child like `image_path`; Android's text-only action-sheet path passes `None`.
+  Retiring the prior set only ever tombstones this parent's edges — a child NOTE is tombstoned only when
+  it's a live handwritten note that no other live edge (any relation/direction) touches and that isn't
+  part of the new set (so a repointed regular survivor, a shared child, a child with a non-handwritten
+  edge, or an idempotent same-id retry can't lose data). Live writes in the batch drop any still-queued
+  tombstone for their id from a previous un-flushed replace (`stage_local_writes` resurrect rule, the
+  `stage_import_batch` sibling) — otherwise the SUR-724 sticky collapse would flush a re-created margin
+  as deleted with a fresh `updated_at`, a divergence the strict-tie LWW pull can never repair. Prior-edge
+  tombstones carry the STORED row's full NOT-NULL shape with `created_at` preserved (the SUR-942
+  membership convention; `note_links` has no sparse-PATCH flush fallback, so a bare `{id, deleted}`
+  tombstone would 23502 on every flush and wedge the outbox — found by the SUR-952 adversarial sweep).
+  Texts are trimmed and blank items dropped in core (PWA filters before its length check — an all-blank
+  call preserves existing margins). Create rows write **EVERY synced notes column explicitly** — the
+  MarginChild-owned values plus the PWA child literal's cleared shapes (`page: ""`, `chapter`/
+  `image_path`/`source_id`: null, `source_meta: {}`; `created_at`/`updated_at` both staggered `now + i`,
+  matching the PWA's child AND edge) — because staging merges partials and the server upsert only sets
+  the columns a payload names, so any omitted column would let an id-reusing restore resurrect stale
+  fields (a whole-page photo, a source, a page number) off the prior row, locally and on the cloud. A
+  schema-completeness test pins the create-row shape (and the edge tombstone's) to the drift-guarded
+  `vendored/schema/sync-schema.json`, so a new synced column fails the build until covered. Host-minted
+  ids are validated fail-loud — reusing an existing id is legal ONLY for this parent's prior handwritten
+  margin (retry/repoint/restore) that **no other live edge still touches**: parent collisions, in-call
+  duplicates, a child id on any non-margin note or another parent's margin, a reused child id any
+  foreign live edge (any relation, either direction — a shared dedupe survivor, a generic `related`
+  row, even this parent's own) still references — the retire loop deliberately KEEPS such entangled
+  children, so the create loop must never overwrite one — and a link id on any non-handwritten edge
+  (including this parent's own `related`/`duplicate_of` edges, which a from-check alone would wave
+  through) all reject the whole call; a corrupt p→p self-edge retires the edge only, never the parent.
+  The child-id edge checks run **whether or not the child's notes row exists locally**: pull skips
+  the tombstone of a row a device never had while edges apply independently (no local FK), so a
+  fleet-deleted child can stand locally as dangling live edges with no notes row — a row-existence-
+  gated check would let exactly that id bypass validation, resurrect the note over its server
+  tombstone on flush, and rewrite what the surviving foreign edge still renders (found pre-push by
+  the round-8 adversarial verification; the dangling cells are pinned in the grid). A 27-cell
+  reuse-state grid test enumerates every reachable (stored-row × edge-topology × queue) state for a
+  reused child/link id and asserts each cell either rejects before staging — with the outbox proven
+  byte-empty after — or converges per a post-condition oracle (exact live edge set, sealed text
+  round-trip, live-not-sticky flush payloads). New FFI symbol + `MarginChild` record →
+  bindings regenerated; 2 args (`String` + `Vec<MarginChild>`), record lowers as one `RustBuffer`, so
+  no arm64 >8-slot spill. Consumers bump their pin to pick it up.
+
 ## [0.8.2] - 2026-07-18
 
 Sixteenth release batch. Patch release: the collection-membership tombstone now preserves the

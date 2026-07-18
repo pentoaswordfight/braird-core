@@ -828,6 +828,72 @@ public protocol SyncEngineProtocol : AnyObject {
     func recentNote(nowMs: Int64, seed: UInt64) throws  -> NoteRecord?
     
     /**
+     * Atomically replace a note's handwritten margins (SUR-952, the SUR-928 "Add the margins"
+     * feature; the PWA's `replaceHandwrittenAnnotations`). Seals each [`MarginChild::text`] under the
+     * parent's LIVE book, creates the new child notes + their parent→child `handwritten_annotation`
+     * links, and retires the parent's prior handwritten children + edges — every row staged in ONE
+     * transaction ([`Store::stage_local_writes`]).
+     *
+     * This exists because the host's per-item `enqueue_note` + `enqueue_note_link` were two separate
+     * transactions: a crash between them orphaned a child note with no edge, which never converged (a
+     * re-run reads prior children from live edges, so an edgeless orphan is invisible to cleanup). One
+     * transaction closes that window — the whole replace commits or rolls back, and a retry re-does it.
+     *
+     * - Texts are trimmed and blank items dropped IN CORE (the PWA filters before its length check);
+     * an empty or all-blank [`children`] is a no-op that leaves existing margins intact — guarded
+     * before any read so it can't error on a missing/locked parent.
+     * - Host-minted ids are validated fail-loud before staging: reusing an existing id is legal ONLY
+     * for THIS parent's prior handwritten margin (retry/repoint/restore) that NO OTHER live edge
+     * still touches. A child/link id equal to the parent, a duplicate within the call, a child id
+     * on any non-margin note or on ANOTHER parent's margin, a reused child id that any foreign
+     * live edge — any relation type, either direction, and whether or not the child's notes row
+     * exists locally (pull can skip a never-seen row's tombstone while its edges apply, so a
+     * fleet-deleted child can stand as dangling live edges; reusing it would resurrect the note
+     * over its server tombstone) — still references (the retire loop deliberately KEEPS such
+     * shared/entangled children, so the create loop must never overwrite one; the host mints a
+     * fresh id instead), or a link id on any non-handwritten edge —
+     * including this parent's own `related`/`duplicate_of` edges — rejects the WHOLE call; each
+     * would silently corrupt, steal, or orphan a row the create loop would otherwise overwrite.
+     * - The parent must exist and be live; its CURRENT `book_id` is read here, so children file where
+     * the parent lives now, not where a host snapshot thought it did.
+     * - Allowed on a decrypt-failed parent: only the NEW child bodies are sealed; the parent's
+     * ciphertext is never read or re-sealed.
+     * - Children carry `source = "handwritten"`, empty tags, the parent's book, each
+     * [`MarginChild::ink_crop_path`] verbatim (`None` on Android's text-only path; a storage key on the
+     * capture-with-crops path), and `created_at`/`updated_at` staggered by index so review order
+     * survives LWW (the PWA child writes `createdAt: now + i, updatedAt: now + i`). EVERY other
+     * synced notes column is written as the PWA child literal's explicit cleared shape (empty
+     * `page`, null `chapter`/`image_path`/`source_id`, `{}` `source_meta`), so an id reuse can
+     * never resurrect a stale field through the staging merge or the server's column-list upsert.
+     * Note-links are a random-pk bag (host ids), so
+     * a re-run with fresh ids adds a new set and tombstones the prior one; a retry re-sending the SAME
+     * ids is idempotent — a row in the new set is NEVER retired, so the batch can't stage a create then
+     * a sticky delete for it (SUR-724 collapse) and destroy the margins it meant to preserve. The same
+     * holds ACROSS batches: a live write in this batch drops any still-queued tombstone for its id from
+     * a PREVIOUS (offline, un-flushed) replace ([`Store::stage_local_writes`]' resurrect rule), so a
+     * retry/restore that re-creates a previously retired id flushes live, not as a sticky delete the
+     * strict-tie LWW pull could never repair.
+     * - HOST CONTRACT (the flip side of that resurrect rule): minted child/link ids are single-shot per
+     * user-initiated replace. A host must NEVER persist a `children` set and replay it after the
+     * reader could have touched the results — the replay would faithfully re-assert those exact ids
+     * live, silently undoing an intervening reader delete or edit of a margin. Replay the same ids
+     * only within one unacknowledged write attempt; any later retry mints fresh ids.
+     * - Retiring the prior set ALWAYS tombstones this parent's edges — as the STORED row's full
+     * NOT-NULL shape with its `created_at` preserved (the SUR-942 membership convention; note_links
+     * has no sparse-PATCH flush fallback, so a bare tombstone would 23502 and wedge the outbox) —
+     * but tombstones a child NOTE only when it is still a live handwritten note that NO OTHER live
+     * edge — any relation type, either direction — still touches, and never the parent itself (a
+     * corrupt self-edge retires the edge only). `note_links` are generic and the reconciler
+     * preserves/repoints every type, so a margin child can be a repointed regular survivor, a shared
+     * child of several parents, or carry a non-handwritten edge (e.g. an imported `related` row); in
+     * each case deleting the note would dangle another edge or destroy a regular note, so only the
+     * edge is retired.
+     *
+     * Returns the count of margin children created.
+     */
+    func replaceHandwrittenAnnotations(parentId: String, children: [MarginChild]) throws  -> UInt32
+    
+    /**
      * Lexical search over decrypted note text + custom-idea name/description (SUR-527 parity).
      * Rebuilds the in-memory index from the live store per call — no plaintext touches disk —
      * and returns up to `limit` hits, best-first.
@@ -1428,6 +1494,79 @@ open func recentNote(nowMs: Int64, seed: UInt64)throws  -> NoteRecord? {
     uniffi_braird_core_fn_method_syncengine_recent_note(self.uniffiClonePointer(),
         FfiConverterInt64.lower(nowMs),
         FfiConverterUInt64.lower(seed),$0
+    )
+})
+}
+    
+    /**
+     * Atomically replace a note's handwritten margins (SUR-952, the SUR-928 "Add the margins"
+     * feature; the PWA's `replaceHandwrittenAnnotations`). Seals each [`MarginChild::text`] under the
+     * parent's LIVE book, creates the new child notes + their parent→child `handwritten_annotation`
+     * links, and retires the parent's prior handwritten children + edges — every row staged in ONE
+     * transaction ([`Store::stage_local_writes`]).
+     *
+     * This exists because the host's per-item `enqueue_note` + `enqueue_note_link` were two separate
+     * transactions: a crash between them orphaned a child note with no edge, which never converged (a
+     * re-run reads prior children from live edges, so an edgeless orphan is invisible to cleanup). One
+     * transaction closes that window — the whole replace commits or rolls back, and a retry re-does it.
+     *
+     * - Texts are trimmed and blank items dropped IN CORE (the PWA filters before its length check);
+     * an empty or all-blank [`children`] is a no-op that leaves existing margins intact — guarded
+     * before any read so it can't error on a missing/locked parent.
+     * - Host-minted ids are validated fail-loud before staging: reusing an existing id is legal ONLY
+     * for THIS parent's prior handwritten margin (retry/repoint/restore) that NO OTHER live edge
+     * still touches. A child/link id equal to the parent, a duplicate within the call, a child id
+     * on any non-margin note or on ANOTHER parent's margin, a reused child id that any foreign
+     * live edge — any relation type, either direction, and whether or not the child's notes row
+     * exists locally (pull can skip a never-seen row's tombstone while its edges apply, so a
+     * fleet-deleted child can stand as dangling live edges; reusing it would resurrect the note
+     * over its server tombstone) — still references (the retire loop deliberately KEEPS such
+     * shared/entangled children, so the create loop must never overwrite one; the host mints a
+     * fresh id instead), or a link id on any non-handwritten edge —
+     * including this parent's own `related`/`duplicate_of` edges — rejects the WHOLE call; each
+     * would silently corrupt, steal, or orphan a row the create loop would otherwise overwrite.
+     * - The parent must exist and be live; its CURRENT `book_id` is read here, so children file where
+     * the parent lives now, not where a host snapshot thought it did.
+     * - Allowed on a decrypt-failed parent: only the NEW child bodies are sealed; the parent's
+     * ciphertext is never read or re-sealed.
+     * - Children carry `source = "handwritten"`, empty tags, the parent's book, each
+     * [`MarginChild::ink_crop_path`] verbatim (`None` on Android's text-only path; a storage key on the
+     * capture-with-crops path), and `created_at`/`updated_at` staggered by index so review order
+     * survives LWW (the PWA child writes `createdAt: now + i, updatedAt: now + i`). EVERY other
+     * synced notes column is written as the PWA child literal's explicit cleared shape (empty
+     * `page`, null `chapter`/`image_path`/`source_id`, `{}` `source_meta`), so an id reuse can
+     * never resurrect a stale field through the staging merge or the server's column-list upsert.
+     * Note-links are a random-pk bag (host ids), so
+     * a re-run with fresh ids adds a new set and tombstones the prior one; a retry re-sending the SAME
+     * ids is idempotent — a row in the new set is NEVER retired, so the batch can't stage a create then
+     * a sticky delete for it (SUR-724 collapse) and destroy the margins it meant to preserve. The same
+     * holds ACROSS batches: a live write in this batch drops any still-queued tombstone for its id from
+     * a PREVIOUS (offline, un-flushed) replace ([`Store::stage_local_writes`]' resurrect rule), so a
+     * retry/restore that re-creates a previously retired id flushes live, not as a sticky delete the
+     * strict-tie LWW pull could never repair.
+     * - HOST CONTRACT (the flip side of that resurrect rule): minted child/link ids are single-shot per
+     * user-initiated replace. A host must NEVER persist a `children` set and replay it after the
+     * reader could have touched the results — the replay would faithfully re-assert those exact ids
+     * live, silently undoing an intervening reader delete or edit of a margin. Replay the same ids
+     * only within one unacknowledged write attempt; any later retry mints fresh ids.
+     * - Retiring the prior set ALWAYS tombstones this parent's edges — as the STORED row's full
+     * NOT-NULL shape with its `created_at` preserved (the SUR-942 membership convention; note_links
+     * has no sparse-PATCH flush fallback, so a bare tombstone would 23502 and wedge the outbox) —
+     * but tombstones a child NOTE only when it is still a live handwritten note that NO OTHER live
+     * edge — any relation type, either direction — still touches, and never the parent itself (a
+     * corrupt self-edge retires the edge only). `note_links` are generic and the reconciler
+     * preserves/repoints every type, so a margin child can be a repointed regular survivor, a shared
+     * child of several parents, or carry a non-handwritten edge (e.g. an imported `related` row); in
+     * each case deleting the note would dangle another edge or destroy a regular note, so only the
+     * edge is retired.
+     *
+     * Returns the count of margin children created.
+     */
+open func replaceHandwrittenAnnotations(parentId: String, children: [MarginChild])throws  -> UInt32 {
+    return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_braird_core_fn_method_syncengine_replace_handwritten_annotations(self.uniffiClonePointer(),
+        FfiConverterString.lower(parentId),
+        FfiConverterSequenceTypeMarginChild.lower(children),$0
     )
 })
 }
@@ -2948,6 +3087,101 @@ public func FfiConverterTypeLensRecord_lift(_ buf: RustBuffer) throws -> LensRec
 #endif
 public func FfiConverterTypeLensRecord_lower(_ value: LensRecord) -> RustBuffer {
     return FfiConverterTypeLensRecord.lower(value)
+}
+
+
+/**
+ * One margin to file under a parent note (SUR-952, the "Add the margins" / capture-time handwriting
+ * features). The host mints both ids and trims the text; core seals [`text`] under the parent's live
+ * book and stages the child note + its parent→child link atomically. [`id`] is the child note's id,
+ * [`link_id`] the parent→child `handwritten_annotation` edge's id — both host-supplied so core needs no
+ * uuid source, matching the note-link API where the host already owns id generation.
+ *
+ * [`ink_crop_path`] is the storage path of the handwriting's cropped image when the host has one (the
+ * capture-time detection path uploads the crop first, mirroring the PWA's `replaceHandwrittenAnnotations`
+ * `{text, cropDataUrl}` items → `inkCropPath`). It is plaintext metadata (a storage key, like
+ * `image_path` — not sealed), stored verbatim on the child. Android's action-sheet "Add the margins" is
+ * text-only (`transcribe_handwriting` returns no crops) and passes `None`.
+ */
+public struct MarginChild {
+    public var id: String
+    public var linkId: String
+    public var text: String
+    public var inkCropPath: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(id: String, linkId: String, text: String, inkCropPath: String?) {
+        self.id = id
+        self.linkId = linkId
+        self.text = text
+        self.inkCropPath = inkCropPath
+    }
+}
+
+
+
+extension MarginChild: Equatable, Hashable {
+    public static func ==(lhs: MarginChild, rhs: MarginChild) -> Bool {
+        if lhs.id != rhs.id {
+            return false
+        }
+        if lhs.linkId != rhs.linkId {
+            return false
+        }
+        if lhs.text != rhs.text {
+            return false
+        }
+        if lhs.inkCropPath != rhs.inkCropPath {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(id)
+        hasher.combine(linkId)
+        hasher.combine(text)
+        hasher.combine(inkCropPath)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMarginChild: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MarginChild {
+        return
+            try MarginChild(
+                id: FfiConverterString.read(from: &buf), 
+                linkId: FfiConverterString.read(from: &buf), 
+                text: FfiConverterString.read(from: &buf), 
+                inkCropPath: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: MarginChild, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.id, into: &buf)
+        FfiConverterString.write(value.linkId, into: &buf)
+        FfiConverterString.write(value.text, into: &buf)
+        FfiConverterOptionString.write(value.inkCropPath, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMarginChild_lift(_ buf: RustBuffer) throws -> MarginChild {
+    return try FfiConverterTypeMarginChild.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMarginChild_lower(_ value: MarginChild) -> RustBuffer {
+    return FfiConverterTypeMarginChild.lower(value)
 }
 
 
@@ -4617,6 +4851,31 @@ fileprivate struct FfiConverterSequenceTypeLensRecord: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeMarginChild: FfiConverterRustBuffer {
+    typealias SwiftType = [MarginChild]
+
+    public static func write(_ value: [MarginChild], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeMarginChild.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [MarginChild] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [MarginChild]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeMarginChild.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeNoteBookAssignment: FfiConverterRustBuffer {
     typealias SwiftType = [NoteBookAssignment]
 
@@ -4884,6 +5143,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_recent_note() != 17557) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_braird_core_checksum_method_syncengine_replace_handwritten_annotations() != 57875) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_search() != 14411) {

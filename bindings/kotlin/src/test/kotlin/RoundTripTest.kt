@@ -649,6 +649,15 @@ class RoundTripTest {
         val methods = SyncEngine::class.java.methods.map { it.name }
         assertTrue("exportSnapshot" in methods)
         assertTrue("importMerge" in methods)
-        assertFalse(methods.any { it.contains("replace", ignoreCase = true) })
+        // The invariant is that the SNAPSHOT/IMPORT surface is merge-only — no whole-corpus Replace
+        // entrypoint that could wipe a reader's notes. Scope the check to that; the SUR-952 margin op
+        // (`replaceHandwrittenAnnotations`) is a scoped, reader-initiated per-note replace named for PWA
+        // parity, NOT a snapshot Replace, so it's deliberately allowed.
+        assertFalse(
+            methods.any {
+                it.contains("replace", ignoreCase = true) &&
+                    (it.contains("snapshot", ignoreCase = true) || it.contains("import", ignoreCase = true))
+            },
+        )
     }
 }
