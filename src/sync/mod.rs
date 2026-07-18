@@ -521,6 +521,11 @@ impl SyncEngine {
     /// - Children carry `source = "handwritten"`, empty tags, the parent's book, and `created_at`
     ///   staggered by index so review order survives LWW. Note-links are a random-pk bag (host ids), so
     ///   a re-run just adds a fresh set and tombstones the prior one — no resurrect hazard.
+    /// - Retiring the prior set ALWAYS tombstones this parent's edges, but tombstones a child NOTE only
+    ///   when it is still a live handwritten note that NO OTHER live handwritten edge references. The
+    ///   duplicate reconciler (`reconcile::repoint_note_links`) can repoint an edge onto a regular
+    ///   survivor, or leave several parents' edges on one shared child — neither may be destroyed by a
+    ///   single-parent replace, so the edge is retired without touching the note.
     ///
     /// Returns the count of margin children created.
     pub fn replace_handwritten_annotations(
@@ -597,19 +602,57 @@ impl SyncEngine {
             writes.push(("note_links", child.link_id.clone(), link));
         }
 
-        // THEN retire the prior children + their edges (partial tombstones merged onto the live rows).
+        // THEN retire the prior set. ALWAYS tombstone this parent's edges, but tombstone the CHILD NOTE
+        // only when it's genuinely a spent margin: a LIVE `source="handwritten"` note that NO OTHER live
+        // handwritten edge still points at. The duplicate reconciler (reconcile.rs `repoint_note_links`)
+        // can, after a content-dedupe merge, repoint a `handwritten_annotation` edge onto a
+        // non-handwritten survivor (so deleting the target would destroy a REGULAR note), or leave
+        // several parents' edges on one shared survivor (so deleting it would orphan another parent's
+        // still-live edge and make that margin vanish). Reads see pre-op state — the batch hasn't
+        // committed — so exclude our OWN retire set when checking for other references.
+        let retiring: std::collections::HashSet<String> = old_edges
+            .iter()
+            .map(|(edge_id, _)| edge_id.clone())
+            .collect();
+        let mut tombstoned: std::collections::HashSet<String> = std::collections::HashSet::new();
         for (edge_id, child_id) in &old_edges {
-            let mut note_tomb = Map::new();
-            note_tomb.insert("id".into(), json!(child_id));
-            note_tomb.insert("deleted".into(), json!(true));
-            note_tomb.insert("updated_at".into(), json!(now));
-            writes.push(("notes", child_id.clone(), note_tomb));
-
             let mut edge_tomb = Map::new();
             edge_tomb.insert("id".into(), json!(edge_id));
             edge_tomb.insert("deleted".into(), json!(true));
             edge_tomb.insert("updated_at".into(), json!(now));
             writes.push(("note_links", edge_id.clone(), edge_tomb));
+
+            if tombstoned.contains(child_id) {
+                continue; // this parent has >1 edge to the same child — tombstone the note once
+            }
+            // Target still a live handwritten child? (A repointed edge can sit on a regular survivor.)
+            let is_live_handwritten = store
+                .get_row("notes", child_id)
+                .map_err(store_err)?
+                .filter(|r| !matches!(r.get("deleted"), Some(Value::Bool(true))))
+                .and_then(|r| r.get("source").and_then(Value::as_str).map(str::to_string))
+                .as_deref()
+                == Some("handwritten");
+            // Still referenced by another live handwritten edge we are NOT retiring? (Shared survivor.)
+            let shared_with_another_parent = read::note_links_for_note(&store, child_id)
+                .map_err(store_err)?
+                .iter()
+                .any(|l| {
+                    &l.to_note_id == child_id
+                        && l.relation_type
+                            .as_deref()
+                            .unwrap_or("handwritten_annotation")
+                            == "handwritten_annotation"
+                        && !retiring.contains(&l.id)
+                });
+            if is_live_handwritten && !shared_with_another_parent {
+                let mut note_tomb = Map::new();
+                note_tomb.insert("id".into(), json!(child_id));
+                note_tomb.insert("deleted".into(), json!(true));
+                note_tomb.insert("updated_at".into(), json!(now));
+                writes.push(("notes", child_id.clone(), note_tomb));
+                tombstoned.insert(child_id.clone());
+            }
         }
 
         store.stage_local_writes(writes, now).map_err(store_err)?;
@@ -2801,6 +2844,101 @@ mod tests {
         assert!(
             !live_ids.contains("e-hw"),
             "only the prior handwritten edge leaving p is retired"
+        );
+    }
+
+    #[test]
+    fn replace_handwritten_annotations_never_deletes_a_repointed_regular_note() {
+        // reconcile.rs repoint_note_links can leave a handwritten_annotation edge on a REGULAR
+        // (non-handwritten) survivor after a content-dedupe merge. Replacing this parent's margins must
+        // retire the edge but NEVER delete that regular note.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine.enqueue_note(parent_with_book("p", "b1")).unwrap();
+        engine
+            .enqueue_note(note_upsert("reg", "a normal note, not a margin"))
+            .unwrap(); // source = manual
+        engine
+            .enqueue_note_link(
+                "e-reg".into(),
+                "p".into(),
+                "reg".into(),
+                Some("handwritten_annotation".into()),
+                5,
+                false,
+            )
+            .unwrap();
+
+        engine
+            .replace_handwritten_annotations("p".into(), vec![margin("c1", "e1", "fresh margin")])
+            .unwrap();
+
+        assert!(
+            engine.get_note("reg".into()).unwrap().is_some(),
+            "a repointed regular note must NOT be deleted"
+        );
+        let live_edges: std::collections::HashSet<String> = engine
+            .note_links_for_note("p".into())
+            .unwrap()
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        assert!(!live_edges.contains("e-reg"), "the stale edge is retired");
+        assert!(live_edges.contains("e1"), "the fresh margin edge is live");
+    }
+
+    #[test]
+    fn replace_handwritten_annotations_keeps_a_child_still_referenced_by_another_parent() {
+        // A content-dedupe merge can leave two parents' live handwritten edges on ONE shared margin
+        // survivor. Replacing one parent's margins must retire only ITS edge, not the shared child (which
+        // the other parent still annotates).
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine.enqueue_note(parent_with_book("p1", "b1")).unwrap();
+        engine.enqueue_note(parent_with_book("p2", "b2")).unwrap();
+        // p1 creates the margin child "shared" (edge e1); p2 also annotates it (edge e2).
+        engine
+            .replace_handwritten_annotations(
+                "p1".into(),
+                vec![margin("shared", "e1", "shared margin")],
+            )
+            .unwrap();
+        engine
+            .enqueue_note_link("e2".into(), "p2".into(), "shared".into(), None, 5, false)
+            .unwrap();
+
+        engine
+            .replace_handwritten_annotations(
+                "p1".into(),
+                vec![margin("new", "e3", "p1's new margin")],
+            )
+            .unwrap();
+
+        assert!(
+            engine.get_note("shared".into()).unwrap().is_some(),
+            "shared child stays live — p2 still references it"
+        );
+        let p1_edges: std::collections::HashSet<String> = engine
+            .note_links_for_note("p1".into())
+            .unwrap()
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        assert!(
+            !p1_edges.contains("e1"),
+            "p1's edge to the shared child is retired"
+        );
+        assert!(p1_edges.contains("e3"), "p1's fresh edge is live");
+        let p2_edges = engine.note_links_for_note("p2".into()).unwrap();
+        assert!(
+            p2_edges
+                .iter()
+                .any(|e| e.id == "e2" && e.to_note_id == "shared"),
+            "p2's edge survives, its target intact",
         );
     }
 

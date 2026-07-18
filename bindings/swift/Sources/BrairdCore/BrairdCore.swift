@@ -848,6 +848,11 @@ public protocol SyncEngineProtocol : AnyObject {
      * - Children carry `source = "handwritten"`, empty tags, the parent's book, and `created_at`
      * staggered by index so review order survives LWW. Note-links are a random-pk bag (host ids), so
      * a re-run just adds a fresh set and tombstones the prior one — no resurrect hazard.
+     * - Retiring the prior set ALWAYS tombstones this parent's edges, but tombstones a child NOTE only
+     * when it is still a live handwritten note that NO OTHER live handwritten edge references. The
+     * duplicate reconciler (`reconcile::repoint_note_links`) can repoint an edge onto a regular
+     * survivor, or leave several parents' edges on one shared child — neither may be destroyed by a
+     * single-parent replace, so the edge is retired without touching the note.
      *
      * Returns the count of margin children created.
      */
@@ -1479,6 +1484,11 @@ open func recentNote(nowMs: Int64, seed: UInt64)throws  -> NoteRecord? {
      * - Children carry `source = "handwritten"`, empty tags, the parent's book, and `created_at`
      * staggered by index so review order survives LWW. Note-links are a random-pk bag (host ids), so
      * a re-run just adds a fresh set and tombstones the prior one — no resurrect hazard.
+     * - Retiring the prior set ALWAYS tombstones this parent's edges, but tombstones a child NOTE only
+     * when it is still a live handwritten note that NO OTHER live handwritten edge references. The
+     * duplicate reconciler (`reconcile::repoint_note_links`) can repoint an edge onto a regular
+     * survivor, or leave several parents' edges on one shared child — neither may be destroyed by a
+     * single-parent replace, so the edge is retired without touching the note.
      *
      * Returns the count of margin children created.
      */
@@ -5051,7 +5061,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_braird_core_checksum_method_syncengine_recent_note() != 17557) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_braird_core_checksum_method_syncengine_replace_handwritten_annotations() != 37956) {
+    if (uniffi_braird_core_checksum_method_syncengine_replace_handwritten_annotations() != 13777) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_search() != 14411) {
