@@ -6,6 +6,19 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-07-18
+
+Seventeenth release batch. Minor release: the atomic margins op —
+`replace_handwritten_annotations` + the `MarginChild` record (SUR-952, for the Android/iOS
+SUR-928 "Add the margins" features) — plus its supporting `Store::stage_local_writes`
+one-transaction batch primitive. One new FFI symbol + one record, bindings regenerated,
+arm64-safe (record lowers as one `RustBuffer`). Hardened through eight adversarial rounds:
+full-synced-column create rows, edge-topology-validated id reuse (notes row present or
+dangling), full-NOT-NULL-shape edge tombstones, cross-batch tombstone resurrection — the
+class held closed by a schema-completeness test, a 27-cell reuse-state grid, and
+mutation-verified invariants. Consumers bump their pin to v0.9.0; the Android SUR-928
+margins write path unblocks on it.
+
 ### Added
 - **`replace_handwritten_annotations(parent_id, children)` — atomic "Add the margins" op (SUR-952,
   for SUR-928).** A single FFI op that files a note's margins (handwritten annotations OCR'd from its
