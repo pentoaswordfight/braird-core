@@ -6,6 +6,19 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-07-18
+
+Sixteenth release batch. Patch release: the collection-membership tombstone now preserves the
+membership's filed-at `created_at` instead of overwriting it with the host wall clock (SUR-942). A
+toggle-off host can't supply the original — `collection_ids_for_note` exposes no timestamp — so the
+enqueue path clobbered it, diverging from surfc's `removeNoteFromCollection` (which tombstones the
+stored row) and from reconcile's own `repoint_memberships` preserve. The lookup and the tombstone
+stage now share one held store guard, so the read-modify-write can't be torn by a concurrent re-add
+from another host thread. Cosmetic today (no membership read consumes `created_at`; whole-row LWW
+keys on `updated_at`), so SUR-927 ships correctly on v0.8.1 — but only core can fix it. Internal
+staging only — no FFI signature/docstring change, bindings unchanged; consumers bump their pin to
+v0.8.2.
+
 ### Fixed
 - **`enqueue_collection_membership` tombstone now preserves the membership's filed-at `created_at` (SUR-942).**
   A toggle-off host can't supply the original `created_at` (`collection_ids_for_note` exposes no
