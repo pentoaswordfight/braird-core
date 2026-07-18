@@ -1271,7 +1271,7 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_braird_core_checksum_method_syncengine_recent_note() != 17557.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_braird_core_checksum_method_syncengine_replace_handwritten_annotations() != 13777.toShort()) {
+    if (lib.uniffi_braird_core_checksum_method_syncengine_replace_handwritten_annotations() != 57913.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_search() != 14411.toShort()) {
@@ -2034,10 +2034,11 @@ public interface SyncEngineInterface {
      * staggered by index so review order survives LWW. Note-links are a random-pk bag (host ids), so
      * a re-run just adds a fresh set and tombstones the prior one — no resurrect hazard.
      * - Retiring the prior set ALWAYS tombstones this parent's edges, but tombstones a child NOTE only
-     * when it is still a live handwritten note that NO OTHER live handwritten edge references. The
-     * duplicate reconciler (`reconcile::repoint_note_links`) can repoint an edge onto a regular
-     * survivor, or leave several parents' edges on one shared child — neither may be destroyed by a
-     * single-parent replace, so the edge is retired without touching the note.
+     * when it is still a live handwritten note that NO OTHER live edge — any relation type, either
+     * direction — still touches. `note_links` are generic and the reconciler preserves/repoints every
+     * type, so a margin child can be a repointed regular survivor, a shared child of several parents,
+     * or carry a non-handwritten edge (e.g. an imported `related` row); in each case deleting the note
+     * would dangle another edge or destroy a regular note, so only the edge is retired.
      *
      * Returns the count of margin children created.
      */
@@ -2800,10 +2801,11 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
      * staggered by index so review order survives LWW. Note-links are a random-pk bag (host ids), so
      * a re-run just adds a fresh set and tombstones the prior one — no resurrect hazard.
      * - Retiring the prior set ALWAYS tombstones this parent's edges, but tombstones a child NOTE only
-     * when it is still a live handwritten note that NO OTHER live handwritten edge references. The
-     * duplicate reconciler (`reconcile::repoint_note_links`) can repoint an edge onto a regular
-     * survivor, or leave several parents' edges on one shared child — neither may be destroyed by a
-     * single-parent replace, so the edge is retired without touching the note.
+     * when it is still a live handwritten note that NO OTHER live edge — any relation type, either
+     * direction — still touches. `note_links` are generic and the reconciler preserves/repoints every
+     * type, so a margin child can be a repointed regular survivor, a shared child of several parents,
+     * or carry a non-handwritten edge (e.g. an imported `related` row); in each case deleting the note
+     * would dangle another edge or destroy a regular note, so only the edge is retired.
      *
      * Returns the count of margin children created.
      */
