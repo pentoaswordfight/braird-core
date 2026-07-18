@@ -816,6 +816,8 @@ internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
 
 
 
+
+
 // A JNA Library to expose the extern-C FFI definitions.
 // This is an implementation detail which will be called internally by the public API.
 
@@ -901,6 +903,8 @@ internal interface UniffiLib : Library {
     ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_syncengine_recent_note(`ptr`: Pointer,`nowMs`: Long,`seed`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
+    fun uniffi_braird_core_fn_method_syncengine_replace_handwritten_annotations(`ptr`: Pointer,`parentId`: RustBuffer.ByValue,`children`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Int
     fun uniffi_braird_core_fn_method_syncengine_search(`ptr`: Pointer,`query`: RustBuffer.ByValue,`limit`: Int,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_syncengine_set_access_token(`ptr`: Pointer,`jwt`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -1117,6 +1121,8 @@ internal interface UniffiLib : Library {
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_recent_note(
     ): Short
+    fun uniffi_braird_core_checksum_method_syncengine_replace_handwritten_annotations(
+    ): Short
     fun uniffi_braird_core_checksum_method_syncengine_search(
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_set_access_token(
@@ -1263,6 +1269,9 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_recent_note() != 17557.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_braird_core_checksum_method_syncengine_replace_handwritten_annotations() != 37956.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_search() != 14411.toShort()) {
@@ -2004,6 +2013,32 @@ public interface SyncEngineInterface {
     fun `recentNote`(`nowMs`: kotlin.Long, `seed`: kotlin.ULong): NoteRecord?
     
     /**
+     * Atomically replace a note's handwritten margins (SUR-952, the SUR-928 "Add the margins"
+     * feature; the PWA's `replaceHandwrittenAnnotations`). Seals each [`MarginChild::text`] under the
+     * parent's LIVE book, creates the new child notes + their parent→child `handwritten_annotation`
+     * links, and retires the parent's prior handwritten children + edges — every row staged in ONE
+     * transaction ([`Store::stage_local_writes`]).
+     *
+     * This exists because the host's per-item `enqueue_note` + `enqueue_note_link` were two separate
+     * transactions: a crash between them orphaned a child note with no edge, which never converged (a
+     * re-run reads prior children from live edges, so an edgeless orphan is invisible to cleanup). One
+     * transaction closes that window — the whole replace commits or rolls back, and a retry re-does it.
+     *
+     * - Empty [`children`] is a no-op that leaves existing margins intact (PWA early-return parity) —
+     * guarded before any read so it can't error on a missing/locked parent.
+     * - The parent must exist and be live; its CURRENT `book_id` is read here, so children file where
+     * the parent lives now, not where a host snapshot thought it did.
+     * - Allowed on a decrypt-failed parent: only the NEW child bodies are sealed; the parent's
+     * ciphertext is never read or re-sealed.
+     * - Children carry `source = "handwritten"`, empty tags, the parent's book, and `created_at`
+     * staggered by index so review order survives LWW. Note-links are a random-pk bag (host ids), so
+     * a re-run just adds a fresh set and tombstones the prior one — no resurrect hazard.
+     *
+     * Returns the count of margin children created.
+     */
+    fun `replaceHandwrittenAnnotations`(`parentId`: kotlin.String, `children`: List<MarginChild>): kotlin.UInt
+    
+    /**
      * Lexical search over decrypted note text + custom-idea name/description (SUR-527 parity).
      * Rebuilds the in-memory index from the live store per call — no plaintext touches disk —
      * and returns up to `limit` hits, best-first.
@@ -2731,6 +2766,43 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
     uniffiRustCallWithError(SyncException) { _status ->
     UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_recent_note(
         it, FfiConverterLong.lower(`nowMs`),FfiConverterULong.lower(`seed`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * Atomically replace a note's handwritten margins (SUR-952, the SUR-928 "Add the margins"
+     * feature; the PWA's `replaceHandwrittenAnnotations`). Seals each [`MarginChild::text`] under the
+     * parent's LIVE book, creates the new child notes + their parent→child `handwritten_annotation`
+     * links, and retires the parent's prior handwritten children + edges — every row staged in ONE
+     * transaction ([`Store::stage_local_writes`]).
+     *
+     * This exists because the host's per-item `enqueue_note` + `enqueue_note_link` were two separate
+     * transactions: a crash between them orphaned a child note with no edge, which never converged (a
+     * re-run reads prior children from live edges, so an edgeless orphan is invisible to cleanup). One
+     * transaction closes that window — the whole replace commits or rolls back, and a retry re-does it.
+     *
+     * - Empty [`children`] is a no-op that leaves existing margins intact (PWA early-return parity) —
+     * guarded before any read so it can't error on a missing/locked parent.
+     * - The parent must exist and be live; its CURRENT `book_id` is read here, so children file where
+     * the parent lives now, not where a host snapshot thought it did.
+     * - Allowed on a decrypt-failed parent: only the NEW child bodies are sealed; the parent's
+     * ciphertext is never read or re-sealed.
+     * - Children carry `source = "handwritten"`, empty tags, the parent's book, and `created_at`
+     * staggered by index so review order survives LWW. Note-links are a random-pk bag (host ids), so
+     * a re-run just adds a fresh set and tombstones the prior one — no resurrect hazard.
+     *
+     * Returns the count of margin children created.
+     */
+    @Throws(SyncException::class)override fun `replaceHandwrittenAnnotations`(`parentId`: kotlin.String, `children`: List<MarginChild>): kotlin.UInt {
+            return FfiConverterUInt.lift(
+    callWithPointer {
+    uniffiRustCallWithError(SyncException) { _status ->
+    UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_replace_handwritten_annotations(
+        it, FfiConverterString.lower(`parentId`),FfiConverterSequenceTypeMarginChild.lower(`children`),_status)
 }
     }
     )
@@ -3922,6 +3994,49 @@ public object FfiConverterTypeLensRecord: FfiConverterRustBuffer<LensRecord> {
 
 
 /**
+ * One margin to file under a parent note (SUR-952, the SUR-928 "Add the margins" feature). The host
+ * mints both ids and trims the text; core seals [`text`] under the parent's live book and stages the
+ * child note + its parent→child link atomically. [`id`] is the child note's id, [`link_id`] the
+ * parent→child `handwritten_annotation` edge's id — both host-supplied so core needs no uuid source,
+ * matching the note-link API where the host already owns id generation.
+ */
+data class MarginChild (
+    var `id`: kotlin.String, 
+    var `linkId`: kotlin.String, 
+    var `text`: kotlin.String
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMarginChild: FfiConverterRustBuffer<MarginChild> {
+    override fun read(buf: ByteBuffer): MarginChild {
+        return MarginChild(
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: MarginChild) = (
+            FfiConverterString.allocationSize(value.`id`) +
+            FfiConverterString.allocationSize(value.`linkId`) +
+            FfiConverterString.allocationSize(value.`text`)
+    )
+
+    override fun write(value: MarginChild, buf: ByteBuffer) {
+            FfiConverterString.write(value.`id`, buf)
+            FfiConverterString.write(value.`linkId`, buf)
+            FfiConverterString.write(value.`text`, buf)
+    }
+}
+
+
+
+/**
  * One note's pre-merge home, for [`unmerge_books`] — mirrors a PWA `undo.reassignments` entry
  * (`{noteId, fromBookId}`). `prior_book_id` is nullable to round-trip the column faithfully,
  * though a rehomed note always had a (loser) book.
@@ -5091,6 +5206,34 @@ public object FfiConverterSequenceTypeLensRecord: FfiConverterRustBuffer<List<Le
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterTypeLensRecord.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeMarginChild: FfiConverterRustBuffer<List<MarginChild>> {
+    override fun read(buf: ByteBuffer): List<MarginChild> {
+        val len = buf.getInt()
+        return List<MarginChild>(len) {
+            FfiConverterTypeMarginChild.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<MarginChild>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeMarginChild.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<MarginChild>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeMarginChild.write(it, buf)
         }
     }
 }

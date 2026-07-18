@@ -190,6 +190,18 @@ pub struct NoteUpsert {
     pub clear_nullable_fields: Vec<String>,
 }
 
+/// One margin to file under a parent note (SUR-952, the SUR-928 "Add the margins" feature). The host
+/// mints both ids and trims the text; core seals [`text`] under the parent's live book and stages the
+/// child note + its parent→child link atomically. [`id`] is the child note's id, [`link_id`] the
+/// parent→child `handwritten_annotation` edge's id — both host-supplied so core needs no uuid source,
+/// matching the note-link API where the host already owns id generation.
+#[derive(Debug, uniffi::Record)]
+pub struct MarginChild {
+    pub id: String,
+    pub link_id: String,
+    pub text: String,
+}
+
 /// A book upsert draft (SUR-843) — the record form of [`SyncEngine::enqueue_book`]'s arguments.
 ///
 /// Collapsed from 10 positional args to a single `uniffi::Record` for the SAME arm64 reason as
@@ -487,6 +499,121 @@ impl SyncEngine {
         row.insert("updated_at".into(), json!(now));
         row.insert("deleted".into(), json!(deleted));
         self.stage_write("note_links", &id, row)
+    }
+
+    /// Atomically replace a note's handwritten margins (SUR-952, the SUR-928 "Add the margins"
+    /// feature; the PWA's `replaceHandwrittenAnnotations`). Seals each [`MarginChild::text`] under the
+    /// parent's LIVE book, creates the new child notes + their parent→child `handwritten_annotation`
+    /// links, and retires the parent's prior handwritten children + edges — every row staged in ONE
+    /// transaction ([`Store::stage_local_writes`]).
+    ///
+    /// This exists because the host's per-item `enqueue_note` + `enqueue_note_link` were two separate
+    /// transactions: a crash between them orphaned a child note with no edge, which never converged (a
+    /// re-run reads prior children from live edges, so an edgeless orphan is invisible to cleanup). One
+    /// transaction closes that window — the whole replace commits or rolls back, and a retry re-does it.
+    ///
+    /// - Empty [`children`] is a no-op that leaves existing margins intact (PWA early-return parity) —
+    ///   guarded before any read so it can't error on a missing/locked parent.
+    /// - The parent must exist and be live; its CURRENT `book_id` is read here, so children file where
+    ///   the parent lives now, not where a host snapshot thought it did.
+    /// - Allowed on a decrypt-failed parent: only the NEW child bodies are sealed; the parent's
+    ///   ciphertext is never read or re-sealed.
+    /// - Children carry `source = "handwritten"`, empty tags, the parent's book, and `created_at`
+    ///   staggered by index so review order survives LWW. Note-links are a random-pk bag (host ids), so
+    ///   a re-run just adds a fresh set and tombstones the prior one — no resurrect hazard.
+    ///
+    /// Returns the count of margin children created.
+    pub fn replace_handwritten_annotations(
+        &self,
+        parent_id: String,
+        children: Vec<MarginChild>,
+    ) -> Result<u32, SyncError> {
+        if children.is_empty() {
+            return Ok(0); // PWA parity: an empty replace leaves existing margins alone
+        }
+        let store = lock!(self.store);
+
+        // Parent must exist + be live; children inherit its CURRENT book (not a host snapshot).
+        let parent = store
+            .get_row("notes", &parent_id)
+            .map_err(store_err)?
+            .filter(|r| !matches!(r.get("deleted"), Some(Value::Bool(true))))
+            .ok_or_else(|| {
+                SyncError::Store(format!(
+                    "replace_handwritten_annotations: parent {parent_id} not found or deleted"
+                ))
+            })?;
+        let book_id = parent
+            .get("book_id")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+
+        // Prior handwritten children of THIS parent (parent is `from`), captured before any write.
+        let old_edges: Vec<(String, String)> = read::note_links_for_note(&store, &parent_id)
+            .map_err(store_err)?
+            .into_iter()
+            .filter(|l| {
+                l.from_note_id == parent_id
+                    && l.relation_type
+                        .as_deref()
+                        .unwrap_or("handwritten_annotation")
+                        == "handwritten_annotation"
+            })
+            .map(|l| (l.id, l.to_note_id))
+            .collect();
+
+        let now = epoch_ms();
+        let mut writes: Vec<(&str, String, Map<String, Value>)> = Vec::new();
+
+        // Create new children + links FIRST (staggered created_at preserves review order). Ordering is
+        // create-before-retire so the outbox flush duplicates-not-loses if interrupted, though the local
+        // transaction is atomic regardless.
+        for (i, child) in children.iter().enumerate() {
+            let created = now + i as i64;
+            let ciphertext = self
+                .vault
+                .encrypt_note(Some(child.id.clone()), child.text.clone());
+            let content_tag = self.vault.content_tag(child.text.clone(), book_id.clone());
+            let mut note = Map::new();
+            note.insert("id".into(), json!(child.id));
+            insert_opt(&mut note, "book_id", book_id.clone());
+            note.insert("tags".into(), json!(Vec::<String>::new()));
+            note.insert("source".into(), json!("handwritten"));
+            note.insert("text".into(), json!(ciphertext));
+            note.insert("content_tag".into(), json!(content_tag));
+            note.insert("created_at".into(), json!(created));
+            note.insert("updated_at".into(), json!(now));
+            note.insert("deleted".into(), json!(false));
+            writes.push(("notes", child.id.clone(), note));
+
+            let mut link = Map::new();
+            link.insert("id".into(), json!(child.link_id));
+            link.insert("from_note_id".into(), json!(parent_id));
+            link.insert("to_note_id".into(), json!(child.id));
+            link.insert("relation_type".into(), json!("handwritten_annotation"));
+            link.insert("created_at".into(), json!(created));
+            link.insert("updated_at".into(), json!(now));
+            link.insert("deleted".into(), json!(false));
+            writes.push(("note_links", child.link_id.clone(), link));
+        }
+
+        // THEN retire the prior children + their edges (partial tombstones merged onto the live rows).
+        for (edge_id, child_id) in &old_edges {
+            let mut note_tomb = Map::new();
+            note_tomb.insert("id".into(), json!(child_id));
+            note_tomb.insert("deleted".into(), json!(true));
+            note_tomb.insert("updated_at".into(), json!(now));
+            writes.push(("notes", child_id.clone(), note_tomb));
+
+            let mut edge_tomb = Map::new();
+            edge_tomb.insert("id".into(), json!(edge_id));
+            edge_tomb.insert("deleted".into(), json!(true));
+            edge_tomb.insert("updated_at".into(), json!(now));
+            writes.push(("note_links", edge_id.clone(), edge_tomb));
+        }
+
+        store.stage_local_writes(writes, now).map_err(store_err)?;
+        Ok(children.len() as u32)
     }
 
     /// Enqueue a lens upsert (SUR-726) — ONE authored query. Plaintext; `leaf_ids` is a cloud
@@ -2514,6 +2641,223 @@ mod tests {
         );
         assert_eq!(payload["combinator"], json!("AND"), "default combinator");
         assert_eq!(payload["threshold"], json!(100), "default threshold");
+    }
+
+    fn margin(id: &str, link_id: &str, text: &str) -> MarginChild {
+        MarginChild {
+            id: id.into(),
+            link_id: link_id.into(),
+            text: text.into(),
+        }
+    }
+
+    fn parent_with_book(id: &str, book_id: &str) -> NoteUpsert {
+        NoteUpsert {
+            book_id: Some(book_id.into()),
+            ..note_upsert(id, "the parent passage")
+        }
+    }
+
+    #[test]
+    fn replace_handwritten_annotations_creates_linked_children_under_the_live_book() {
+        // Core never reads the parent's text (only its existence + book_id), so a decrypt-failed parent
+        // takes margins fine — the same path as here. Children seal their OWN text.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine.enqueue_note(parent_with_book("p", "b1")).unwrap();
+
+        let n = engine
+            .replace_handwritten_annotations(
+                "p".into(),
+                vec![
+                    margin("c1", "e1", "  Kahneman overstates it  "),
+                    margin("c2", "e2", "cf. base rates"),
+                ],
+            )
+            .unwrap();
+        assert_eq!(n, 2);
+
+        // Both children are live, handwritten, on the parent's book, text sealed→decrypts to input.
+        let c1 = engine.get_note("c1".into()).unwrap().expect("c1 live");
+        assert_eq!(c1.source.as_deref(), Some("handwritten"));
+        assert_eq!(c1.book_id.as_deref(), Some("b1"));
+        assert_eq!(c1.text.as_deref(), Some("  Kahneman overstates it  ")); // core trims nothing; host did
+        assert!(c1.tags.is_empty());
+        let c2 = engine.get_note("c2".into()).unwrap().expect("c2 live");
+        assert_eq!(c2.text.as_deref(), Some("cf. base rates"));
+        assert!(
+            c1.created_at < c2.created_at,
+            "staggered created_at preserves review order"
+        );
+
+        // Each child has a live parent→child handwritten edge (no orphan possible — one transaction).
+        let edges = engine.note_links_for_note("p".into()).unwrap();
+        let from_parent: Vec<_> = edges.iter().filter(|e| e.from_note_id == "p").collect();
+        assert_eq!(from_parent.len(), 2);
+        assert!(from_parent
+            .iter()
+            .all(|e| e.relation_type.as_deref() == Some("handwritten_annotation")));
+        assert_eq!(
+            from_parent
+                .iter()
+                .map(|e| e.to_note_id.clone())
+                .collect::<std::collections::HashSet<_>>(),
+            ["c1".to_string(), "c2".to_string()].into_iter().collect(),
+        );
+    }
+
+    #[test]
+    fn replace_handwritten_annotations_retires_prior_set_and_converges() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine.enqueue_note(parent_with_book("p", "b1")).unwrap();
+
+        engine
+            .replace_handwritten_annotations(
+                "p".into(),
+                vec![margin("c1", "e1", "old one"), margin("c2", "e2", "old two")],
+            )
+            .unwrap();
+        engine
+            .replace_handwritten_annotations("p".into(), vec![margin("c3", "e3", "fresh")])
+            .unwrap();
+
+        // Prior children + edges retired; exactly the fresh set survives (convergence, no accumulation).
+        assert!(
+            engine.get_note("c1".into()).unwrap().is_none(),
+            "prior child c1 tombstoned"
+        );
+        assert!(
+            engine.get_note("c2".into()).unwrap().is_none(),
+            "prior child c2 tombstoned"
+        );
+        assert!(
+            engine.get_note("c3".into()).unwrap().is_some(),
+            "fresh child live"
+        );
+        let edges = engine.note_links_for_note("p".into()).unwrap();
+        assert_eq!(
+            edges
+                .iter()
+                .filter(|e| e.from_note_id == "p")
+                .map(|e| e.to_note_id.clone())
+                .collect::<Vec<_>>(),
+            vec!["c3".to_string()]
+        );
+    }
+
+    #[test]
+    fn replace_handwritten_annotations_only_retires_this_parents_handwritten_edges() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine.enqueue_note(parent_with_book("p", "b1")).unwrap();
+        engine
+            .replace_handwritten_annotations("p".into(), vec![margin("hw", "e-hw", "a margin")])
+            .unwrap();
+        // A non-handwritten edge leaving p, and an inbound handwritten edge into p — neither may be retired.
+        engine
+            .enqueue_note_link(
+                "e-other".into(),
+                "p".into(),
+                "dup".into(),
+                Some("duplicate_of".into()),
+                5,
+                false,
+            )
+            .unwrap();
+        engine
+            .enqueue_note_link("e-in".into(), "src".into(), "p".into(), None, 5, false)
+            .unwrap();
+
+        engine
+            .replace_handwritten_annotations("p".into(), vec![margin("hw2", "e-hw2", "new margin")])
+            .unwrap();
+
+        assert!(
+            engine.get_note("hw".into()).unwrap().is_none(),
+            "prior handwritten child retired"
+        );
+        let live_ids: std::collections::HashSet<String> = engine
+            .note_links_for_note("p".into())
+            .unwrap()
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        assert!(
+            live_ids.contains("e-other"),
+            "non-handwritten edge untouched"
+        );
+        assert!(
+            live_ids.contains("e-in"),
+            "inbound handwritten edge untouched"
+        );
+        assert!(live_ids.contains("e-hw2"), "the fresh edge is live");
+        assert!(
+            !live_ids.contains("e-hw"),
+            "only the prior handwritten edge leaving p is retired"
+        );
+    }
+
+    #[test]
+    fn replace_handwritten_annotations_empty_children_is_a_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine.enqueue_note(parent_with_book("p", "b1")).unwrap();
+        engine
+            .replace_handwritten_annotations("p".into(), vec![margin("c1", "e1", "keep me")])
+            .unwrap();
+
+        let n = engine
+            .replace_handwritten_annotations("p".into(), vec![])
+            .unwrap();
+
+        assert_eq!(n, 0);
+        assert!(
+            engine.get_note("c1".into()).unwrap().is_some(),
+            "empty replace leaves existing margins intact"
+        );
+        assert_eq!(
+            engine
+                .note_links_for_note("p".into())
+                .unwrap()
+                .iter()
+                .filter(|e| e.from_note_id == "p")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn replace_handwritten_annotations_missing_parent_errors_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+
+        let err = engine
+            .replace_handwritten_annotations("ghost".into(), vec![margin("c1", "e1", "x")])
+            .unwrap_err();
+        assert!(matches!(err, SyncError::Store(_)));
+        assert!(
+            engine.get_note("c1".into()).unwrap().is_none(),
+            "no child staged when the parent is missing"
+        );
+        assert!(
+            Store::open(db_path)
+                .unwrap()
+                .outbox_items()
+                .unwrap()
+                .is_empty(),
+            "nothing enqueued"
+        );
     }
 
     #[test]

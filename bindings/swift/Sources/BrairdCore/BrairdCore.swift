@@ -828,6 +828,32 @@ public protocol SyncEngineProtocol : AnyObject {
     func recentNote(nowMs: Int64, seed: UInt64) throws  -> NoteRecord?
     
     /**
+     * Atomically replace a note's handwritten margins (SUR-952, the SUR-928 "Add the margins"
+     * feature; the PWA's `replaceHandwrittenAnnotations`). Seals each [`MarginChild::text`] under the
+     * parent's LIVE book, creates the new child notes + their parent→child `handwritten_annotation`
+     * links, and retires the parent's prior handwritten children + edges — every row staged in ONE
+     * transaction ([`Store::stage_local_writes`]).
+     *
+     * This exists because the host's per-item `enqueue_note` + `enqueue_note_link` were two separate
+     * transactions: a crash between them orphaned a child note with no edge, which never converged (a
+     * re-run reads prior children from live edges, so an edgeless orphan is invisible to cleanup). One
+     * transaction closes that window — the whole replace commits or rolls back, and a retry re-does it.
+     *
+     * - Empty [`children`] is a no-op that leaves existing margins intact (PWA early-return parity) —
+     * guarded before any read so it can't error on a missing/locked parent.
+     * - The parent must exist and be live; its CURRENT `book_id` is read here, so children file where
+     * the parent lives now, not where a host snapshot thought it did.
+     * - Allowed on a decrypt-failed parent: only the NEW child bodies are sealed; the parent's
+     * ciphertext is never read or re-sealed.
+     * - Children carry `source = "handwritten"`, empty tags, the parent's book, and `created_at`
+     * staggered by index so review order survives LWW. Note-links are a random-pk bag (host ids), so
+     * a re-run just adds a fresh set and tombstones the prior one — no resurrect hazard.
+     *
+     * Returns the count of margin children created.
+     */
+    func replaceHandwrittenAnnotations(parentId: String, children: [MarginChild]) throws  -> UInt32
+    
+    /**
      * Lexical search over decrypted note text + custom-idea name/description (SUR-527 parity).
      * Rebuilds the in-memory index from the live store per call — no plaintext touches disk —
      * and returns up to `limit` hits, best-first.
@@ -1428,6 +1454,39 @@ open func recentNote(nowMs: Int64, seed: UInt64)throws  -> NoteRecord? {
     uniffi_braird_core_fn_method_syncengine_recent_note(self.uniffiClonePointer(),
         FfiConverterInt64.lower(nowMs),
         FfiConverterUInt64.lower(seed),$0
+    )
+})
+}
+    
+    /**
+     * Atomically replace a note's handwritten margins (SUR-952, the SUR-928 "Add the margins"
+     * feature; the PWA's `replaceHandwrittenAnnotations`). Seals each [`MarginChild::text`] under the
+     * parent's LIVE book, creates the new child notes + their parent→child `handwritten_annotation`
+     * links, and retires the parent's prior handwritten children + edges — every row staged in ONE
+     * transaction ([`Store::stage_local_writes`]).
+     *
+     * This exists because the host's per-item `enqueue_note` + `enqueue_note_link` were two separate
+     * transactions: a crash between them orphaned a child note with no edge, which never converged (a
+     * re-run reads prior children from live edges, so an edgeless orphan is invisible to cleanup). One
+     * transaction closes that window — the whole replace commits or rolls back, and a retry re-does it.
+     *
+     * - Empty [`children`] is a no-op that leaves existing margins intact (PWA early-return parity) —
+     * guarded before any read so it can't error on a missing/locked parent.
+     * - The parent must exist and be live; its CURRENT `book_id` is read here, so children file where
+     * the parent lives now, not where a host snapshot thought it did.
+     * - Allowed on a decrypt-failed parent: only the NEW child bodies are sealed; the parent's
+     * ciphertext is never read or re-sealed.
+     * - Children carry `source = "handwritten"`, empty tags, the parent's book, and `created_at`
+     * staggered by index so review order survives LWW. Note-links are a random-pk bag (host ids), so
+     * a re-run just adds a fresh set and tombstones the prior one — no resurrect hazard.
+     *
+     * Returns the count of margin children created.
+     */
+open func replaceHandwrittenAnnotations(parentId: String, children: [MarginChild])throws  -> UInt32 {
+    return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_braird_core_fn_method_syncengine_replace_handwritten_annotations(self.uniffiClonePointer(),
+        FfiConverterString.lower(parentId),
+        FfiConverterSequenceTypeMarginChild.lower(children),$0
     )
 })
 }
@@ -2948,6 +3007,87 @@ public func FfiConverterTypeLensRecord_lift(_ buf: RustBuffer) throws -> LensRec
 #endif
 public func FfiConverterTypeLensRecord_lower(_ value: LensRecord) -> RustBuffer {
     return FfiConverterTypeLensRecord.lower(value)
+}
+
+
+/**
+ * One margin to file under a parent note (SUR-952, the SUR-928 "Add the margins" feature). The host
+ * mints both ids and trims the text; core seals [`text`] under the parent's live book and stages the
+ * child note + its parent→child link atomically. [`id`] is the child note's id, [`link_id`] the
+ * parent→child `handwritten_annotation` edge's id — both host-supplied so core needs no uuid source,
+ * matching the note-link API where the host already owns id generation.
+ */
+public struct MarginChild {
+    public var id: String
+    public var linkId: String
+    public var text: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(id: String, linkId: String, text: String) {
+        self.id = id
+        self.linkId = linkId
+        self.text = text
+    }
+}
+
+
+
+extension MarginChild: Equatable, Hashable {
+    public static func ==(lhs: MarginChild, rhs: MarginChild) -> Bool {
+        if lhs.id != rhs.id {
+            return false
+        }
+        if lhs.linkId != rhs.linkId {
+            return false
+        }
+        if lhs.text != rhs.text {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(id)
+        hasher.combine(linkId)
+        hasher.combine(text)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMarginChild: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MarginChild {
+        return
+            try MarginChild(
+                id: FfiConverterString.read(from: &buf), 
+                linkId: FfiConverterString.read(from: &buf), 
+                text: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: MarginChild, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.id, into: &buf)
+        FfiConverterString.write(value.linkId, into: &buf)
+        FfiConverterString.write(value.text, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMarginChild_lift(_ buf: RustBuffer) throws -> MarginChild {
+    return try FfiConverterTypeMarginChild.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMarginChild_lower(_ value: MarginChild) -> RustBuffer {
+    return FfiConverterTypeMarginChild.lower(value)
 }
 
 
@@ -4617,6 +4757,31 @@ fileprivate struct FfiConverterSequenceTypeLensRecord: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeMarginChild: FfiConverterRustBuffer {
+    typealias SwiftType = [MarginChild]
+
+    public static func write(_ value: [MarginChild], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeMarginChild.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [MarginChild] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [MarginChild]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeMarginChild.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeNoteBookAssignment: FfiConverterRustBuffer {
     typealias SwiftType = [NoteBookAssignment]
 
@@ -4884,6 +5049,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_recent_note() != 17557) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_braird_core_checksum_method_syncengine_replace_handwritten_annotations() != 37956) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_search() != 14411) {

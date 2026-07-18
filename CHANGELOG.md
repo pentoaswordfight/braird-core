@@ -6,6 +6,27 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+### Added
+- **`replace_handwritten_annotations(parent_id, children)` — atomic "Add the margins" op (SUR-952,
+  for SUR-928).** A single FFI op that files a note's margins (handwritten annotations OCR'd from its
+  source photo) as linked child notes, replacing any prior set — the transactional form of the PWA's
+  `replaceHandwrittenAnnotations`. The host mints the child + link ids (via the new `MarginChild`
+  record `{ id, link_id, text }`) and trims the texts; core seals each child under the parent's LIVE
+  `book_id` (read here, so children file where the parent lives now), creates the child notes +
+  parent→child `handwritten_annotation` links, and tombstones the parent's prior handwritten children +
+  their edges — **every row staged in ONE transaction** (`Store::stage_local_writes`, new). This
+  exists because the host's per-item `enqueue_note` + `enqueue_note_link` were two separate
+  transactions: a crash between them orphaned a child note with no edge, which never converged (a
+  re-run reads prior children from live edges, so an edgeless orphan is invisible to cleanup). One
+  transaction closes that window. Empty `children` is a no-op that leaves existing margins intact (PWA
+  early-return parity); the parent must exist and be live; it's allowed on a decrypt-failed parent
+  (core never reads the parent's text — only its existence + book — and only the NEW child bodies are
+  sealed). Children carry `source = "handwritten"`, empty tags, and `created_at` staggered by index so
+  review order survives LWW. Note-links are a random-pk bag (host ids), so a re-run just adds a fresh
+  set and tombstones the prior one — no resurrect hazard. New FFI symbol + `MarginChild` record →
+  bindings regenerated; 2 args (`String` + `Vec<MarginChild>`), record lowers as one `RustBuffer`, so
+  no arm64 >8-slot spill. Consumers bump their pin to pick it up.
+
 ## [0.8.2] - 2026-07-18
 
 Sixteenth release batch. Patch release: the collection-membership tombstone now preserves the

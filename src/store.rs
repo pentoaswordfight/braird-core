@@ -792,6 +792,31 @@ impl Store {
         tx.commit()
     }
 
+    /// Stage a whole BATCH of partial writes as ONE transaction (SUR-952). Each entry merges onto its
+    /// existing row + enqueues its partial, exactly like [`stage_local_write`], but the whole batch
+    /// commits or rolls back together. This is the atomicity primitive behind
+    /// [`SyncEngine::replace_handwritten_annotations`]: a margin replace stages every new child note +
+    /// its parent→child link AND every prior child/edge tombstone here, so a crash can't leave an
+    /// orphan child with no link (the SUR-928 note-before-link window) or a retired edge whose child
+    /// stayed live. All ids in one batch are distinct (fresh children vs. the prior set's ids), so no
+    /// entry resurrects another's tombstone — plain per-row staging is correct, no resurrect handling.
+    /// One `created_at` stamps every outbox row (the batch's enqueue time), as `stage_local_write` uses
+    /// `epoch_ms()`; each row carries its own `created_at` column inside its payload.
+    pub(crate) fn stage_local_writes(
+        &self,
+        writes: Vec<(&str, String, Map<String, Value>)>,
+        created_at: i64,
+    ) -> rusqlite::Result<()> {
+        if writes.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        for (table, record_id, row) in writes {
+            self.stage_write_inner(table, &record_id, row, created_at)?;
+        }
+        tx.commit()
+    }
+
     /// Atomically stage a partial write only when its target exists and is currently live.
     ///
     /// The precondition check and the local-row/outbox write share one transaction. This prevents
