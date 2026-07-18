@@ -861,6 +861,11 @@ public protocol SyncEngineProtocol : AnyObject {
      * a PREVIOUS (offline, un-flushed) replace ([`Store::stage_local_writes`]' resurrect rule), so a
      * retry/restore that re-creates a previously retired id flushes live, not as a sticky delete the
      * strict-tie LWW pull could never repair.
+     * - HOST CONTRACT (the flip side of that resurrect rule): minted child/link ids are single-shot per
+     * user-initiated replace. A host must NEVER persist a `children` set and replay it after the
+     * reader could have touched the results — the replay would faithfully re-assert those exact ids
+     * live, silently undoing an intervening reader delete or edit of a margin. Replay the same ids
+     * only within one unacknowledged write attempt; any later retry mints fresh ids.
      * - Retiring the prior set ALWAYS tombstones this parent's edges — as the STORED row's full
      * NOT-NULL shape with its `created_at` preserved (the SUR-942 membership convention; note_links
      * has no sparse-PATCH flush fallback, so a bare tombstone would 23502 and wedge the outbox) —
@@ -1515,6 +1520,11 @@ open func recentNote(nowMs: Int64, seed: UInt64)throws  -> NoteRecord? {
      * a PREVIOUS (offline, un-flushed) replace ([`Store::stage_local_writes`]' resurrect rule), so a
      * retry/restore that re-creates a previously retired id flushes live, not as a sticky delete the
      * strict-tie LWW pull could never repair.
+     * - HOST CONTRACT (the flip side of that resurrect rule): minted child/link ids are single-shot per
+     * user-initiated replace. A host must NEVER persist a `children` set and replay it after the
+     * reader could have touched the results — the replay would faithfully re-assert those exact ids
+     * live, silently undoing an intervening reader delete or edit of a margin. Replay the same ids
+     * only within one unacknowledged write attempt; any later retry mints fresh ids.
      * - Retiring the prior set ALWAYS tombstones this parent's edges — as the STORED row's full
      * NOT-NULL shape with its `created_at` preserved (the SUR-942 membership convention; note_links
      * has no sparse-PATCH flush fallback, so a bare tombstone would 23502 and wedge the outbox) —
@@ -5111,7 +5121,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_braird_core_checksum_method_syncengine_recent_note() != 17557) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_braird_core_checksum_method_syncengine_replace_handwritten_annotations() != 53570) {
+    if (uniffi_braird_core_checksum_method_syncengine_replace_handwritten_annotations() != 53457) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_search() != 14411) {
