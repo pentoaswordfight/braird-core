@@ -522,10 +522,12 @@ impl SyncEngine {
     /// - Texts are trimmed and blank items dropped IN CORE (the PWA filters before its length check);
     ///   an empty or all-blank [`children`] is a no-op that leaves existing margins intact — guarded
     ///   before any read so it can't error on a missing/locked parent.
-    /// - Host-minted ids are validated fail-loud before staging: a child/link id equal to the parent, a
-    ///   duplicate id within the call, a child id colliding with an existing non-margin note, or a link
-    ///   id owned by another note's edge rejects the WHOLE call — each would silently corrupt or orphan
-    ///   a row (re-seal over a foreign note, an edgeless child, a stolen edge).
+    /// - Host-minted ids are validated fail-loud before staging: reusing an existing id is legal ONLY
+    ///   for THIS parent's prior handwritten margin (retry/repoint/restore). A child/link id equal to
+    ///   the parent, a duplicate within the call, a child id on any non-margin note or on ANOTHER
+    ///   parent's margin, or a link id on any non-handwritten edge — including this parent's own
+    ///   `related`/`duplicate_of` edges — rejects the WHOLE call; each would silently corrupt, steal,
+    ///   or orphan a row the create loop would otherwise overwrite.
     /// - The parent must exist and be live; its CURRENT `book_id` is read here, so children file where
     ///   the parent lives now, not where a host snapshot thought it did.
     /// - Allowed on a decrypt-failed parent: only the NEW child bodies are sealed; the parent's
@@ -594,11 +596,15 @@ impl SyncEngine {
             .and_then(Value::as_str)
             .map(str::to_string);
 
-        // Host-minted ids must be coherent — reject the whole call BEFORE staging anything. A child id
-        // colliding with the parent or any non-margin note would MERGE margin fields over that row and
-        // re-seal its text (destroying it); a duplicate id within the call leaves a child edgeless (the
-        // orphan class this op closes); a link id owned by ANOTHER note's edge would repoint that edge
-        // fleet-wide, silently orphaning the other parent's margin.
+        // Host-minted ids must be coherent — reject the whole call BEFORE staging anything. Reusing an
+        // existing id is legal ONLY for THIS parent's prior handwritten margin (the sanctioned
+        // retry/repoint/restore paths); anything else the create loop would overwrite:
+        //  - a child id on the parent or any non-margin note re-seals margin text over that row;
+        //  - a child id on ANOTHER parent's margin steals + rewrites that margin;
+        //  - a link id on any non-handwritten edge — INCLUDING this same parent's own `related`/
+        //    `duplicate_of` edge, which only a from-check would wave through — rewrites its
+        //    to_note_id/relation_type, corrupting the very generic edges the retire loop preserves;
+        //  - a duplicate id within the call leaves a child edgeless (the orphan class this op closes).
         let mut seen_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for child in &children {
             if child.id == parent_id || child.link_id == parent_id {
@@ -612,6 +618,30 @@ impl SyncEngine {
                     "replace_handwritten_annotations: duplicate child/link ids in one call".into(),
                 ));
             }
+            // A reused link id must be this parent's prior HANDWRITTEN edge (live or tombstoned —
+            // the restore path re-sends a retired pair). Same-parent alone is NOT enough: this
+            // parent's own generic edges must never be repointed into margins.
+            let link_row = store
+                .get_row("note_links", &child.link_id)
+                .map_err(store_err)?;
+            if let Some(ref existing) = link_row {
+                let same_parent = existing.get("from_note_id").and_then(Value::as_str)
+                    == Some(parent_id.as_str());
+                let handwritten = existing
+                    .get("relation_type")
+                    .and_then(Value::as_str)
+                    .is_none_or(|r| r == "handwritten_annotation");
+                if !(same_parent && handwritten) {
+                    return Err(SyncError::Store(
+                        "replace_handwritten_annotations: link id collides with a non-margin edge"
+                            .into(),
+                    ));
+                }
+            }
+            // A reused child id must be a handwritten note that is THIS parent's margin: either a
+            // live handwritten edge parent→child exists, or this call's paired link row already
+            // points parent→child (the tombstoned-restore pair). A handwritten child of ANOTHER
+            // parent — reachable by no edge of ours — is someone else's margin, not reusable.
             if let Some(existing) = store.get_row("notes", &child.id).map_err(store_err)? {
                 if existing.get("source").and_then(Value::as_str) != Some("handwritten") {
                     return Err(SyncError::Store(
@@ -619,15 +649,24 @@ impl SyncEngine {
                             .into(),
                     ));
                 }
-            }
-            if let Some(existing) = store
-                .get_row("note_links", &child.link_id)
-                .map_err(store_err)?
-            {
-                if existing.get("from_note_id").and_then(Value::as_str) != Some(parent_id.as_str())
-                {
+                let paired = link_row.as_ref().is_some_and(|l| {
+                    l.get("to_note_id").and_then(Value::as_str) == Some(child.id.as_str())
+                });
+                let live_from_parent = read::note_links_for_note(&store, &child.id)
+                    .map_err(store_err)?
+                    .iter()
+                    .any(|l| {
+                        l.from_note_id == parent_id
+                            && l.to_note_id == child.id
+                            && l.relation_type
+                                .as_deref()
+                                .unwrap_or("handwritten_annotation")
+                                == "handwritten_annotation"
+                    });
+                if !(paired || live_from_parent) {
                     return Err(SyncError::Store(
-                        "replace_handwritten_annotations: link id collides with another note's edge".into(),
+                        "replace_handwritten_annotations: child id collides with another parent's margin"
+                            .into(),
                     ));
                 }
             }
@@ -3343,10 +3382,22 @@ mod tests {
         engine
             .enqueue_note(note_upsert("regular", "an unrelated passage"))
             .unwrap();
-        // Another parent with its own margin (its edge is the theft target).
+        // Another parent with its own margin (its edge AND child are theft targets).
         engine.enqueue_note(parent_with_book("p2", "b2")).unwrap();
         engine
             .replace_handwritten_annotations("p2".into(), vec![margin("cB", "eX", "p2's margin")])
+            .unwrap();
+        // This parent's OWN generic (non-handwritten) edge — a from-check alone would wave its id
+        // through, and the create loop would rewrite its to/relation into a margin edge.
+        engine
+            .enqueue_note_link(
+                "er".into(),
+                "p".into(),
+                "regular".into(),
+                Some("related".into()),
+                5,
+                false,
+            )
             .unwrap();
         drain_outbox(db_path);
 
@@ -3367,6 +3418,14 @@ mod tests {
             (
                 vec![margin("c1", "eX", "x")],
                 "link id owned by another parent's edge",
+            ),
+            (
+                vec![margin("c1", "er", "x")],
+                "link id owned by this parent's GENERIC edge",
+            ),
+            (
+                vec![margin("cB", "e9", "x")],
+                "child id is another parent's margin",
             ),
         ] {
             let err = engine
@@ -3391,6 +3450,28 @@ mod tests {
                 .count(),
             1,
             "p2's edge not stolen",
+        );
+        assert_eq!(
+            engine
+                .get_note("cB".into())
+                .unwrap()
+                .unwrap()
+                .text
+                .as_deref(),
+            Some("p2's margin"),
+            "p2's margin text not rewritten",
+        );
+        // The generic edge is byte-untouched: still `related`, still to `regular`, still live.
+        let er = engine
+            .note_links_for_note("p".into())
+            .unwrap()
+            .into_iter()
+            .find(|e| e.id == "er")
+            .expect("generic edge still live");
+        assert_eq!(
+            (er.relation_type.as_deref(), er.to_note_id.as_str()),
+            (Some("related"), "regular"),
+            "this parent's generic edge not repointed into a margin",
         );
     }
 

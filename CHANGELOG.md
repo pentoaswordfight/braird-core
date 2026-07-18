@@ -39,9 +39,11 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   Texts are trimmed and blank items dropped in core (PWA filters before its length check — an all-blank
   call preserves existing margins); create rows write `book_id`/`ink_crop_path` as EXPLICIT nulls when
   absent so an id-reusing restore can't resurrect stale fields off its tombstoned row; host-minted ids
-  are validated fail-loud (parent collision, in-call duplicates, collision with a non-margin note, a
-  link id owned by another note's edge — each would corrupt or orphan a row); a corrupt p→p self-edge
-  retires the edge only, never the parent. New FFI symbol + `MarginChild` record →
+  are validated fail-loud — reusing an existing id is legal ONLY for this parent's prior handwritten
+  margin (retry/repoint/restore); parent collisions, in-call duplicates, a child id on any non-margin
+  note or another parent's margin, and a link id on any non-handwritten edge (including this parent's
+  own `related`/`duplicate_of` edges, which a from-check alone would wave through) all reject the whole
+  call; a corrupt p→p self-edge retires the edge only, never the parent. New FFI symbol + `MarginChild` record →
   bindings regenerated; 2 args (`String` + `Vec<MarginChild>`), record lowers as one `RustBuffer`, so
   no arm64 >8-slot spill. Consumers bump their pin to pick it up.
 

@@ -1271,7 +1271,7 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_braird_core_checksum_method_syncengine_recent_note() != 17557.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_braird_core_checksum_method_syncengine_replace_handwritten_annotations() != 53457.toShort()) {
+    if (lib.uniffi_braird_core_checksum_method_syncengine_replace_handwritten_annotations() != 35681.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_search() != 14411.toShort()) {
@@ -2027,10 +2027,12 @@ public interface SyncEngineInterface {
      * - Texts are trimmed and blank items dropped IN CORE (the PWA filters before its length check);
      * an empty or all-blank [`children`] is a no-op that leaves existing margins intact — guarded
      * before any read so it can't error on a missing/locked parent.
-     * - Host-minted ids are validated fail-loud before staging: a child/link id equal to the parent, a
-     * duplicate id within the call, a child id colliding with an existing non-margin note, or a link
-     * id owned by another note's edge rejects the WHOLE call — each would silently corrupt or orphan
-     * a row (re-seal over a foreign note, an edgeless child, a stolen edge).
+     * - Host-minted ids are validated fail-loud before staging: reusing an existing id is legal ONLY
+     * for THIS parent's prior handwritten margin (retry/repoint/restore). A child/link id equal to
+     * the parent, a duplicate within the call, a child id on any non-margin note or on ANOTHER
+     * parent's margin, or a link id on any non-handwritten edge — including this parent's own
+     * `related`/`duplicate_of` edges — rejects the WHOLE call; each would silently corrupt, steal,
+     * or orphan a row the create loop would otherwise overwrite.
      * - The parent must exist and be live; its CURRENT `book_id` is read here, so children file where
      * the parent lives now, not where a host snapshot thought it did.
      * - Allowed on a decrypt-failed parent: only the NEW child bodies are sealed; the parent's
@@ -2816,10 +2818,12 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
      * - Texts are trimmed and blank items dropped IN CORE (the PWA filters before its length check);
      * an empty or all-blank [`children`] is a no-op that leaves existing margins intact — guarded
      * before any read so it can't error on a missing/locked parent.
-     * - Host-minted ids are validated fail-loud before staging: a child/link id equal to the parent, a
-     * duplicate id within the call, a child id colliding with an existing non-margin note, or a link
-     * id owned by another note's edge rejects the WHOLE call — each would silently corrupt or orphan
-     * a row (re-seal over a foreign note, an edgeless child, a stolen edge).
+     * - Host-minted ids are validated fail-loud before staging: reusing an existing id is legal ONLY
+     * for THIS parent's prior handwritten margin (retry/repoint/restore). A child/link id equal to
+     * the parent, a duplicate within the call, a child id on any non-margin note or on ANOTHER
+     * parent's margin, or a link id on any non-handwritten edge — including this parent's own
+     * `related`/`duplicate_of` edges — rejects the WHOLE call; each would silently corrupt, steal,
+     * or orphan a row the create loop would otherwise overwrite.
      * - The parent must exist and be live; its CURRENT `book_id` is read here, so children file where
      * the parent lives now, not where a host snapshot thought it did.
      * - Allowed on a decrypt-failed parent: only the NEW child bodies are sealed; the parent's
