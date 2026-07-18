@@ -1271,7 +1271,7 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_braird_core_checksum_method_syncengine_recent_note() != 17557.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_braird_core_checksum_method_syncengine_replace_handwritten_annotations() != 35681.toShort()) {
+    if (lib.uniffi_braird_core_checksum_method_syncengine_replace_handwritten_annotations() != 57875.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_search() != 14411.toShort()) {
@@ -2028,18 +2028,28 @@ public interface SyncEngineInterface {
      * an empty or all-blank [`children`] is a no-op that leaves existing margins intact — guarded
      * before any read so it can't error on a missing/locked parent.
      * - Host-minted ids are validated fail-loud before staging: reusing an existing id is legal ONLY
-     * for THIS parent's prior handwritten margin (retry/repoint/restore). A child/link id equal to
-     * the parent, a duplicate within the call, a child id on any non-margin note or on ANOTHER
-     * parent's margin, or a link id on any non-handwritten edge — including this parent's own
-     * `related`/`duplicate_of` edges — rejects the WHOLE call; each would silently corrupt, steal,
-     * or orphan a row the create loop would otherwise overwrite.
+     * for THIS parent's prior handwritten margin (retry/repoint/restore) that NO OTHER live edge
+     * still touches. A child/link id equal to the parent, a duplicate within the call, a child id
+     * on any non-margin note or on ANOTHER parent's margin, a reused child id that any foreign
+     * live edge — any relation type, either direction, and whether or not the child's notes row
+     * exists locally (pull can skip a never-seen row's tombstone while its edges apply, so a
+     * fleet-deleted child can stand as dangling live edges; reusing it would resurrect the note
+     * over its server tombstone) — still references (the retire loop deliberately KEEPS such
+     * shared/entangled children, so the create loop must never overwrite one; the host mints a
+     * fresh id instead), or a link id on any non-handwritten edge —
+     * including this parent's own `related`/`duplicate_of` edges — rejects the WHOLE call; each
+     * would silently corrupt, steal, or orphan a row the create loop would otherwise overwrite.
      * - The parent must exist and be live; its CURRENT `book_id` is read here, so children file where
      * the parent lives now, not where a host snapshot thought it did.
      * - Allowed on a decrypt-failed parent: only the NEW child bodies are sealed; the parent's
      * ciphertext is never read or re-sealed.
      * - Children carry `source = "handwritten"`, empty tags, the parent's book, each
      * [`MarginChild::ink_crop_path`] verbatim (`None` on Android's text-only path; a storage key on the
-     * capture-with-crops path), and `created_at` staggered by index so review order survives LWW.
+     * capture-with-crops path), and `created_at`/`updated_at` staggered by index so review order
+     * survives LWW (the PWA child writes `createdAt: now + i, updatedAt: now + i`). EVERY other
+     * synced notes column is written as the PWA child literal's explicit cleared shape (empty
+     * `page`, null `chapter`/`image_path`/`source_id`, `{}` `source_meta`), so an id reuse can
+     * never resurrect a stale field through the staging merge or the server's column-list upsert.
      * Note-links are a random-pk bag (host ids), so
      * a re-run with fresh ids adds a new set and tombstones the prior one; a retry re-sending the SAME
      * ids is idempotent — a row in the new set is NEVER retired, so the batch can't stage a create then
@@ -2819,18 +2829,28 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
      * an empty or all-blank [`children`] is a no-op that leaves existing margins intact — guarded
      * before any read so it can't error on a missing/locked parent.
      * - Host-minted ids are validated fail-loud before staging: reusing an existing id is legal ONLY
-     * for THIS parent's prior handwritten margin (retry/repoint/restore). A child/link id equal to
-     * the parent, a duplicate within the call, a child id on any non-margin note or on ANOTHER
-     * parent's margin, or a link id on any non-handwritten edge — including this parent's own
-     * `related`/`duplicate_of` edges — rejects the WHOLE call; each would silently corrupt, steal,
-     * or orphan a row the create loop would otherwise overwrite.
+     * for THIS parent's prior handwritten margin (retry/repoint/restore) that NO OTHER live edge
+     * still touches. A child/link id equal to the parent, a duplicate within the call, a child id
+     * on any non-margin note or on ANOTHER parent's margin, a reused child id that any foreign
+     * live edge — any relation type, either direction, and whether or not the child's notes row
+     * exists locally (pull can skip a never-seen row's tombstone while its edges apply, so a
+     * fleet-deleted child can stand as dangling live edges; reusing it would resurrect the note
+     * over its server tombstone) — still references (the retire loop deliberately KEEPS such
+     * shared/entangled children, so the create loop must never overwrite one; the host mints a
+     * fresh id instead), or a link id on any non-handwritten edge —
+     * including this parent's own `related`/`duplicate_of` edges — rejects the WHOLE call; each
+     * would silently corrupt, steal, or orphan a row the create loop would otherwise overwrite.
      * - The parent must exist and be live; its CURRENT `book_id` is read here, so children file where
      * the parent lives now, not where a host snapshot thought it did.
      * - Allowed on a decrypt-failed parent: only the NEW child bodies are sealed; the parent's
      * ciphertext is never read or re-sealed.
      * - Children carry `source = "handwritten"`, empty tags, the parent's book, each
      * [`MarginChild::ink_crop_path`] verbatim (`None` on Android's text-only path; a storage key on the
-     * capture-with-crops path), and `created_at` staggered by index so review order survives LWW.
+     * capture-with-crops path), and `created_at`/`updated_at` staggered by index so review order
+     * survives LWW (the PWA child writes `createdAt: now + i, updatedAt: now + i`). EVERY other
+     * synced notes column is written as the PWA child literal's explicit cleared shape (empty
+     * `page`, null `chapter`/`image_path`/`source_id`, `{}` `source_meta`), so an id reuse can
+     * never resurrect a stale field through the staging merge or the server's column-list upsert.
      * Note-links are a random-pk bag (host ids), so
      * a re-run with fresh ids adds a new set and tombstones the prior one; a retry re-sending the SAME
      * ids is idempotent — a row in the new set is NEVER retired, so the batch can't stage a create then

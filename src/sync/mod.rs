@@ -523,18 +523,28 @@ impl SyncEngine {
     ///   an empty or all-blank [`children`] is a no-op that leaves existing margins intact — guarded
     ///   before any read so it can't error on a missing/locked parent.
     /// - Host-minted ids are validated fail-loud before staging: reusing an existing id is legal ONLY
-    ///   for THIS parent's prior handwritten margin (retry/repoint/restore). A child/link id equal to
-    ///   the parent, a duplicate within the call, a child id on any non-margin note or on ANOTHER
-    ///   parent's margin, or a link id on any non-handwritten edge — including this parent's own
-    ///   `related`/`duplicate_of` edges — rejects the WHOLE call; each would silently corrupt, steal,
-    ///   or orphan a row the create loop would otherwise overwrite.
+    ///   for THIS parent's prior handwritten margin (retry/repoint/restore) that NO OTHER live edge
+    ///   still touches. A child/link id equal to the parent, a duplicate within the call, a child id
+    ///   on any non-margin note or on ANOTHER parent's margin, a reused child id that any foreign
+    ///   live edge — any relation type, either direction, and whether or not the child's notes row
+    ///   exists locally (pull can skip a never-seen row's tombstone while its edges apply, so a
+    ///   fleet-deleted child can stand as dangling live edges; reusing it would resurrect the note
+    ///   over its server tombstone) — still references (the retire loop deliberately KEEPS such
+    ///   shared/entangled children, so the create loop must never overwrite one; the host mints a
+    ///   fresh id instead), or a link id on any non-handwritten edge —
+    ///   including this parent's own `related`/`duplicate_of` edges — rejects the WHOLE call; each
+    ///   would silently corrupt, steal, or orphan a row the create loop would otherwise overwrite.
     /// - The parent must exist and be live; its CURRENT `book_id` is read here, so children file where
     ///   the parent lives now, not where a host snapshot thought it did.
     /// - Allowed on a decrypt-failed parent: only the NEW child bodies are sealed; the parent's
     ///   ciphertext is never read or re-sealed.
     /// - Children carry `source = "handwritten"`, empty tags, the parent's book, each
     ///   [`MarginChild::ink_crop_path`] verbatim (`None` on Android's text-only path; a storage key on the
-    ///   capture-with-crops path), and `created_at` staggered by index so review order survives LWW.
+    ///   capture-with-crops path), and `created_at`/`updated_at` staggered by index so review order
+    ///   survives LWW (the PWA child writes `createdAt: now + i, updatedAt: now + i`). EVERY other
+    ///   synced notes column is written as the PWA child literal's explicit cleared shape (empty
+    ///   `page`, null `chapter`/`image_path`/`source_id`, `{}` `source_meta`), so an id reuse can
+    ///   never resurrect a stale field through the staging merge or the server's column-list upsert.
     ///   Note-links are a random-pk bag (host ids), so
     ///   a re-run with fresh ids adds a new set and tombstones the prior one; a retry re-sending the SAME
     ///   ids is idempotent — a row in the new set is NEVER retired, so the batch can't stage a create then
@@ -642,6 +652,20 @@ impl SyncEngine {
             // live handwritten edge parent→child exists, or this call's paired link row already
             // points parent→child (the tombstoned-restore pair). A handwritten child of ANOTHER
             // parent — reachable by no edge of ours — is someone else's margin, not reusable.
+            // The edge scan runs for EVERY child id, row or no row: pull skips a tombstone for a
+            // row this device never had (`pull.rs` incoming-delete-without-local) while edges apply
+            // independently (no local FK), so a fleet-tombstoned child can stand locally as live
+            // edges with NO notes row — gating the edge checks on row existence would let exactly
+            // that id bypass them.
+            let live_touching = read::note_links_for_note(&store, &child.id).map_err(store_err)?;
+            let own_margin_edge = |l: &NoteLinkRecord| {
+                l.from_note_id == parent_id
+                    && l.to_note_id == child.id
+                    && l.relation_type
+                        .as_deref()
+                        .unwrap_or("handwritten_annotation")
+                        == "handwritten_annotation"
+            };
             if let Some(existing) = store.get_row("notes", &child.id).map_err(store_err)? {
                 if existing.get("source").and_then(Value::as_str) != Some("handwritten") {
                     return Err(SyncError::Store(
@@ -652,23 +676,28 @@ impl SyncEngine {
                 let paired = link_row.as_ref().is_some_and(|l| {
                     l.get("to_note_id").and_then(Value::as_str) == Some(child.id.as_str())
                 });
-                let live_from_parent = read::note_links_for_note(&store, &child.id)
-                    .map_err(store_err)?
-                    .iter()
-                    .any(|l| {
-                        l.from_note_id == parent_id
-                            && l.to_note_id == child.id
-                            && l.relation_type
-                                .as_deref()
-                                .unwrap_or("handwritten_annotation")
-                                == "handwritten_annotation"
-                    });
-                if !(paired || live_from_parent) {
+                if !(paired || live_touching.iter().any(own_margin_edge)) {
                     return Err(SyncError::Store(
                         "replace_handwritten_annotations: child id collides with another parent's margin"
                             .into(),
                     ));
                 }
+            }
+            // Ownership is NOT sufficiency: the retire loop deliberately KEEPS a child that any
+            // other live edge still touches (a shared dedupe survivor, a generic `related` row —
+            // even this parent's own), and the create loop below OVERWRITES the notes row for
+            // every id in the set. Accepting the reuse would rewrite the text/book/source that the
+            // preserved edge still renders — and when the notes row is locally ABSENT (the dangling
+            // state above), the create would additionally resurrect a fleet-deleted note over its
+            // server tombstone. So while any foreign live edge touches the child id, reuse rejects
+            // and the host mints a fresh child id instead. (An id whose only live edges are this
+            // parent's own margin edges stays legal with or without the row — the row-less form is
+            // the same restore, just seen from a device that skipped the note's tombstone.)
+            if live_touching.iter().any(|l| !own_margin_edge(l)) {
+                return Err(SyncError::Store(
+                    "replace_handwritten_annotations: reused child id is still referenced by another live edge"
+                        .into(),
+                ));
             }
         }
 
@@ -699,22 +728,34 @@ impl SyncEngine {
                 .vault
                 .encrypt_note(Some(child.id.clone()), child.text.clone());
             let content_tag = self.vault.content_tag(child.text.clone(), book_id.clone());
+            // EVERY synced notes column gets an EXPLICIT value — MarginChild-owned, or the PWA
+            // child literal's cleared shape (`useNoteActions.js`: `page: ''`, `chapter: null`,
+            // `imagePath: null`, `sourceId: null`, `sourceMeta: {}`) — never an omitted key.
+            // Staging MERGES the partial onto any existing row, and the server upsert only sets the
+            // columns the payload names, so a restore/retry reusing a prior child id would
+            // otherwise resurrect that row's stale fields — a crop or whole-page photo rendered
+            // against unrelated text, a stale source/page/chapter riding a text-only margin —
+            // locally AND on the cloud row. The schema-completeness test pins this shape to
+            // `vendored/schema/sync-schema.json`, so a new synced notes column fails the build
+            // until it is covered here.
             let mut note = Map::new();
             note.insert("id".into(), json!(child.id));
-            // EXPLICIT null when absent (json! of None → null), never an omitted column: staging MERGES
-            // the partial onto any existing row, so a restore/retry reusing a prior child id would
-            // otherwise resurrect the tombstoned row's stale book_id/ink_crop_path — a crop rendered
-            // against unrelated text, a child filed under a book the parent left, and a content_tag
-            // computed under a different book than the stored one. The PWA writes both explicitly
-            // (`bookId: parent?.bookId ?? null`, `inkCropPath`).
             note.insert("book_id".into(), json!(book_id.clone()));
-            note.insert("ink_crop_path".into(), json!(child.ink_crop_path.clone()));
-            note.insert("tags".into(), json!(Vec::<String>::new()));
-            note.insert("source".into(), json!("handwritten"));
             note.insert("text".into(), json!(ciphertext));
             note.insert("content_tag".into(), json!(content_tag));
+            note.insert("tags".into(), json!(Vec::<String>::new()));
+            note.insert("source".into(), json!("handwritten"));
+            note.insert("page".into(), json!(""));
+            note.insert("chapter".into(), Value::Null);
+            note.insert("image_path".into(), Value::Null);
+            note.insert("ink_crop_path".into(), json!(child.ink_crop_path.clone()));
+            note.insert("source_id".into(), Value::Null);
+            note.insert("source_meta".into(), json!({}));
+            // created_at staggered by index (review order survives LWW); updated_at mirrors it on
+            // both rows — the PWA writes `createdAt: now + i, updatedAt: now + i` for the child AND
+            // its edge.
             note.insert("created_at".into(), json!(created));
-            note.insert("updated_at".into(), json!(now));
+            note.insert("updated_at".into(), json!(created));
             note.insert("deleted".into(), json!(false));
             writes.push(("notes", child.id.clone(), note));
 
@@ -724,7 +765,7 @@ impl SyncEngine {
             link.insert("to_note_id".into(), json!(child.id));
             link.insert("relation_type".into(), json!("handwritten_annotation"));
             link.insert("created_at".into(), json!(created));
-            link.insert("updated_at".into(), json!(now));
+            link.insert("updated_at".into(), json!(created));
             link.insert("deleted".into(), json!(false));
             writes.push(("note_links", child.link_id.clone(), link));
         }
@@ -2898,6 +2939,26 @@ mod tests {
             "staggered created_at preserves review order"
         );
 
+        // Wire stamps: updated_at mirrors the staggered created_at (PWA parity, both rows), and
+        // content_tag is computed under the parent's LIVE book — not None, not a host snapshot.
+        let c1_payload = collapsed_payload_for(db_path, "notes", "c1").expect("c1 queued");
+        assert_eq!(
+            c1_payload["updated_at"], c1_payload["created_at"],
+            "updatedAt == createdAt == now + i (PWA stamp parity)"
+        );
+        assert_eq!(
+            c1_payload["content_tag"],
+            json!(engine
+                .vault
+                .content_tag("Kahneman overstates it".into(), Some("b1".into()))),
+            "content_tag fingerprinted under the parent's live book"
+        );
+        let e1_payload = collapsed_payload_for(db_path, "note_links", "e1").expect("e1 queued");
+        assert_eq!(
+            e1_payload["updated_at"], e1_payload["created_at"],
+            "edge stamps mirror the child's (PWA writes now + i on both)"
+        );
+
         // Each child has a live parent→child handwritten edge (no orphan possible — one transaction).
         let edges = engine.note_links_for_note("p".into()).unwrap();
         let from_parent: Vec<_> = edges.iter().filter(|e| e.from_note_id == "p").collect();
@@ -3278,8 +3339,11 @@ mod tests {
 
     #[test]
     fn replace_handwritten_annotations_restore_writes_explicit_nulls_not_stale_merges() {
-        // M1 (sweep): a restore reusing a prior child id must not resurrect the tombstoned row's stale
-        // ink_crop_path via the staging merge — absent Options are written as EXPLICIT nulls.
+        // M1 (sweep) + the round-8 completion: a restore reusing a prior child id must not resurrect
+        // ANY of the tombstoned row's stale fields via the staging merge — every synced column the
+        // MarginChild doesn't own is written as the PWA child's explicit cleared shape. A pull can
+        // enrich a margin with fields a fresh one never has (dedupe merges, PWA-side edits, older
+        // schemas), so seed them ALL and prove a text-only restore clears every one.
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.sqlite");
         let db_path = db.to_str().unwrap();
@@ -3296,28 +3360,66 @@ mod tests {
                 }],
             )
             .unwrap();
+        // Simulate the pull-side enrichment: the stored row now carries every clearable field.
+        let enriched = json!({
+            "id": "c1",
+            "book_id": "b-old",
+            "text": "enc:v2:stale",
+            "content_tag": "stale-tag",
+            "tags": ["stale-idea"],
+            "source": "handwritten",
+            "page": "12",
+            "chapter": "Ch. 3",
+            "image_path": "u/whole-page.jpg",
+            "ink_crop_path": "u/c1.jpg",
+            "source_id": "src-9",
+            "source_meta": {"title": "Old Book"},
+            "created_at": 1,
+            "updated_at": 1,
+            "deleted": false
+        });
+        Store::open(db_path)
+            .unwrap()
+            .apply_row("notes", enriched.as_object().unwrap())
+            .unwrap();
         engine
             .replace_handwritten_annotations("p".into(), vec![margin("c2", "e2", "interim")])
             .unwrap();
 
-        // Restore c1 text-only: the old crop must NOT come back with it.
+        // Restore c1 text-only: none of the stale fields may come back with it.
         engine
             .replace_handwritten_annotations("p".into(), vec![margin("c1", "e1", "typed rewrite")])
             .unwrap();
 
+        let restored = engine.get_note("c1".into()).unwrap().unwrap();
+        assert_eq!(restored.ink_crop_path, None, "stale crop not resurrected");
         assert_eq!(
-            engine.get_note("c1".into()).unwrap().unwrap().ink_crop_path,
-            None,
-            "stale crop not resurrected"
+            restored.book_id.as_deref(),
+            Some("b1"),
+            "book re-derived from the live parent, not the stale row"
         );
+        assert!(restored.tags.is_empty(), "stale tags not resurrected");
         let payload = collapsed_payload_for(db_path, "notes", "c1").expect("c1 queued");
-        assert!(
-            payload
-                .get("ink_crop_path")
-                .map(Value::is_null)
-                .unwrap_or(false),
-            "explicit null on the wire"
+        for column in ["chapter", "image_path", "ink_crop_path", "source_id"] {
+            assert_eq!(
+                payload.get(column),
+                Some(&Value::Null),
+                "{column}: explicit null on the wire"
+            );
+        }
+        assert_eq!(
+            payload["page"],
+            json!(""),
+            "page cleared to the PWA child's ''"
         );
+        assert_eq!(
+            payload["source_meta"],
+            json!({}),
+            "source_meta cleared to the PWA child's {{}}"
+        );
+        assert_eq!(payload["book_id"], json!("b1"));
+        assert_eq!(payload["tags"], json!([]));
+        assert_eq!(payload["deleted"], json!(false));
     }
 
     #[test]
@@ -3399,6 +3501,28 @@ mod tests {
                 false,
             )
             .unwrap();
+        // This parent's OWN margin — but entangled: p2 also annotates it (shared dedupe-survivor
+        // shape) and an imported `related` row touches it. The retire loop would deliberately KEEP
+        // such a child, so the create loop must never be allowed to overwrite it via id reuse.
+        engine
+            .replace_handwritten_annotations(
+                "p".into(),
+                vec![margin("cS", "eS", "the entangled margin")],
+            )
+            .unwrap();
+        engine
+            .enqueue_note_link("e2b".into(), "p2".into(), "cS".into(), None, 5, false)
+            .unwrap();
+        engine
+            .enqueue_note_link(
+                "eg".into(),
+                "regular".into(),
+                "cS".into(),
+                Some("related".into()),
+                5,
+                false,
+            )
+            .unwrap();
         drain_outbox(db_path);
 
         for (children, why) in [
@@ -3426,6 +3550,10 @@ mod tests {
             (
                 vec![margin("cB", "e9", "x")],
                 "child id is another parent's margin",
+            ),
+            (
+                vec![margin("cS", "eS", "x")],
+                "child id reused while another live edge still touches it",
             ),
         ] {
             let err = engine
@@ -3472,6 +3600,28 @@ mod tests {
             (er.relation_type.as_deref(), er.to_note_id.as_str()),
             (Some("related"), "regular"),
             "this parent's generic edge not repointed into a margin",
+        );
+        // The entangled margin is byte-untouched: its text was not rewritten, and both foreign
+        // edges (the second parent's and the imported `related` row) still point at it, live.
+        assert_eq!(
+            engine
+                .get_note("cS".into())
+                .unwrap()
+                .unwrap()
+                .text
+                .as_deref(),
+            Some("the entangled margin"),
+            "the shared child's text not rewritten by the rejected reuse",
+        );
+        let cs_edges: std::collections::HashSet<String> = engine
+            .note_links_for_note("cS".into())
+            .unwrap()
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        assert!(
+            cs_edges.contains("e2b") && cs_edges.contains("eg"),
+            "both foreign edges still live on the shared child",
         );
     }
 
@@ -3711,6 +3861,489 @@ mod tests {
                 .is_empty(),
             "nothing enqueued"
         );
+    }
+
+    #[test]
+    fn replace_handwritten_annotations_create_rows_cover_every_synced_column() {
+        // The mechanical guard for the stale-resurrection class (round 8): the create row must carry
+        // EVERY column the synced schema knows for notes/note_links — an omitted column survives an
+        // id reuse through the staging merge locally AND through the server's column-list upsert.
+        // Pinned to the drift-guarded vendored schema, so when surfc grows a synced column this test
+        // fails until the op covers it — completeness is no longer a review judgment call.
+        let schema: Value =
+            serde_json::from_str(include_str!("../../vendored/schema/sync-schema.json")).unwrap();
+        let columns = |table: &str| -> std::collections::BTreeSet<String> {
+            schema[table].as_object().unwrap().keys().cloned().collect()
+        };
+        let keys = |m: &Map<String, Value>| -> std::collections::BTreeSet<String> {
+            m.keys().cloned().collect()
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine.enqueue_note(parent_with_book("p", "b1")).unwrap();
+        engine
+            .replace_handwritten_annotations("p".into(), vec![margin("c1", "e1", "a margin")])
+            .unwrap();
+
+        assert_eq!(
+            keys(&collapsed_payload_for(db_path, "notes", "c1").unwrap()),
+            columns("notes"),
+            "child create writes every synced notes column — nothing less, nothing more",
+        );
+        assert_eq!(
+            keys(&collapsed_payload_for(db_path, "note_links", "e1").unwrap()),
+            columns("note_links"),
+            "edge create writes every synced note_links column",
+        );
+
+        // The edge TOMBSTONE must be schema-complete too — note_links has no sparse-PATCH flush
+        // fallback, so a missing NOT-NULL column would 23502 and wedge the outbox (B1).
+        drain_outbox(db_path);
+        engine
+            .replace_handwritten_annotations("p".into(), vec![margin("c2", "e2", "next")])
+            .unwrap();
+        assert_eq!(
+            keys(&collapsed_payload_for(db_path, "note_links", "e1").unwrap()),
+            columns("note_links"),
+            "edge tombstone carries the full synced shape",
+        );
+    }
+
+    /// Post-condition oracle for a SUCCESSFUL replace: the parent's live handwritten edge set is
+    /// EXACTLY `expected`'s (link, child) pairs; every expected child is a live handwritten note
+    /// whose text decrypts to the input, filed under the parent's live book; and what would FLUSH
+    /// for each expected id is LIVE (the sticky-delete check) with the edge pointing parent→child.
+    fn assert_margins_converged(
+        engine: &SyncEngine,
+        db_path: &str,
+        parent_id: &str,
+        book_id: Option<&str>,
+        expected: &[(&str, &str, &str)],
+    ) {
+        let live_hw: std::collections::BTreeSet<(String, String)> = engine
+            .note_links_for_note(parent_id.into())
+            .unwrap()
+            .into_iter()
+            .filter(|e| {
+                e.from_note_id == parent_id
+                    && e.relation_type
+                        .as_deref()
+                        .unwrap_or("handwritten_annotation")
+                        == "handwritten_annotation"
+            })
+            .map(|e| (e.id, e.to_note_id))
+            .collect();
+        let want: std::collections::BTreeSet<(String, String)> = expected
+            .iter()
+            .map(|(child, link, _)| (link.to_string(), child.to_string()))
+            .collect();
+        assert_eq!(
+            live_hw, want,
+            "live handwritten edge set == the new set, exactly"
+        );
+
+        for (child_id, link_id, text) in expected {
+            let child = engine
+                .get_note((*child_id).into())
+                .unwrap()
+                .unwrap_or_else(|| panic!("{child_id}: expected child live"));
+            assert_eq!(child.source.as_deref(), Some("handwritten"), "{child_id}");
+            assert_eq!(
+                child.text.as_deref(),
+                Some(*text),
+                "{child_id}: sealed text round-trips"
+            );
+            assert_eq!(
+                child.book_id.as_deref(),
+                book_id,
+                "{child_id}: parent's live book"
+            );
+
+            let note = collapsed_payload_for(db_path, "notes", child_id)
+                .unwrap_or_else(|| panic!("{child_id}: create queued"));
+            assert_eq!(
+                note["deleted"],
+                json!(false),
+                "{child_id}: flushes live — never a sticky delete"
+            );
+            let edge = collapsed_payload_for(db_path, "note_links", link_id)
+                .unwrap_or_else(|| panic!("{link_id}: edge queued"));
+            assert_eq!(
+                edge["deleted"],
+                json!(false),
+                "{link_id}: edge flushes live"
+            );
+            assert_eq!(edge["from_note_id"], json!(parent_id), "{link_id}");
+            assert_eq!(
+                edge["to_note_id"],
+                json!(child_id),
+                "{link_id}: parent→child"
+            );
+        }
+    }
+
+    #[test]
+    fn replace_handwritten_annotations_reuse_state_grid_rejects_or_converges() {
+        // Rounds 2–8, mechanized: reuse legality is a function of (stored-row state × edge topology
+        // × queue state), and every regression this op has had was one unenumerated cell of that
+        // space. Each reachable cell must either REJECT before staging or CONVERGE per the oracle —
+        // no third outcome. When the space grows (a new relation semantic, a new reconcile
+        // producer), extend the grid FIRST, then the op.
+        enum Expect {
+            Converges(&'static [(&'static str, &'static str, &'static str)]),
+            Rejects(&'static str),
+        }
+        use Expect::*;
+        type Setup = fn(&SyncEngine, &str);
+        let cells: Vec<(&str, Setup, Vec<MarginChild>, Expect)> = vec![
+            // ── reused CHILD id "x" (fresh link "eF" unless the cell is about the pair) ──
+            (
+                "child absent — fresh mint",
+                |_, _| {},
+                vec![margin("x", "eF", "m")],
+                Converges(&[("x", "eF", "m")]),
+            ),
+            (
+                "child own live margin, same link — idempotent retry",
+                |e, _| {
+                    e.replace_handwritten_annotations("p".into(), vec![margin("x", "eL", "m")])
+                        .unwrap();
+                },
+                vec![margin("x", "eL", "m")],
+                Converges(&[("x", "eL", "m")]),
+            ),
+            (
+                "child own live margin, fresh link — link rotation retires the old edge",
+                |e, _| {
+                    e.replace_handwritten_annotations("p".into(), vec![margin("x", "eL", "m")])
+                        .unwrap();
+                },
+                vec![margin("x", "eF", "m2")],
+                Converges(&[("x", "eF", "m2")]),
+            ),
+            (
+                "child own tombstoned margin, paired tombstoned link — restore drops queued tombstones",
+                |e, _| {
+                    e.replace_handwritten_annotations("p".into(), vec![margin("x", "eL", "m")])
+                        .unwrap();
+                    e.replace_handwritten_annotations("p".into(), vec![margin("y", "eY", "mid")])
+                        .unwrap();
+                },
+                vec![margin("x", "eL", "m3")],
+                Converges(&[("x", "eL", "m3")]),
+            ),
+            (
+                "child own tombstoned margin, FRESH link — unprovable ownership rejects",
+                |e, _| {
+                    e.replace_handwritten_annotations("p".into(), vec![margin("x", "eL", "m")])
+                        .unwrap();
+                    e.replace_handwritten_annotations("p".into(), vec![margin("y", "eY", "mid")])
+                        .unwrap();
+                },
+                vec![margin("x", "eF", "m")],
+                Rejects("another parent's margin"),
+            ),
+            (
+                "child shared with a second parent's live handwritten edge",
+                |e, _| {
+                    e.replace_handwritten_annotations("p".into(), vec![margin("x", "eL", "m")])
+                        .unwrap();
+                    e.enqueue_note_link("e2".into(), "p2".into(), "x".into(), None, 5, false)
+                        .unwrap();
+                },
+                vec![margin("x", "eL", "m")],
+                Rejects("referenced by another live edge"),
+            ),
+            (
+                "child carries an inbound generic edge",
+                |e, _| {
+                    e.replace_handwritten_annotations("p".into(), vec![margin("x", "eL", "m")])
+                        .unwrap();
+                    e.enqueue_note_link(
+                        "eg".into(),
+                        "r".into(),
+                        "x".into(),
+                        Some("related".into()),
+                        5,
+                        false,
+                    )
+                    .unwrap();
+                },
+                vec![margin("x", "eL", "m")],
+                Rejects("referenced by another live edge"),
+            ),
+            (
+                "child carries an outbound generic edge",
+                |e, _| {
+                    e.replace_handwritten_annotations("p".into(), vec![margin("x", "eL", "m")])
+                        .unwrap();
+                    e.enqueue_note_link(
+                        "eg".into(),
+                        "x".into(),
+                        "r".into(),
+                        Some("related".into()),
+                        5,
+                        false,
+                    )
+                    .unwrap();
+                },
+                vec![margin("x", "eL", "m")],
+                Rejects("referenced by another live edge"),
+            ),
+            (
+                "child carries this parent's OWN generic edge",
+                |e, _| {
+                    e.replace_handwritten_annotations("p".into(), vec![margin("x", "eL", "m")])
+                        .unwrap();
+                    e.enqueue_note_link(
+                        "eg".into(),
+                        "p".into(),
+                        "x".into(),
+                        Some("related".into()),
+                        5,
+                        false,
+                    )
+                    .unwrap();
+                },
+                vec![margin("x", "eL", "m")],
+                Rejects("referenced by another live edge"),
+            ),
+            (
+                "child id on a live regular note",
+                |e, _| {
+                    e.enqueue_note(note_upsert("x", "a passage")).unwrap();
+                },
+                vec![margin("x", "eF", "m")],
+                Rejects("non-margin note"),
+            ),
+            (
+                "child id on a tombstoned regular note",
+                |e, _| {
+                    e.enqueue_note(NoteUpsert {
+                        deleted: true,
+                        ..note_upsert("x", "a passage")
+                    })
+                    .unwrap();
+                },
+                vec![margin("x", "eF", "m")],
+                Rejects("non-margin note"),
+            ),
+            (
+                "child id on another parent's margin",
+                |e, _| {
+                    e.enqueue_note(parent_with_book("p2", "b2")).unwrap();
+                    e.replace_handwritten_annotations(
+                        "p2".into(),
+                        vec![margin("x", "eX", "theirs")],
+                    )
+                    .unwrap();
+                },
+                vec![margin("x", "eF", "m")],
+                Rejects("another parent's margin"),
+            ),
+            (
+                "child id is the parent",
+                |_, _| {},
+                vec![margin("p", "eF", "m")],
+                Rejects("the parent id"),
+            ),
+            // ── reused LINK id "y" (fresh child "cF" unless the cell is about the pair) ──
+            (
+                "link absent — fresh mint",
+                |_, _| {},
+                vec![margin("cF", "y", "m")],
+                Converges(&[("cF", "y", "m")]),
+            ),
+            (
+                "link own live margin edge, new child — repoint retires the old child",
+                |e, _| {
+                    e.replace_handwritten_annotations("p".into(), vec![margin("old", "y", "m")])
+                        .unwrap();
+                },
+                vec![margin("cF", "y", "m2")],
+                Converges(&[("cF", "y", "m2")]),
+            ),
+            (
+                "link own tombstoned margin edge, new child — restore-repoint",
+                |e, _| {
+                    e.replace_handwritten_annotations("p".into(), vec![margin("old", "y", "m")])
+                        .unwrap();
+                    e.replace_handwritten_annotations("p".into(), vec![margin("mid", "eM", "m2")])
+                        .unwrap();
+                },
+                vec![margin("cF", "y", "m3")],
+                Converges(&[("cF", "y", "m3")]),
+            ),
+            (
+                "link id on this parent's generic edge",
+                |e, _| {
+                    e.enqueue_note_link(
+                        "y".into(),
+                        "p".into(),
+                        "r".into(),
+                        Some("related".into()),
+                        5,
+                        false,
+                    )
+                    .unwrap();
+                },
+                vec![margin("cF", "y", "m")],
+                Rejects("non-margin edge"),
+            ),
+            (
+                "link id on another parent's edge",
+                |e, _| {
+                    e.enqueue_note_link("y".into(), "p2".into(), "z".into(), None, 5, false)
+                        .unwrap();
+                },
+                vec![margin("cF", "y", "m")],
+                Rejects("non-margin edge"),
+            ),
+            (
+                "link id is the parent",
+                |_, _| {},
+                vec![margin("cF", "p", "m")],
+                Rejects("the parent id"),
+            ),
+            // ── DANGLING states: live edges whose child has NO local notes row. Pull skips a
+            // tombstone for a row this device never had while edges apply independently (no local
+            // FK), so these are reachable on any fresh device — the round-8b bypass class. ──
+            (
+                "no notes row, own live margin edge only — row-less restore",
+                |e, _| {
+                    e.enqueue_note_link("eL".into(), "p".into(), "x".into(), None, 5, false)
+                        .unwrap();
+                },
+                vec![margin("x", "eL", "m")],
+                Converges(&[("x", "eL", "m")]),
+            ),
+            (
+                "no notes row, own edge + a second parent's live edge",
+                |e, _| {
+                    e.enqueue_note_link("eL".into(), "p".into(), "x".into(), None, 5, false)
+                        .unwrap();
+                    e.enqueue_note_link("e2".into(), "p2".into(), "x".into(), None, 5, false)
+                        .unwrap();
+                },
+                vec![margin("x", "eL", "m")],
+                Rejects("referenced by another live edge"),
+            ),
+            (
+                "no notes row, a foreign live edge only",
+                |e, _| {
+                    e.enqueue_note_link("e2".into(), "p2".into(), "x".into(), None, 5, false)
+                        .unwrap();
+                },
+                vec![margin("x", "eF", "m")],
+                Rejects("referenced by another live edge"),
+            ),
+            // ── Partial-skew + duplicate-edge states (converge; pinned so they stay that way) ──
+            (
+                "note tombstoned but own edge still live — paired reuse resurrects (restore)",
+                |e, db| {
+                    e.replace_handwritten_annotations("p".into(), vec![margin("x", "eL", "m")])
+                        .unwrap();
+                    // Tombstone JUST the note (partial-pull skew): the edge stays live.
+                    let tomb = json!({
+                        "id": "x",
+                        "source": "handwritten",
+                        "deleted": true,
+                        "created_at": 1,
+                        "updated_at": 1
+                    });
+                    Store::open(db)
+                        .unwrap()
+                        .apply_row("notes", tomb.as_object().unwrap())
+                        .unwrap();
+                },
+                vec![margin("x", "eL", "m2")],
+                Converges(&[("x", "eL", "m2")]),
+            ),
+            (
+                "note live but own edge tombstoned — paired reuse relinks",
+                |e, _| {
+                    e.replace_handwritten_annotations("p".into(), vec![margin("x", "eL", "m")])
+                        .unwrap();
+                    e.enqueue_note_link("eL".into(), "p".into(), "x".into(), None, 5, true)
+                        .unwrap();
+                },
+                vec![margin("x", "eL", "m2")],
+                Converges(&[("x", "eL", "m2")]),
+            ),
+            (
+                "two live own margin edges to one child — reuse one, the duplicate is cleaned",
+                |e, _| {
+                    e.replace_handwritten_annotations("p".into(), vec![margin("x", "eL", "m")])
+                        .unwrap();
+                    e.enqueue_note_link("eL2".into(), "p".into(), "x".into(), None, 5, false)
+                        .unwrap();
+                },
+                vec![margin("x", "eL", "m2")],
+                Converges(&[("x", "eL", "m2")]),
+            ),
+            (
+                "reused link whose stored row is a p→p self-edge — repaired, parent kept",
+                |e, _| {
+                    e.enqueue_note_link("y".into(), "p".into(), "p".into(), None, 5, false)
+                        .unwrap();
+                },
+                vec![margin("cF", "y", "m")],
+                Converges(&[("cF", "y", "m")]),
+            ),
+            (
+                "two reused pairs crossed — edges swap to the requested pairing",
+                |e, _| {
+                    e.replace_handwritten_annotations(
+                        "p".into(),
+                        vec![margin("a", "eA", "m"), margin("b", "eB", "m")],
+                    )
+                    .unwrap();
+                },
+                vec![margin("a", "eB", "ra"), margin("b", "eA", "rb")],
+                Converges(&[("a", "eB", "ra"), ("b", "eA", "rb")]),
+            ),
+        ];
+
+        for (name, setup, children, expect) in cells {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("t.sqlite");
+            let db_path = db.to_str().unwrap();
+            let engine = engine_at(db_path);
+            engine.enqueue_note(parent_with_book("p", "b1")).unwrap();
+            setup(&engine, db_path);
+            match expect {
+                Converges(want) => {
+                    engine
+                        .replace_handwritten_annotations("p".into(), children)
+                        .unwrap_or_else(|e| panic!("{name}: expected Ok, got {e:?}"));
+                    assert_margins_converged(&engine, db_path, "p", Some("b1"), want);
+                }
+                Rejects(sub) => {
+                    // A reject must stage NOTHING — drain the setup's writes first so an empty
+                    // outbox after the failed call proves it. (For the dangling no-row cells this
+                    // is the no-resurrection guarantee: not one byte queued for the fleet.)
+                    drain_outbox(db_path);
+                    let err = engine
+                        .replace_handwritten_annotations("p".into(), children)
+                        .unwrap_err();
+                    let SyncError::Store(msg) = &err else {
+                        panic!("{name}: wrong error kind {err:?}")
+                    };
+                    assert!(msg.contains(sub), "{name}: `{msg}` should contain `{sub}`");
+                    assert!(
+                        Store::open(db_path)
+                            .unwrap()
+                            .outbox_items()
+                            .unwrap()
+                            .is_empty(),
+                        "{name}: rejected call staged something"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
