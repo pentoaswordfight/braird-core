@@ -6,6 +6,23 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+### Changed
+- **`replace_handwritten_annotations` now refreshes the parent's `note_signals.has_annotation` in the
+  same batch (SUR-956).** The op previously staged only the child notes + edges, so a native margin
+  add/replace left the parent's `has_annotation` false fleet-wide — importance scoring weights the flag
+  at 0.3, so this was ranking drift the host could not compensate for (`enqueue_note_signals` is a
+  blind whole-row LWW write that would clobber earned counters, and the FFI has no signals read). The
+  op now read-merge-stages the parent's signals row inside its single `stage_local_writes` transaction:
+  the stored row — or a birth-defaults row with `source_prior` derived from the parent's `source` — is
+  re-staged WHOLE with `has_annotation: true` and `importance` recomputed via the (newly shared)
+  PWA `computeImportance` formula, preserving every earned behavioural counter verbatim. Mirrors the
+  PWA's `applyNoteSignal` posture exactly: change-detection no-op (an already-flagged live row gets no
+  write, no `updated_at` bump), whole-row enqueue, and live-write tombstone drop. This ports the
+  `record-annotation` parity behavior (manifest row flipped to core/SUR-956); the recompute-to-false
+  half (margins delete) is deliberately out of scope — this op never ends with zero margins — and is
+  ticketed as SUR-959 on the `refresh-annotation-signal` row. Internal-only change: no FFI signature
+  added or altered (docstring-only bindings regen).
+
 ## [0.9.0] - 2026-07-18
 
 Seventeenth release batch. Minor release: the atomic margins op —
