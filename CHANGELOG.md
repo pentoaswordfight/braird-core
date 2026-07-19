@@ -6,6 +6,14 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-07-19
+
+Eighteenth release batch. Patch release: `replace_handwritten_annotations` now refreshes the
+parent's `note_signals.has_annotation` (+ recomputed `importance`) inside its single staged
+batch (SUR-956) — closing the fleet-wide ranking drift where a native margin add/replace left
+the flag false. No FFI surface change (docstring-only bindings regen); the recompute-to-false
+half is tracked as SUR-959. Consumers bump their pin to v0.9.1.
+
 ### Changed
 - **`replace_handwritten_annotations` now refreshes the parent's `note_signals.has_annotation` in the
   same batch (SUR-956).** The op previously staged only the child notes + edges, so a native margin
