@@ -35,6 +35,7 @@ use serde_json::{json, Map, Value};
 use crate::search::SearchHit;
 use crate::store::{synced_table_names, StageExistingWriteError, Store};
 use crate::vault::Vault;
+use export_import::import::{compute_importance, source_prior};
 use http::{user_id_from_jwt, PostgrestClient};
 use read::{
     BookRecord, CollectionNoteCount, CollectionRecord, CustomIdeaRecord, IdeaCount, LensRecord,
@@ -568,6 +569,14 @@ impl SyncEngine {
     ///   child of several parents, or carry a non-handwritten edge (e.g. an imported `related` row); in
     ///   each case deleting the note would dangle another edge or destroy a regular note, so only the
     ///   edge is retired.
+    /// - The parent's `note_signals.has_annotation` rides the SAME batch (SUR-956; the PWA fires
+    ///   `refreshAnnotationSignal` on every margin save, and importance scoring weights the flag at
+    ///   0.3): the stored signals row — or a birth-defaults row with the prior derived from the
+    ///   parent's `source` — is re-staged WHOLE with `has_annotation: true` and `importance`
+    ///   recomputed, preserving earned behavioural counters verbatim. An existing live row already
+    ///   flagged is left untouched (the PWA's change-detection no-op: no `updated_at` bump, no
+    ///   outbox churn). Dropping the flag to false (a margins-delete recompute) is deliberately NOT
+    ///   here — this op never ends with zero margins (SUR-959 owns that path).
     ///
     /// Returns the count of margin children created.
     pub fn replace_handwritten_annotations(
@@ -856,6 +865,70 @@ impl SyncEngine {
                 writes.push(("notes", child_id.clone(), note_tomb));
                 tombstoned.insert(child_id.clone());
             }
+        }
+
+        // SUR-956: the op ends with ≥1 live margin, so the parent's `note_signals.has_annotation`
+        // must ride the same batch (the PWA's `record-annotation` parity behavior). Read-merge-stage
+        // IN CORE: `enqueue_note_signals` is a blind whole-row LWW write a host must never point at
+        // this (it would clobber earned counters), and the FFI has no signals read. Mirrors the
+        // PWA's `applyNoteSignal`:
+        //  - change-detection no-op — an existing LIVE row already flagged stays untouched;
+        //  - otherwise the FULL row is staged: existing columns verbatim, or birth defaults with
+        //    the prior from the parent's `source` (`freshNoteSignals`). Full-row on purpose — the
+        //    enqueued payload is the staged partial, and the server upsert only sets the columns
+        //    the payload names, so a minimal `{has_annotation}` payload would leave a NEW cloud
+        //    row's other columns to server defaults while the PWA enqueues whole rows;
+        //  - `deleted: false` — a live write, so `stage_local_writes` drops any queued signals
+        //    tombstone (resurrect rule).
+        // The recompute-to-FALSE half lives in the future margins-delete path (SUR-959), not here.
+        let signals = store
+            .get_row("note_signals", &parent_id)
+            .map_err(store_err)?;
+        let already_flagged = signals.as_ref().is_some_and(|s| {
+            matches!(s.get("has_annotation"), Some(Value::Bool(true)))
+                && !matches!(s.get("deleted"), Some(Value::Bool(true)))
+        });
+        if !already_flagged {
+            let existing = signals.unwrap_or_default();
+            let prior = existing
+                .get("source_prior")
+                .and_then(Value::as_f64)
+                .unwrap_or_else(|| source_prior(parent.get("source").and_then(Value::as_str)));
+            let int_or = |field: &str, default: i64| {
+                existing
+                    .get(field)
+                    .and_then(Value::as_i64)
+                    .unwrap_or(default)
+            };
+            let return_visits = int_or("return_visits", 0);
+            let stitch_spawns = int_or("stitch_spawns", 0);
+            let mut sig = Map::new();
+            sig.insert("note_id".into(), json!(parent_id));
+            sig.insert("source_prior".into(), json!(prior));
+            sig.insert("return_visits".into(), json!(return_visits));
+            sig.insert("has_annotation".into(), json!(true));
+            sig.insert("stitch_spawns".into(), json!(stitch_spawns));
+            sig.insert(
+                "exposure_recency_at".into(),
+                json!(int_or("exposure_recency_at", 0)),
+            );
+            sig.insert(
+                "engagement_recency_at".into(),
+                json!(int_or("engagement_recency_at", 0)),
+            );
+            sig.insert(
+                "importance".into(),
+                json!(compute_importance(
+                    prior,
+                    return_visits,
+                    true,
+                    stitch_spawns
+                )),
+            );
+            sig.insert("created_at".into(), json!(int_or("created_at", now)));
+            sig.insert("updated_at".into(), json!(now));
+            sig.insert("deleted".into(), json!(false));
+            writes.push(("note_signals", parent_id.clone(), sig));
         }
 
         store.stage_local_writes(writes, now).map_err(store_err)?;
@@ -3284,7 +3357,12 @@ mod tests {
             .collect();
         crate::sync::outbox::collapse(items, &std::collections::BTreeMap::new())
             .iter()
-            .find(|c| c.table == table && c.payload.get("id") == Some(&json!(record_id)))
+            // note_signals is keyed by note_id (no `id` column) — match either pk shape.
+            .find(|c| {
+                c.table == table
+                    && (c.payload.get("id") == Some(&json!(record_id))
+                        || c.payload.get("note_id") == Some(&json!(record_id)))
+            })
             .map(|c| c.payload.clone())
     }
 
@@ -3818,6 +3896,8 @@ mod tests {
             .replace_handwritten_annotations("p".into(), vec![margin("c1", "e1", "keep me")])
             .unwrap();
 
+        let signals_before = stored_signals(db_path, "p");
+
         let n = engine
             .replace_handwritten_annotations("p".into(), vec![])
             .unwrap();
@@ -3826,6 +3906,11 @@ mod tests {
         assert!(
             engine.get_note("c1".into()).unwrap().is_some(),
             "empty replace leaves existing margins intact"
+        );
+        assert_eq!(
+            stored_signals(db_path, "p"),
+            signals_before,
+            "a no-op replace never touches the parent's signals (SUR-956)"
         );
         assert_eq!(
             engine
@@ -3898,6 +3983,12 @@ mod tests {
             columns("note_links"),
             "edge create writes every synced note_links column",
         );
+        assert_eq!(
+            keys(&collapsed_payload_for(db_path, "note_signals", "p").unwrap()),
+            columns("note_signals"),
+            "the SUR-956 signals refresh writes every synced note_signals column — a sparse \
+             payload would leave a NEW cloud row's unnamed columns to server defaults",
+        );
 
         // The edge TOMBSTONE must be schema-complete too — note_links has no sparse-PATCH flush
         // fallback, so a missing NOT-NULL column would 23502 and wedge the outbox (B1).
@@ -3909,6 +4000,181 @@ mod tests {
             keys(&collapsed_payload_for(db_path, "note_links", "e1").unwrap()),
             columns("note_links"),
             "edge tombstone carries the full synced shape",
+        );
+    }
+
+    fn stored_signals(db_path: &str, note_id: &str) -> Option<Map<String, Value>> {
+        Store::open(db_path)
+            .unwrap()
+            .get_row("note_signals", note_id)
+            .unwrap()
+    }
+
+    #[test]
+    fn replace_handwritten_annotations_stages_birth_signals_row_in_the_same_batch() {
+        // SUR-956: a first margin on a signals-less parent births the row exactly as the PWA's
+        // `refreshAnnotationSignal` → `applyNoteSignal` does — defaults + the prior derived from the
+        // parent's `source`, `has_annotation: true`, importance recomputed — and it rides the SAME
+        // outbox batch as the child rows (one enqueue stamp = one transaction).
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine
+            .enqueue_note(NoteUpsert {
+                source: Some("manual".into()),
+                ..parent_with_book("p", "b1")
+            })
+            .unwrap();
+
+        engine
+            .replace_handwritten_annotations("p".into(), vec![margin("c1", "e1", "a margin")])
+            .unwrap();
+
+        let sig = stored_signals(db_path, "p").expect("birth signals row staged");
+        assert_eq!(sig["has_annotation"], json!(true));
+        assert_eq!(sig["deleted"], json!(false));
+        assert_eq!(sig["return_visits"], json!(0));
+        assert_eq!(sig["stitch_spawns"], json!(0));
+        assert_eq!(sig["exposure_recency_at"], json!(0));
+        assert_eq!(sig["engagement_recency_at"], json!(0));
+        assert_eq!(
+            sig["source_prior"],
+            json!(0.7),
+            "prior derived from the parent's source (`manual`), not a flat default"
+        );
+        assert!(
+            (sig["importance"].as_f64().unwrap() - 0.909_385_394_307_286_9).abs() < 1e-12,
+            "importance = 0.7 * 2^(-0.3/1.5) + 0.3 — the annotation's 0.3 evidence applied"
+        );
+        assert_eq!(sig["updated_at"], sig["created_at"], "birth stamps");
+
+        let items = Store::open(db_path).unwrap().outbox_items().unwrap();
+        let enqueue_stamp = |table: &str, rec: &str| {
+            items
+                .iter()
+                .find(|(_, t, r, _, _)| t == table && r.as_deref() == Some(rec))
+                .unwrap_or_else(|| panic!("{table}/{rec} not enqueued"))
+                .4
+        };
+        assert_eq!(
+            enqueue_stamp("note_signals", "p"),
+            enqueue_stamp("notes", "c1"),
+            "signals row rides the same batch (one enqueue stamp = one transaction)"
+        );
+    }
+
+    #[test]
+    fn replace_handwritten_annotations_preserves_earned_signal_counters() {
+        // The whole point of read-merge-stage IN CORE (vs the host's blind `enqueue_note_signals`):
+        // flipping `has_annotation` must not clobber behavioural counters another surface earned.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine.enqueue_note(parent_with_book("p", "b1")).unwrap();
+        engine
+            .enqueue_note_signals("p".into(), 0.9, 5, false, 2, 111, 222, 1.23, 100, false)
+            .unwrap();
+
+        engine
+            .replace_handwritten_annotations("p".into(), vec![margin("c1", "e1", "a margin")])
+            .unwrap();
+
+        let sig = stored_signals(db_path, "p").expect("signals row live");
+        assert_eq!(sig["has_annotation"], json!(true));
+        assert_eq!(sig["return_visits"], json!(5), "earned counter preserved");
+        assert_eq!(sig["stitch_spawns"], json!(2), "earned counter preserved");
+        assert_eq!(sig["exposure_recency_at"], json!(111));
+        assert_eq!(sig["engagement_recency_at"], json!(222));
+        assert_eq!(
+            sig["source_prior"],
+            json!(0.9),
+            "stored prior kept, not re-derived"
+        );
+        assert_eq!(sig["created_at"], json!(100), "created_at preserved");
+        assert!(
+            (sig["importance"].as_f64().unwrap() - 2.191_747_753_483_256).abs() < 1e-12,
+            "importance recomputed over the PRESERVED counters: 0.9 * 2^(-1.8/1.5) + 1.8"
+        );
+    }
+
+    #[test]
+    fn replace_handwritten_annotations_already_flagged_signals_are_untouched() {
+        // PWA change-detection parity (`applyNoteSignal`'s early return): an already-annotated live
+        // row gets NO write — no `updated_at` bump, no outbox churn, zero LWW clobber exposure.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine.enqueue_note(parent_with_book("p", "b1")).unwrap();
+        engine
+            .enqueue_note_signals("p".into(), 0.9, 5, true, 2, 111, 222, 1.23, 100, false)
+            .unwrap();
+        let before = stored_signals(db_path, "p").expect("seeded");
+        drain_outbox(db_path);
+
+        engine
+            .replace_handwritten_annotations("p".into(), vec![margin("c1", "e1", "a margin")])
+            .unwrap();
+
+        assert_eq!(
+            stored_signals(db_path, "p").unwrap(),
+            before,
+            "already-flagged row byte-identical — no updated_at bump"
+        );
+        assert!(
+            !Store::open(db_path)
+                .unwrap()
+                .outbox_items()
+                .unwrap()
+                .iter()
+                .any(|(_, t, _, _, _)| t == "note_signals"),
+            "no signals outbox row enqueued"
+        );
+    }
+
+    #[test]
+    fn replace_handwritten_annotations_resurrects_a_tombstoned_signals_row() {
+        // A tombstoned signals row is a live upsert target here: the batch's live write drops the
+        // queued tombstone (the resurrect rule), so the flush can't push a sticky delete.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine.enqueue_note(parent_with_book("p", "b1")).unwrap();
+        engine
+            .enqueue_note_signals("p".into(), 0.9, 5, false, 2, 111, 222, 1.23, 100, true)
+            .unwrap();
+
+        engine
+            .replace_handwritten_annotations("p".into(), vec![margin("c1", "e1", "a margin")])
+            .unwrap();
+
+        let sig = stored_signals(db_path, "p").expect("signals row live again");
+        assert_eq!(sig["deleted"], json!(false));
+        assert_eq!(sig["has_annotation"], json!(true));
+        assert_eq!(
+            sig["return_visits"],
+            json!(5),
+            "counters survive the resurrect"
+        );
+        let payload = collapsed_payload_for(db_path, "note_signals", "p").expect("queued");
+        assert_eq!(
+            payload["deleted"],
+            json!(false),
+            "what flushes is LIVE — the queued tombstone was dropped, not collapsed over"
+        );
+        assert_eq!(
+            Store::open(db_path)
+                .unwrap()
+                .outbox_items()
+                .unwrap()
+                .iter()
+                .filter(|(_, t, _, _, _)| t == "note_signals")
+                .count(),
+            1,
+            "the queued tombstone was DROPPED (one live item), not merely outweighed by collapse"
         );
     }
 

@@ -477,11 +477,7 @@ fn normalize_note_signal(
             finite_number(value)?;
         }
     }
-    let evidence = return_visits as f64 * 0.1
-        + if has_annotation { 0.3 } else { 0.0 }
-        + stitch_spawns as f64 * 0.5;
-    let importance =
-        source_prior * (-std::f64::consts::LN_2 * evidence.max(0.0) / 1.5).exp() + evidence;
+    let importance = compute_importance(source_prior, return_visits, has_annotation, stitch_spawns);
 
     output.insert("source_prior".into(), Value::from(source_prior));
     output.insert("return_visits".into(), Value::from(return_visits));
@@ -639,7 +635,7 @@ fn remap_tag_stage(tags: Vec<String>, remap: &[(&str, &str)]) -> Vec<String> {
         .collect()
 }
 
-fn source_prior(source: Option<&str>) -> f64 {
+pub(crate) fn source_prior(source: Option<&str>) -> f64 {
     match source {
         Some("handwritten" | "readwise_annotation") => 0.9,
         Some("share") => 0.75,
@@ -650,6 +646,22 @@ fn source_prior(source: Option<&str>) -> f64 {
     }
 }
 
+/// The PWA's `computeImportance` (surfc `db.js`): behavioural evidence decays the source prior
+/// toward 0 (half-life 1.5 evidence units) and adds itself back on top. The 0.3 annotation
+/// weight is why `has_annotation` matters to ranking (SUR-956). Single source of truth —
+/// used by import normalization AND `replace_handwritten_annotations`' signal refresh.
+pub(crate) fn compute_importance(
+    source_prior: f64,
+    return_visits: i64,
+    has_annotation: bool,
+    stitch_spawns: i64,
+) -> f64 {
+    let evidence = return_visits as f64 * 0.1
+        + if has_annotation { 0.3 } else { 0.0 }
+        + stitch_spawns as f64 * 0.5;
+    source_prior * (-std::f64::consts::LN_2 * evidence.max(0.0) / 1.5).exp() + evidence
+}
+
 #[cfg(test)]
 mod import_tests {
     use std::future::Future;
@@ -658,7 +670,8 @@ mod import_tests {
 
     use super::super::merge::merge_parsed_with_sink;
     use super::{
-        parse_import_at, NormalizedImport, NormalizedRow, CANON_REMAP_V14, GREAT_IDEAS_RENAMES,
+        compute_importance, parse_import_at, NormalizedImport, NormalizedRow, CANON_REMAP_V14,
+        GREAT_IDEAS_RENAMES,
     };
     use crate::store::Store;
     use crate::sync::http::PostgrestSink;
@@ -683,6 +696,26 @@ mod import_tests {
         include_str!("../../../vendored/snapshot-parity/schema-19-defaults.json");
     const SCHEMA_19_DEFAULTS_EXPECTED: &str =
         include_str!("../../../vendored/snapshot-parity/expected-schema-19-defaults.json");
+
+    #[test]
+    fn compute_importance_pins_the_pwa_formula() {
+        // Literal expected values (NOT re-derived from the formula) pin the SUR-956 extraction
+        // against drift: cold start == the prior; annotation alone adds 0.3 evidence; the mixed
+        // case exercises all three weights (visits 0.1, annotation 0.3, spawns 0.5).
+        assert_eq!(
+            compute_importance(0.5, 0, false, 0),
+            0.5,
+            "no evidence → the prior"
+        );
+        assert!(
+            (compute_importance(0.7, 0, true, 0) - 0.909_385_394_307_286_9).abs() < 1e-12,
+            "0.7 * 2^(-0.3/1.5) + 0.3"
+        );
+        assert!(
+            (compute_importance(0.9, 5, true, 2) - 2.191_747_753_483_256).abs() < 1e-12,
+            "0.9 * 2^(-1.8/1.5) + 1.8"
+        );
+    }
 
     fn parse_raw(raw: &str) -> Result<NormalizedImport, SyncError> {
         parse_import_at(raw, NOW)

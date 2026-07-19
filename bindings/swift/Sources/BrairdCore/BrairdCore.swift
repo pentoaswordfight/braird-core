@@ -888,6 +888,14 @@ public protocol SyncEngineProtocol : AnyObject {
      * child of several parents, or carry a non-handwritten edge (e.g. an imported `related` row); in
      * each case deleting the note would dangle another edge or destroy a regular note, so only the
      * edge is retired.
+     * - The parent's `note_signals.has_annotation` rides the SAME batch (SUR-956; the PWA fires
+     * `refreshAnnotationSignal` on every margin save, and importance scoring weights the flag at
+     * 0.3): the stored signals row — or a birth-defaults row with the prior derived from the
+     * parent's `source` — is re-staged WHOLE with `has_annotation: true` and `importance`
+     * recomputed, preserving earned behavioural counters verbatim. An existing live row already
+     * flagged is left untouched (the PWA's change-detection no-op: no `updated_at` bump, no
+     * outbox churn). Dropping the flag to false (a margins-delete recompute) is deliberately NOT
+     * here — this op never ends with zero margins (SUR-959 owns that path).
      *
      * Returns the count of margin children created.
      */
@@ -1559,6 +1567,14 @@ open func recentNote(nowMs: Int64, seed: UInt64)throws  -> NoteRecord? {
      * child of several parents, or carry a non-handwritten edge (e.g. an imported `related` row); in
      * each case deleting the note would dangle another edge or destroy a regular note, so only the
      * edge is retired.
+     * - The parent's `note_signals.has_annotation` rides the SAME batch (SUR-956; the PWA fires
+     * `refreshAnnotationSignal` on every margin save, and importance scoring weights the flag at
+     * 0.3): the stored signals row — or a birth-defaults row with the prior derived from the
+     * parent's `source` — is re-staged WHOLE with `has_annotation: true` and `importance`
+     * recomputed, preserving earned behavioural counters verbatim. An existing live row already
+     * flagged is left untouched (the PWA's change-detection no-op: no `updated_at` bump, no
+     * outbox churn). Dropping the flag to false (a margins-delete recompute) is deliberately NOT
+     * here — this op never ends with zero margins (SUR-959 owns that path).
      *
      * Returns the count of margin children created.
      */
@@ -5145,7 +5161,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_braird_core_checksum_method_syncengine_recent_note() != 17557) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_braird_core_checksum_method_syncengine_replace_handwritten_annotations() != 57875) {
+    if (uniffi_braird_core_checksum_method_syncengine_replace_handwritten_annotations() != 559) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_search() != 14411) {
