@@ -844,7 +844,9 @@ public protocol SyncEngineProtocol : AnyObject {
      * fires only on rare, deliberate acts, so throttling would drop real evidence.
      *
      * Returns `true` if a row was staged, `false` on a change-detection no-op / throttled write
-     * (nothing staged, no `updated_at` bump). If `note_id` has no local note row (created on
+     * (nothing staged, no `updated_at` bump) — or when the note is LOCALLY DELETED, so a signal
+     * callback that lands after the host's delete cannot resurrect the signals tombstone and leak
+     * live metadata for a dead note. If `note_id` has no local note row (created on
      * another device, not yet synced down), `source_prior` falls back to the default — the row is
      * otherwise correct; a later pull of the note does not retro-correct the prior (accepted:
      * signals are derived and self-heal on the next signal).
@@ -1565,7 +1567,9 @@ open func recentNote(nowMs: Int64, seed: UInt64)throws  -> NoteRecord? {
      * fires only on rare, deliberate acts, so throttling would drop real evidence.
      *
      * Returns `true` if a row was staged, `false` on a change-detection no-op / throttled write
-     * (nothing staged, no `updated_at` bump). If `note_id` has no local note row (created on
+     * (nothing staged, no `updated_at` bump) — or when the note is LOCALLY DELETED, so a signal
+     * callback that lands after the host's delete cannot resurrect the signals tombstone and leak
+     * live metadata for a dead note. If `note_id` has no local note row (created on
      * another device, not yet synced down), `source_prior` falls back to the default — the row is
      * otherwise correct; a later pull of the note does not retro-correct the prior (accepted:
      * signals are derived and self-heal on the next signal).
@@ -5350,7 +5354,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_braird_core_checksum_method_syncengine_recent_note() != 17557) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_braird_core_checksum_method_syncengine_record_note_signal() != 37879) {
+    if (uniffi_braird_core_checksum_method_syncengine_record_note_signal() != 19533) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_replace_handwritten_annotations() != 3703) {
