@@ -1673,14 +1673,13 @@ impl SyncEngine {
         // 0.5 for a genuine `readwise` note is a no-op, so the sentinel test costs nothing.
         let stored_prior = row.get("source_prior").and_then(Value::as_f64);
         let unknown_prior = source_prior(None);
+        // `before` MIRRORS THE STORED ROW, verbatim. Nothing derived belongs here: the no-op check
+        // below compares against it to decide whether the persisted row already says what we are
+        // about to write, so anything computed into `before` is a change that silently cannot be
+        // detected. (The prior heal lived here once and was lost on every throttled Exposure —
+        // healed in `before`, equal in `after`, no-op'd, never persisted.)
         let before = SignalState {
-            source_prior: match stored_prior {
-                // `unknown_prior` is 0.5 — exactly representable, so `==` is safe here.
-                Some(p) if p != unknown_prior => p,
-                _ if note_source.is_some() => source_prior(note_source),
-                Some(p) => p,
-                None => unknown_prior,
-            },
+            source_prior: stored_prior.unwrap_or(unknown_prior),
             return_visits: int_or("return_visits", 0),
             has_annotation: matches!(row.get("has_annotation"), Some(Value::Bool(true))),
             stitch_spawns: int_or("stitch_spawns", 0),
@@ -1689,6 +1688,19 @@ impl SyncEngine {
         };
         let created_at = int_or("created_at", now);
         let mut after = before.clone();
+        // The heal is a MUTATION, applied to `after` alongside the caller's — so change-detection
+        // sees it and it persists even when the caller's own mutation is a throttled no-op.
+        // `unknown_prior` (0.5) means "source unknown", not "source is worth 0.5": a row born while
+        // the note was invisible carries it, and kept verbatim it would pin `handwritten` (0.9),
+        // `share` (0.75) and `manual` (0.7) notes at 0.5 forever, under-scoring them in
+        // `compute_importance` with nothing to correct it. Only that sentinel re-derives, and only
+        // once the note is visible; any OTHER stored prior is kept verbatim, preserving SUR-956's
+        // "stored prior kept, not re-derived" invariant (v0.9.1). A genuine `readwise` note heals
+        // 0.5 -> 0.5, a no-op, so the sentinel test costs nothing.
+        // `unknown_prior` is 0.5 — exactly representable, so `==` is safe here.
+        if note_source.is_some() && before.source_prior == unknown_prior {
+            after.source_prior = source_prior(note_source);
+        }
         mutate(&mut after);
         // Change-detection no-op: a LIVE row the mutation left byte-identical stages nothing (an
         // Exposure inside the throttle window, a repeat of an already-set flag). A tombstoned or
@@ -4779,6 +4791,59 @@ mod tests {
             sig["importance"],
             json!(compute_importance(0.9, 1, false, 0)),
             "importance recomputed on the healed prior"
+        );
+    }
+
+    #[test]
+    fn record_note_signal_heals_the_prior_even_when_the_exposure_is_throttled() {
+        // The heal must be a MUTATION, not a re-read: if it is folded into the pre-image, a
+        // throttled Exposure computes the healed prior, finds `after == before`, no-ops, and the
+        // stored row keeps 0.5. A repeat exposure inside the 1h window is the COMMON case, so that
+        // leaves the note under-scored until some future non-throttled signal happens to fire.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+
+        // Born blind: ReturnVisit also stamps `exposure_recency_at`, so the next Exposure is
+        // throttled by construction — exactly the reported path.
+        assert!(engine
+            .record_note_signal("n".into(), NoteSignalKind::ReturnVisit)
+            .unwrap());
+        assert_eq!(
+            stored_signals(db_path, "n").unwrap()["source_prior"],
+            json!(0.5),
+            "born carrying the unknown-source sentinel"
+        );
+
+        engine
+            .enqueue_note(note_with_source("n", "handwritten"))
+            .unwrap();
+        assert!(
+            engine
+                .record_note_signal("n".into(), NoteSignalKind::Exposure)
+                .unwrap(),
+            "a throttled Exposure still stages, because the heal itself is a change"
+        );
+        let sig = stored_signals(db_path, "n").unwrap();
+        assert_eq!(sig["source_prior"], json!(0.9), "the heal persisted");
+        assert_eq!(
+            sig["exposure_recency_at"],
+            json!(sig["exposure_recency_at"].as_i64().unwrap()),
+            "throttle still suppressed the exposure stamp itself"
+        );
+        assert_eq!(
+            sig["importance"],
+            json!(compute_importance(0.9, 1, false, 0)),
+            "importance recomputed on the healed prior"
+        );
+
+        // Once healed, a further throttled Exposure is a genuine no-op again.
+        assert!(
+            !engine
+                .record_note_signal("n".into(), NoteSignalKind::Exposure)
+                .unwrap(),
+            "nothing left to heal, throttle window still open — no churn"
         );
     }
 
