@@ -960,7 +960,9 @@ impl SyncEngine {
     ///    fires only on rare, deliberate acts, so throttling would drop real evidence.
     ///
     /// Returns `true` if a row was staged, `false` on a change-detection no-op / throttled write
-    /// (nothing staged, no `updated_at` bump). If `note_id` has no local note row (created on
+    /// (nothing staged, no `updated_at` bump) — or when the note is LOCALLY DELETED, so a signal
+    /// callback that lands after the host's delete cannot resurrect the signals tombstone and leak
+    /// live metadata for a dead note. If `note_id` has no local note row (created on
     /// another device, not yet synced down), `source_prior` falls back to the default — the row is
     /// otherwise correct; a later pull of the note does not retro-correct the prior (accepted:
     /// signals are derived and self-heal on the next signal).
@@ -971,10 +973,21 @@ impl SyncEngine {
     ) -> Result<bool, SyncError> {
         let store = lock!(self.store);
         let now = epoch_ms();
-        let note_source = store
-            .get_row("notes", &note_id)
-            .map_err(store_err)?
-            .and_then(|r| r.get("source").and_then(Value::as_str).map(str::to_string));
+        let note = store.get_row("notes", &note_id).map_err(store_err)?;
+        // A late signal callback can land AFTER the host deleted the note and tombstoned its
+        // signals row. Staging here would take the resurrect path (`was_live == false` always
+        // stages) and `stage_local_writes` would drop the queued tombstone — leaving live signal
+        // metadata for a deleted note, the orphaned-row leak this op exists to prevent. An ABSENT
+        // note row stays allowed (created on another device, not yet synced down — documented
+        // above); only a LOCALLY-DELETED one is the no-op.
+        if note
+            .as_ref()
+            .is_some_and(|r| matches!(r.get("deleted"), Some(Value::Bool(true))))
+        {
+            return Ok(false);
+        }
+        let note_source =
+            note.and_then(|r| r.get("source").and_then(Value::as_str).map(str::to_string));
         let write =
             self.stage_signal_write(&store, &note_id, note_source.as_deref(), now, |s| {
                 match kind {
@@ -4641,6 +4654,82 @@ mod tests {
                 .count(),
             1,
             "the queued tombstone was DROPPED (one live item)"
+        );
+    }
+
+    #[test]
+    fn record_note_signal_on_a_deleted_note_is_a_no_op_and_keeps_the_tombstone_queued() {
+        // The delete/callback race: the host deletes the note and tombstones its signals row, THEN
+        // a late exposure/engagement callback fires. Without the deleted-note guard this takes the
+        // resurrect path (a tombstoned row always stages) and `stage_local_writes` DROPS the queued
+        // tombstone — leaving live signal metadata for a dead note, and losing the retirement.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine
+            .enqueue_note(note_with_source("n", "manual"))
+            .unwrap();
+        engine
+            .record_note_signal("n".into(), NoteSignalKind::ReturnVisit)
+            .unwrap();
+
+        // Host deletes the note, then retires its signals row.
+        let mut tomb = Map::new();
+        tomb.insert("id".into(), json!("n"));
+        tomb.insert("deleted".into(), json!(true));
+        tomb.insert("updated_at".into(), json!(epoch_ms()));
+        Store::open(db_path)
+            .unwrap()
+            .stage_local_writes(vec![("notes", "n".into(), tomb)], epoch_ms())
+            .unwrap();
+        engine.soft_delete_signals_for_note("n".into()).unwrap();
+
+        // Every kind is a no-op — none of them may resurrect the row.
+        for kind in [
+            NoteSignalKind::Exposure,
+            NoteSignalKind::Engagement,
+            NoteSignalKind::ReturnVisit,
+        ] {
+            assert!(
+                !engine.record_note_signal("n".into(), kind).unwrap(),
+                "a signal on a locally-deleted note stages nothing"
+            );
+        }
+
+        assert_eq!(
+            stored_signals(db_path, "n").unwrap()["deleted"],
+            json!(true),
+            "signals row stays tombstoned"
+        );
+        let payload =
+            collapsed_payload_for(db_path, "note_signals", "n").expect("queued signals row");
+        assert_eq!(
+            payload["deleted"],
+            json!(true),
+            "what flushes is still the TOMBSTONE — it was not dropped by a resurrect"
+        );
+    }
+
+    #[test]
+    fn record_note_signal_still_writes_when_the_note_row_is_merely_absent() {
+        // The guard must distinguish DELETED from ABSENT: a note created on another device and not
+        // yet synced down has no local row, and that case is documented as allowed — it births the
+        // signals row with a default `source_prior` rather than dropping the signal.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+
+        assert!(
+            engine
+                .record_note_signal("never-synced".into(), NoteSignalKind::Engagement)
+                .unwrap(),
+            "an absent note row still writes"
+        );
+        assert_eq!(
+            stored_signals(db_path, "never-synced").unwrap()["deleted"],
+            json!(false)
         );
     }
 

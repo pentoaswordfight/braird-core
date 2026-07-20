@@ -34,6 +34,10 @@ SUR-956 margins no-op guard so an already-annotated note still records margin en
   rare, so every call is genuine evidence). Returns `true` when a row was staged, `false` on a
   change-detection / throttle no-op (no `updated_at` bump, no outbox churn). Shares one read-merge-stage
   helper with `replace_handwritten_annotations` so the scoring constants stay in one place.
+  A signal on a **locally-deleted** note is a no-op returning `false`: a callback that lands after the
+  host's delete would otherwise take the resurrect path and drop the queued signals tombstone, leaving
+  live signal metadata for a dead note. An *absent* local note row is unaffected (a note created on
+  another device and not yet synced down still births its signals row with a default `source_prior`).
 - **`soft_delete_signals_for_note(note_id)` — note_signals tombstone on note delete (SUR-966).** ALWAYS
   stages a whole-shape tombstone even when this device holds no local signals row — the cross-device tail:
   another device may hold a live cloud row this delete must tear down, else orphaned signal metadata
