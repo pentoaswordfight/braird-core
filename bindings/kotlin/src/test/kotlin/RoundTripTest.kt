@@ -16,6 +16,7 @@ import uniffi.braird_core.BookUpsert
 import uniffi.braird_core.CryptoException
 import uniffi.braird_core.ImportCounts
 import uniffi.braird_core.ImportSummary
+import uniffi.braird_core.NoteSignalKind
 import uniffi.braird_core.NoteUpsert
 import uniffi.braird_core.SearchDocKind
 import uniffi.braird_core.SyncEngine
@@ -638,6 +639,52 @@ class RoundTripTest {
                 assertFalse(error.v1.contains(sentinel))
                 assertFalse(error.message.orEmpty().contains(sentinel))
             }
+        } finally {
+            engine.close()
+        }
+    }
+
+    /** SUR-966: the note_signals collection surface over the FFI — the `NoteSignalKind` enum lowers
+     * across the JNA seam (the SUR-843 RustBuffer concern), each kind is callable, and the throttle /
+     * resurrect return values marshal both Booleans. There is deliberately NO signals read-back on the
+     * FFI (collection owns the counter math IN CORE), so the observable contract IS the return value:
+     * a genuine write returns true, a throttled repeat Exposure returns false. */
+    @Test
+    fun noteSignalCollectionOverFfi() {
+        val db = File.createTempFile("braird-signals", ".sqlite").apply { deleteOnExit() }
+        val engine = SyncEngine.open(db.absolutePath, "https://x.supabase.co", "anon", Vault.generate())
+        try {
+            // The enum lowers all three variants (no host-invented value can reach the counter math).
+            assertEquals(
+                listOf("EXPOSURE", "ENGAGEMENT", "RETURN_VISIT"),
+                NoteSignalKind.values().map { it.name },
+            )
+
+            engine.enqueueNote(NoteUpsert(
+                id = "n", bookId = null, plaintext = "a note", page = null, tags = emptyList(),
+                source = "manual", sourceId = null, sourceMetaJson = null, chapter = null,
+                imagePath = null, inkCropPath = null, createdAt = 1L, deleted = false,
+                clearNullableFields = emptyList(),
+            ))
+
+            // Each deliberate kind stages a genuine write → true.
+            assertTrue(engine.recordNoteSignal("n", NoteSignalKind.RETURN_VISIT))
+            assertTrue(engine.recordNoteSignal("n", NoteSignalKind.ENGAGEMENT))
+            assertTrue(engine.recordNoteSignal("n", NoteSignalKind.EXPOSURE), "first Exposure writes")
+            // Repeat Exposure inside the throttle window is a no-op → false (both Booleans marshal).
+            assertFalse(
+                engine.recordNoteSignal("n", NoteSignalKind.EXPOSURE),
+                "repeat Exposure within the window returns false",
+            )
+
+            // soft-delete stages a tombstone even here (returns Unit, throws only on error); a repeat is a
+            // no-op; then a live signal resurrects the row (true).
+            engine.softDeleteSignalsForNote("n")
+            engine.softDeleteSignalsForNote("n")
+            assertTrue(
+                engine.recordNoteSignal("n", NoteSignalKind.RETURN_VISIT),
+                "a live signal after soft-delete resurrects the row",
+            )
         } finally {
             engine.close()
         }

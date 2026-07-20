@@ -694,6 +694,41 @@ final class RoundTripTests: XCTestCase {
         }
     }
 
+    /// SUR-966: the note_signals collection surface over the FFI — the `NoteSignalKind` enum lowers
+    /// across the seam, each kind is callable, and the throttle / resurrect return values marshal both
+    /// Booleans. There is deliberately NO signals read-back on the FFI (collection owns the counter math
+    /// IN CORE), so the observable contract IS the return value: a genuine write returns true, a
+    /// throttled repeat Exposure returns false.
+    func testNoteSignalCollectionOverFfi() throws {
+        let db = FileManager.default.temporaryDirectory
+            .appendingPathComponent("braird-signals-\(UUID().uuidString).sqlite")
+        let engine = try SyncEngine.open(
+            dbPath: db.path, supabaseUrl: "https://x.supabase.co", anonKey: "anon",
+            vault: Vault.generate())
+
+        try engine.enqueueNote(NoteUpsert(
+            id: "n", bookId: nil, plaintext: "a note", page: nil, tags: [], source: "manual",
+            sourceId: nil, sourceMetaJson: nil, chapter: nil, imagePath: nil, inkCropPath: nil,
+            createdAt: 1, deleted: false, clearNullableFields: []))
+
+        // Each deliberate kind stages a genuine write → true (the enum lowers all three variants).
+        XCTAssertTrue(try engine.recordNoteSignal(noteId: "n", kind: .returnVisit))
+        XCTAssertTrue(try engine.recordNoteSignal(noteId: "n", kind: .engagement))
+        XCTAssertTrue(try engine.recordNoteSignal(noteId: "n", kind: .exposure), "first Exposure writes")
+        // Repeat Exposure inside the throttle window is a no-op → false (both Booleans marshal).
+        XCTAssertFalse(
+            try engine.recordNoteSignal(noteId: "n", kind: .exposure),
+            "repeat Exposure within the window returns false")
+
+        // soft-delete stages a tombstone (Void, throws only on error); a repeat is a no-op; then a live
+        // signal resurrects the row (true).
+        try engine.softDeleteSignalsForNote(noteId: "n")
+        try engine.softDeleteSignalsForNote(noteId: "n")
+        XCTAssertTrue(
+            try engine.recordNoteSignal(noteId: "n", kind: .returnVisit),
+            "a live signal after soft-delete resurrects the row")
+    }
+
     /// SUR-911 deliberately exposes protective Merge only; no destructive Replace entrypoint.
     func testGeneratedSnapshotSurfaceHasNoReplaceApi() throws {
         let sourceURL = repoRoot()

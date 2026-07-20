@@ -828,6 +828,30 @@ public protocol SyncEngineProtocol : AnyObject {
     func recentNote(nowMs: Int64, seed: UInt64) throws  -> NoteRecord?
     
     /**
+     * Record a behavioural signal for a note (SUR-966), mirroring surfc `applyNoteSignal`. Owns the
+     * per-kind mutation IN CORE — the FFI has no `note_signals` read-back, so a host cannot safely
+     * increment a counter it cannot read (it would clobber another device's earned counters over
+     * whole-row LWW). Reads the stored row (or births defaults with `source_prior` from the note's
+     * `source`), applies the mutation for `kind`, recomputes `importance`, and whole-row stages it
+     * (`deleted: false`, so a queued tombstone is dropped — the resurrect rule):
+     * - [`NoteSignalKind::ReturnVisit`] → `return_visits += 1`, `exposure_recency_at = now`
+     * (deliberately NOT engagement — "re-reading isn't reflection").
+     * - [`NoteSignalKind::Exposure`] → `exposure_recency_at = now`, throttled by
+     * [`SIGNAL_THROTTLE_MS`]. An absent/epoch stamp (a first-ever signal of another kind birthed
+     * the row) counts as "never exposed", so the first real Exposure always writes — no unsigned
+     * underflow, no NULL short-circuit suppressing it.
+     * - [`NoteSignalKind::Engagement`] → `engagement_recency_at = now`. NOT throttled: engagement
+     * fires only on rare, deliberate acts, so throttling would drop real evidence.
+     *
+     * Returns `true` if a row was staged, `false` on a change-detection no-op / throttled write
+     * (nothing staged, no `updated_at` bump). If `note_id` has no local note row (created on
+     * another device, not yet synced down), `source_prior` falls back to the default — the row is
+     * otherwise correct; a later pull of the note does not retro-correct the prior (accepted:
+     * signals are derived and self-heal on the next signal).
+     */
+    func recordNoteSignal(noteId: String, kind: NoteSignalKind) throws  -> Bool
+    
+    /**
      * Atomically replace a note's handwritten margins (SUR-952, the SUR-928 "Add the margins"
      * feature; the PWA's `replaceHandwrittenAnnotations`). Seals each [`MarginChild::text`] under the
      * parent's LIVE book, creates the new child notes + their parent→child `handwritten_annotation`
@@ -888,14 +912,16 @@ public protocol SyncEngineProtocol : AnyObject {
      * child of several parents, or carry a non-handwritten edge (e.g. an imported `related` row); in
      * each case deleting the note would dangle another edge or destroy a regular note, so only the
      * edge is retired.
-     * - The parent's `note_signals.has_annotation` rides the SAME batch (SUR-956; the PWA fires
+     * - The parent's `note_signals` row rides the SAME batch (SUR-956/SUR-966; the PWA fires
      * `refreshAnnotationSignal` on every margin save, and importance scoring weights the flag at
      * 0.3): the stored signals row — or a birth-defaults row with the prior derived from the
-     * parent's `source` — is re-staged WHOLE with `has_annotation: true` and `importance`
-     * recomputed, preserving earned behavioural counters verbatim. An existing live row already
-     * flagged is left untouched (the PWA's change-detection no-op: no `updated_at` bump, no
-     * outbox churn). Dropping the flag to false (a margins-delete recompute) is deliberately NOT
-     * here — this op never ends with zero margins (SUR-959 owns that path).
+     * parent's `source` — is re-staged WHOLE with `has_annotation: true`, an
+     * `engagement_recency_at` bump (SUR-966 §2: "Add the margins" is a single, always-deliberate
+     * act → a genuine engagement signal), and `importance` recomputed, preserving earned
+     * behavioural counters verbatim. The engagement bump fires on EVERY save, including on a note
+     * already flagged — the shared [`SyncEngine::stage_signal_write`] helper's change-detection
+     * still no-ops only when truly nothing moved. Dropping the flag to false (a margins-delete
+     * recompute) is deliberately NOT here — this op never ends with zero margins (SUR-959).
      *
      * Returns the count of margin children created.
      */
@@ -913,6 +939,22 @@ public protocol SyncEngineProtocol : AnyObject {
      * PostgREST calls with it; the `user_id` stamped on each row is the token's `sub` claim.
      */
     func setAccessToken(jwt: String) 
+    
+    /**
+     * Tombstone a note's `note_signals` row on note delete (SUR-966), mirroring the surfc oracle.
+     * ALWAYS stages a tombstone even when this device has NO local signals row (a birth row is
+     * local-only, and another device may hold a live cloud row from its own bump), so the delete
+     * tears that cross-device row down instead of leaking it as orphaned metadata. A repeat call on
+     * an already-tombstoned row is a no-op (no `updated_at` churn).
+     *
+     * The tombstone carries the stored row's full shape — or birth defaults when absent — NOT a
+     * bare `{note_id, deleted}`: `note_signals` has no sparse-PATCH flush fallback (only `notes`
+     * does — `push.rs`), so a minimal payload would risk a NOT-NULL upsert reject that wedges the
+     * outbox (the SUR-942 note_links lesson). Staged through the plain `stage_local_writes` path,
+     * which stages a `deleted: true` write unconditionally (no existing-live precondition), so the
+     * no-local-row tombstone is never silently dropped.
+     */
+    func softDeleteSignalsForNote(noteId: String) throws 
     
     /**
      * Pull, then flush — the one-call convergence path (SUR-736). Pulls FIRST, then flushes.
@@ -1507,6 +1549,37 @@ open func recentNote(nowMs: Int64, seed: UInt64)throws  -> NoteRecord? {
 }
     
     /**
+     * Record a behavioural signal for a note (SUR-966), mirroring surfc `applyNoteSignal`. Owns the
+     * per-kind mutation IN CORE — the FFI has no `note_signals` read-back, so a host cannot safely
+     * increment a counter it cannot read (it would clobber another device's earned counters over
+     * whole-row LWW). Reads the stored row (or births defaults with `source_prior` from the note's
+     * `source`), applies the mutation for `kind`, recomputes `importance`, and whole-row stages it
+     * (`deleted: false`, so a queued tombstone is dropped — the resurrect rule):
+     * - [`NoteSignalKind::ReturnVisit`] → `return_visits += 1`, `exposure_recency_at = now`
+     * (deliberately NOT engagement — "re-reading isn't reflection").
+     * - [`NoteSignalKind::Exposure`] → `exposure_recency_at = now`, throttled by
+     * [`SIGNAL_THROTTLE_MS`]. An absent/epoch stamp (a first-ever signal of another kind birthed
+     * the row) counts as "never exposed", so the first real Exposure always writes — no unsigned
+     * underflow, no NULL short-circuit suppressing it.
+     * - [`NoteSignalKind::Engagement`] → `engagement_recency_at = now`. NOT throttled: engagement
+     * fires only on rare, deliberate acts, so throttling would drop real evidence.
+     *
+     * Returns `true` if a row was staged, `false` on a change-detection no-op / throttled write
+     * (nothing staged, no `updated_at` bump). If `note_id` has no local note row (created on
+     * another device, not yet synced down), `source_prior` falls back to the default — the row is
+     * otherwise correct; a later pull of the note does not retro-correct the prior (accepted:
+     * signals are derived and self-heal on the next signal).
+     */
+open func recordNoteSignal(noteId: String, kind: NoteSignalKind)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_braird_core_fn_method_syncengine_record_note_signal(self.uniffiClonePointer(),
+        FfiConverterString.lower(noteId),
+        FfiConverterTypeNoteSignalKind.lower(kind),$0
+    )
+})
+}
+    
+    /**
      * Atomically replace a note's handwritten margins (SUR-952, the SUR-928 "Add the margins"
      * feature; the PWA's `replaceHandwrittenAnnotations`). Seals each [`MarginChild::text`] under the
      * parent's LIVE book, creates the new child notes + their parent→child `handwritten_annotation`
@@ -1567,14 +1640,16 @@ open func recentNote(nowMs: Int64, seed: UInt64)throws  -> NoteRecord? {
      * child of several parents, or carry a non-handwritten edge (e.g. an imported `related` row); in
      * each case deleting the note would dangle another edge or destroy a regular note, so only the
      * edge is retired.
-     * - The parent's `note_signals.has_annotation` rides the SAME batch (SUR-956; the PWA fires
+     * - The parent's `note_signals` row rides the SAME batch (SUR-956/SUR-966; the PWA fires
      * `refreshAnnotationSignal` on every margin save, and importance scoring weights the flag at
      * 0.3): the stored signals row — or a birth-defaults row with the prior derived from the
-     * parent's `source` — is re-staged WHOLE with `has_annotation: true` and `importance`
-     * recomputed, preserving earned behavioural counters verbatim. An existing live row already
-     * flagged is left untouched (the PWA's change-detection no-op: no `updated_at` bump, no
-     * outbox churn). Dropping the flag to false (a margins-delete recompute) is deliberately NOT
-     * here — this op never ends with zero margins (SUR-959 owns that path).
+     * parent's `source` — is re-staged WHOLE with `has_annotation: true`, an
+     * `engagement_recency_at` bump (SUR-966 §2: "Add the margins" is a single, always-deliberate
+     * act → a genuine engagement signal), and `importance` recomputed, preserving earned
+     * behavioural counters verbatim. The engagement bump fires on EVERY save, including on a note
+     * already flagged — the shared [`SyncEngine::stage_signal_write`] helper's change-detection
+     * still no-ops only when truly nothing moved. Dropping the flag to false (a margins-delete
+     * recompute) is deliberately NOT here — this op never ends with zero margins (SUR-959).
      *
      * Returns the count of margin children created.
      */
@@ -1608,6 +1683,27 @@ open func search(query: String, limit: UInt32)throws  -> [SearchHit] {
 open func setAccessToken(jwt: String) {try! rustCall() {
     uniffi_braird_core_fn_method_syncengine_set_access_token(self.uniffiClonePointer(),
         FfiConverterString.lower(jwt),$0
+    )
+}
+}
+    
+    /**
+     * Tombstone a note's `note_signals` row on note delete (SUR-966), mirroring the surfc oracle.
+     * ALWAYS stages a tombstone even when this device has NO local signals row (a birth row is
+     * local-only, and another device may hold a live cloud row from its own bump), so the delete
+     * tears that cross-device row down instead of leaking it as orphaned metadata. A repeat call on
+     * an already-tombstoned row is a no-op (no `updated_at` churn).
+     *
+     * The tombstone carries the stored row's full shape — or birth defaults when absent — NOT a
+     * bare `{note_id, deleted}`: `note_signals` has no sparse-PATCH flush fallback (only `notes`
+     * does — `push.rs`), so a minimal payload would risk a NOT-NULL upsert reject that wedges the
+     * outbox (the SUR-942 note_links lesson). Staged through the plain `stage_local_writes` path,
+     * which stages a `deleted: true` write unconditionally (no existing-live precondition), so the
+     * no-local-row tombstone is never silently dropped.
+     */
+open func softDeleteSignalsForNote(noteId: String)throws  {try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_braird_core_fn_method_syncengine_soft_delete_signals_for_note(self.uniffiClonePointer(),
+        FfiConverterString.lower(noteId),$0
     )
 }
 }
@@ -4435,6 +4531,99 @@ extension CryptoError: Foundation.LocalizedError {
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * The kind of behavioural signal a host records for a note (SUR-966), mirroring surfc
+ * `applyNoteSignal`. Collection lives HERE (not host-side) because `note_signals` is a
+ * whole-row LWW table with no FFI read-back — a host can't increment a counter it can't read
+ * without clobbering another device's earned counters. Only the mutation math differs per kind;
+ * `record_note_signal` owns it so the scoring constants stay in one place (the SUR-475
+ * calibration harness retunes them).
+ */
+
+public enum NoteSignalKind {
+    
+    /**
+     * The note passed the reader's eyes — bumps `exposure_recency_at`, throttled (see
+     * [`SIGNAL_THROTTLE_MS`]): a scroll-list re-seeing the same note all afternoon must not
+     * restage the identical "recently seen" fact fifty times.
+     */
+    case exposure
+    /**
+     * A deliberate act on the note (a reflective interaction) — bumps `engagement_recency_at`.
+     * NOT throttled: engagement fires only on rare, intentional acts, so every call is genuine
+     * evidence ranking should trust.
+     */
+    case engagement
+    /**
+     * The reader returned to re-read the note — `return_visits += 1` and bumps
+     * `exposure_recency_at`. Deliberately NOT engagement (the PWA: "re-reading isn't reflection").
+     */
+    case returnVisit
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeNoteSignalKind: FfiConverterRustBuffer {
+    typealias SwiftType = NoteSignalKind
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> NoteSignalKind {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .exposure
+        
+        case 2: return .engagement
+        
+        case 3: return .returnVisit
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: NoteSignalKind, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .exposure:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .engagement:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .returnVisit:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeNoteSignalKind_lift(_ buf: RustBuffer) throws -> NoteSignalKind {
+    return try FfiConverterTypeNoteSignalKind.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeNoteSignalKind_lower(_ value: NoteSignalKind) -> RustBuffer {
+    return FfiConverterTypeNoteSignalKind.lower(value)
+}
+
+
+
+extension NoteSignalKind: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * Which entity a [`SearchHit`] points at. Mirrors the PWA's `type` field (`'note'`/`'idea'`),
  * but a closed enum gives Swift/Kotlin an exhaustive switch instead of a stringly-typed field.
  * Scope is notes + custom-ideas only (SUR-744 decision 1); books aren't indexed by the PWA and
@@ -5161,13 +5350,19 @@ private var initializationResult: InitializationResult = {
     if (uniffi_braird_core_checksum_method_syncengine_recent_note() != 17557) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_braird_core_checksum_method_syncengine_replace_handwritten_annotations() != 559) {
+    if (uniffi_braird_core_checksum_method_syncengine_record_note_signal() != 37879) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_braird_core_checksum_method_syncengine_replace_handwritten_annotations() != 3703) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_search() != 14411) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_set_access_token() != 47386) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_braird_core_checksum_method_syncengine_soft_delete_signals_for_note() != 14715) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_sync() != 38790) {
