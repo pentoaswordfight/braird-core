@@ -844,16 +844,17 @@ public protocol SyncEngineProtocol : AnyObject {
      * fires only on rare, deliberate acts, so throttling would drop real evidence.
      *
      * Returns `true` if a row was staged, `false` on a change-detection no-op / throttled write
-     * (nothing staged, no `updated_at` bump) — or when the note is LOCALLY DELETED, so a signal
-     * callback that lands after the host's delete cannot resurrect the signals tombstone and leak
-     * live metadata for a dead note. If `note_id` has no local note row (created on
-     * another device, not yet synced down), `source_prior` is born carrying its unknown-source
-     * fallback — the row is otherwise correct. The pull itself does not retro-correct it; the next
-     * signal from a device that can SEE the note does, re-deriving the prior from its real
-     * `source`. Only that unknown-source sentinel heals: a real stored prior is never overwritten
-     * (SUR-956). Best-effort across the fleet, not monotonic — a device that still cannot see the
-     * note does not heal, and pushes its stale sentinel with a newer `updated_at`, reverting a
-     * healed row under whole-row LWW until any note-visible device signals again.
+     * (nothing staged, no `updated_at` bump) — or when the note is NOT LOCALLY VISIBLE, i.e. its
+     * row is absent or tombstoned. Only a note this device can actually see earns a signal:
+     * - deleted → staging would take the resurrect path and drop the queued signals tombstone,
+     * leaking live metadata for a dead note;
+     * - absent → there is no `source` to derive `source_prior` from, so the row would be born at
+     * the unknown-source fallback and pinned there (nothing re-derives a stored prior — SUR-956,
+     * v0.9.1), permanently under-scoring the note in [`compute_importance`].
+     *
+     * A signal for a note the host cannot render is near-unreachable in practice, and signals are
+     * cheap and repeat, so dropping one racing an unsynced note costs nothing next to storing a
+     * wrong prior forever.
      */
     func recordNoteSignal(noteId: String, kind: NoteSignalKind) throws  -> Bool
     
@@ -1571,16 +1572,17 @@ open func recentNote(nowMs: Int64, seed: UInt64)throws  -> NoteRecord? {
      * fires only on rare, deliberate acts, so throttling would drop real evidence.
      *
      * Returns `true` if a row was staged, `false` on a change-detection no-op / throttled write
-     * (nothing staged, no `updated_at` bump) — or when the note is LOCALLY DELETED, so a signal
-     * callback that lands after the host's delete cannot resurrect the signals tombstone and leak
-     * live metadata for a dead note. If `note_id` has no local note row (created on
-     * another device, not yet synced down), `source_prior` is born carrying its unknown-source
-     * fallback — the row is otherwise correct. The pull itself does not retro-correct it; the next
-     * signal from a device that can SEE the note does, re-deriving the prior from its real
-     * `source`. Only that unknown-source sentinel heals: a real stored prior is never overwritten
-     * (SUR-956). Best-effort across the fleet, not monotonic — a device that still cannot see the
-     * note does not heal, and pushes its stale sentinel with a newer `updated_at`, reverting a
-     * healed row under whole-row LWW until any note-visible device signals again.
+     * (nothing staged, no `updated_at` bump) — or when the note is NOT LOCALLY VISIBLE, i.e. its
+     * row is absent or tombstoned. Only a note this device can actually see earns a signal:
+     * - deleted → staging would take the resurrect path and drop the queued signals tombstone,
+     * leaking live metadata for a dead note;
+     * - absent → there is no `source` to derive `source_prior` from, so the row would be born at
+     * the unknown-source fallback and pinned there (nothing re-derives a stored prior — SUR-956,
+     * v0.9.1), permanently under-scoring the note in [`compute_importance`].
+     *
+     * A signal for a note the host cannot render is near-unreachable in practice, and signals are
+     * cheap and repeat, so dropping one racing an unsynced note costs nothing next to storing a
+     * wrong prior forever.
      */
 open func recordNoteSignal(noteId: String, kind: NoteSignalKind)throws  -> Bool {
     return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
@@ -5362,7 +5364,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_braird_core_checksum_method_syncengine_recent_note() != 17557) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_braird_core_checksum_method_syncengine_record_note_signal() != 31578) {
+    if (uniffi_braird_core_checksum_method_syncengine_record_note_signal() != 34401) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_replace_handwritten_annotations() != 3703) {

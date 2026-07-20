@@ -960,16 +960,17 @@ impl SyncEngine {
     ///    fires only on rare, deliberate acts, so throttling would drop real evidence.
     ///
     /// Returns `true` if a row was staged, `false` on a change-detection no-op / throttled write
-    /// (nothing staged, no `updated_at` bump) — or when the note is LOCALLY DELETED, so a signal
-    /// callback that lands after the host's delete cannot resurrect the signals tombstone and leak
-    /// live metadata for a dead note. If `note_id` has no local note row (created on
-    /// another device, not yet synced down), `source_prior` is born carrying its unknown-source
-    /// fallback — the row is otherwise correct. The pull itself does not retro-correct it; the next
-    /// signal from a device that can SEE the note does, re-deriving the prior from its real
-    /// `source`. Only that unknown-source sentinel heals: a real stored prior is never overwritten
-    /// (SUR-956). Best-effort across the fleet, not monotonic — a device that still cannot see the
-    /// note does not heal, and pushes its stale sentinel with a newer `updated_at`, reverting a
-    /// healed row under whole-row LWW until any note-visible device signals again.
+    /// (nothing staged, no `updated_at` bump) — or when the note is NOT LOCALLY VISIBLE, i.e. its
+    /// row is absent or tombstoned. Only a note this device can actually see earns a signal:
+    ///  - deleted → staging would take the resurrect path and drop the queued signals tombstone,
+    ///    leaking live metadata for a dead note;
+    ///  - absent → there is no `source` to derive `source_prior` from, so the row would be born at
+    ///    the unknown-source fallback and pinned there (nothing re-derives a stored prior — SUR-956,
+    ///    v0.9.1), permanently under-scoring the note in [`compute_importance`].
+    ///
+    /// A signal for a note the host cannot render is near-unreachable in practice, and signals are
+    /// cheap and repeat, so dropping one racing an unsynced note costs nothing next to storing a
+    /// wrong prior forever.
     pub fn record_note_signal(
         &self,
         note_id: String,
@@ -978,27 +979,33 @@ impl SyncEngine {
         let store = lock!(self.store);
         let now = epoch_ms();
         let note = store.get_row("notes", &note_id).map_err(store_err)?;
-        // A late signal callback can land AFTER the host deleted the note and tombstoned its
-        // signals row. Staging here would take the resurrect path (`was_live == false` always
-        // stages) and `stage_local_writes` would drop the queued tombstone — leaving live signal
-        // metadata for a deleted note, the orphaned-row leak this op exists to prevent. An ABSENT
-        // note row stays allowed (created on another device, not yet synced down — documented
-        // above); only a LOCALLY-DELETED one is the no-op.
+        // ONLY A LOCALLY-VISIBLE NOTE EARNS A SIGNAL. Two different leaks close on this one guard:
         //
-        // SAME-DEVICE ONLY, deliberately. This does not close the leak fleet-wide, and absent is
-        // AMBIGUOUS — not proven-safe: `pull` skips an incoming tombstone when there is no local
-        // row, so "never synced down" and "deleted on another device" look identical here, and a
-        // device that has not yet pulled a tombstone still holds a LIVE local row whose signal wins
-        // on whole-row LWW. Retiring those needs a post-pull signals reconciliation pass (none
-        // exists); the FFI has no note-existence read-back that would let a host disambiguate.
-        if note
-            .as_ref()
-            .is_some_and(|r| matches!(r.get("deleted"), Some(Value::Bool(true))))
-        {
+        //  - DELETED: a late callback landing after the host's delete would take the resurrect path
+        //    (`was_live == false` always stages) and `stage_local_writes` would drop the queued
+        //    tombstone — live signal metadata for a dead note.
+        //  - ABSENT: with no note there is no `source`, so the row would be born at the
+        //    unknown-source fallback. Nothing re-derives a stored prior (SUR-956's "stored prior
+        //    kept, not re-derived", v0.9.1), so `handwritten` (0.9), `share` (0.75) and `manual`
+        //    (0.7) notes would sit at 0.5 forever, under-scored by `compute_importance`.
+        //
+        // Refusing the absent case is what lets the prior stay a plain read. The alternative — birth
+        // at a sentinel and heal later — cannot work: a stored 0.5 is genuinely ambiguous (a
+        // `readwise` note derives 0.5, and an import or the blind `enqueue_note_signals` FFI can
+        // write a real 0.5 onto a note whose source derives higher), so healing on the value would
+        // overwrite legitimate priors and break the very invariant it was protecting.
+        //
+        // Same-device only, and deliberately so: it does not close the leak fleet-wide. A device
+        // that has not yet pulled a tombstone still holds a LIVE local row whose signal wins on
+        // whole-row LWW. Retiring those needs a post-pull signals reconciliation pass (none exists).
+        let Some(note) = note.filter(|r| !matches!(r.get("deleted"), Some(Value::Bool(true))))
+        else {
             return Ok(false);
-        }
-        let note_source =
-            note.and_then(|r| r.get("source").and_then(Value::as_str).map(str::to_string));
+        };
+        let note_source = note
+            .get("source")
+            .and_then(Value::as_str)
+            .map(str::to_string);
         let write =
             self.stage_signal_write(&store, &note_id, note_source.as_deref(), now, |s| {
                 match kind {
@@ -1664,31 +1671,28 @@ impl SyncEngine {
         // Stored columns verbatim, or birth defaults (`freshNoteSignals`): prior from the note's
         // `source`, zeroed counters. `created_at` is preserved (or born now) around the mutation.
         //
-        // `source_prior` has one narrow exception, and only one. `record_note_signal` allows a
-        // signal on a note that has not synced down yet; with no note to read, the row is born
-        // carrying `source_prior`'s `_ => 0.5` fallback, which means "source unknown", not "source
-        // is worth 0.5". Kept verbatim, that pins `handwritten` (0.9), `share` (0.75) and `manual`
-        // (0.7) notes at 0.5 forever — silently under-scoring them in `compute_importance` with
-        // nothing in the system to correct it, and making this method's documented "self-heal on
-        // the next signal" a lie. So: when the stored prior is that sentinel AND the note is now
-        // visible, re-derive it. Any OTHER stored value is kept verbatim — SUR-956's "stored prior
-        // kept, not re-derived" invariant (v0.9.1) is deliberately preserved. Healing to the same
-        // 0.5 for a genuine `readwise` note is a no-op, so the sentinel test costs nothing.
-        let stored_prior = row.get("source_prior").and_then(Value::as_f64);
-        let unknown_prior = source_prior(None);
+        // `source_prior` is a PLAIN READ: stored verbatim, or derived at birth from the note's
+        // `source`. Nothing re-derives it afterwards — SUR-956's "stored prior kept, not
+        // re-derived" invariant (v0.9.1). That is only safe because both callers refuse a note they
+        // cannot see (`record_note_signal`'s visibility guard, `replace_handwritten_annotations`'
+        // live-parent requirement), so a row can never be born at the unknown-source fallback and
+        // then be stuck there. Do NOT relax either guard without revisiting this line.
+        //
         // `before` MIRRORS THE STORED ROW, verbatim. Nothing derived belongs here: the no-op check
         // below compares against it to decide whether the persisted row already says what we are
         // about to write, so anything computed into `before` is a change that silently cannot be
-        // detected. (The prior heal lived here once and was lost on every throttled Exposure —
-        // healed in `before`, equal in `after`, no-op'd, never persisted.)
+        // detected.
         //
         // NOTE: `importance` is deliberately NOT a `SignalState` field — it is staged below but
         // rides OUTSIDE change-detection, which is sound only because it is a pure function of
         // fields that are inside it. A stored `importance` that disagrees with the formula (the
         // blind `enqueue_note_signals` FFI takes one as an argument) is therefore pinned wrong on a
-        // live row by the same mechanism the prior heal exists to undo.
+        // live row by the same mechanism.
         let before = SignalState {
-            source_prior: stored_prior.unwrap_or(unknown_prior),
+            source_prior: row
+                .get("source_prior")
+                .and_then(Value::as_f64)
+                .unwrap_or_else(|| source_prior(note_source)),
             return_visits: int_or("return_visits", 0),
             has_annotation: matches!(row.get("has_annotation"), Some(Value::Bool(true))),
             stitch_spawns: int_or("stitch_spawns", 0),
@@ -1697,29 +1701,6 @@ impl SyncEngine {
         };
         let created_at = int_or("created_at", now);
         let mut after = before.clone();
-        // The heal is a MUTATION, applied to `after` alongside the caller's — so change-detection
-        // sees it and it persists even when the caller's own mutation is a throttled no-op.
-        // `unknown_prior` (0.5) means "source unknown", not "source is worth 0.5": a row born while
-        // the note was invisible carries it, and kept verbatim it would pin `handwritten` (0.9),
-        // `share` (0.75) and `manual` (0.7) notes at 0.5 forever, under-scoring them in
-        // `compute_importance` with nothing to correct it. Only that sentinel re-derives, and only
-        // once the note is visible; any OTHER stored prior is kept verbatim, preserving SUR-956's
-        // "stored prior kept, not re-derived" invariant (v0.9.1). A genuine `readwise` note heals
-        // 0.5 -> 0.5, a no-op, so the sentinel test costs nothing.
-        //
-        // BIRTHS RIDE THIS BRANCH: with no stored row, `before.source_prior` is the 0.5 fiction and
-        // the real prior is derived HERE, not in `before`. That is correct only because `!was_live`
-        // bypasses the no-op below. Do NOT gate this on `was_live` — it would silently birth every
-        // row at 0.5.
-        //
-        // BEST-EFFORT ACROSS THE FLEET, not a guarantee. Only a device that can SEE the note heals;
-        // a blind device's `before` reads its own stale sentinel, does not heal, and pushes 0.5 with
-        // a newer `updated_at` — reverting a healed row under whole-row LWW. Convergent under
-        // continued activity on any note-visible device, but not monotonic.
-        // `unknown_prior` is 0.5 — exactly representable, so `==` is safe here.
-        if note_source.is_some() && before.source_prior == unknown_prior {
-            after.source_prior = source_prior(note_source);
-        }
         mutate(&mut after);
         // Change-detection no-op: a LIVE row the mutation left byte-identical stages nothing (an
         // Exposure inside the throttle window, a repeat of an already-set flag). A tombstoned or
@@ -4767,225 +4748,100 @@ mod tests {
     }
 
     #[test]
-    fn record_note_signal_heals_the_unknown_prior_once_the_note_syncs_down() {
-        // The birth-before-note case is allowed, and it stores `source_prior`'s `_ => 0.5` fallback
-        // because there is no note to read. That is only acceptable BECAUSE the next signal heals
-        // it: once the note pulls down, the prior must re-derive from its real `source`
-        // (handwritten = 0.9). Left pinned at 0.5 the note is under-scored in `compute_importance`
-        // forever, and nothing else in the system recomputes it.
+    fn record_note_signal_keeps_a_real_stored_prior_when_the_note_is_visible() {
+        // SUR-956's "stored prior kept, not re-derived" invariant (v0.9.1): a stored prior is kept
+        // verbatim even when the visible note's `source` would derive a different number.
+        //
+        // 0.5 is asserted DELIBERATELY, and is the sharper half. A stored 0.5 is a legitimate value
+        // — `readwise` derives it, and an import or the blind `enqueue_note_signals` FFI can write
+        // it onto a note whose source derives higher. Any scheme that treated 0.5 as an
+        // "unknown source" sentinel and re-derived it would silently overwrite a real prior here.
+        for (seeded, source) in [(0.9_f64, "manual"), (0.5_f64, "handwritten")] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("t.sqlite");
+            let db_path = db.to_str().unwrap();
+            let engine = engine_at(db_path);
+            engine.enqueue_note(note_with_source("n", source)).unwrap();
+            engine
+                .enqueue_note_signals("n".into(), seeded, 0, false, 0, 0, 0, 0.0, 100, false)
+                .unwrap();
+
+            assert!(engine
+                .record_note_signal("n".into(), NoteSignalKind::Engagement)
+                .unwrap());
+            assert_eq!(
+                stored_signals(db_path, "n").unwrap()["source_prior"],
+                json!(seeded),
+                "a real stored prior is never re-derived (seeded {seeded} on a `{source}` note)"
+            );
+        }
+    }
+
+    #[test]
+    fn record_note_signal_on_an_absent_note_is_a_no_op_and_stages_nothing() {
+        // ABSENT is refused for a different reason than DELETED: with no note there is no `source`,
+        // so the row would be born at the unknown-source fallback (0.5) — and nothing re-derives a
+        // stored prior (SUR-956), so `handwritten`/`share`/`manual` notes would sit under-scored
+        // forever. Healing later cannot fix it either: a stored 0.5 is ambiguous (a `readwise` note
+        // derives 0.5, and imports / the blind `enqueue_note_signals` FFI can write a real 0.5), so
+        // healing on the value would overwrite legitimate priors. Refusing the birth is the fix.
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.sqlite");
         let db_path = db.to_str().unwrap();
         let engine = engine_at(db_path);
 
-        // Signal arrives BEFORE the note exists locally.
-        assert!(engine
+        for kind in [
+            NoteSignalKind::Exposure,
+            NoteSignalKind::Engagement,
+            NoteSignalKind::ReturnVisit,
+        ] {
+            assert!(
+                !engine
+                    .record_note_signal("never-synced".into(), kind)
+                    .unwrap(),
+                "a signal on a note this device cannot see stages nothing"
+            );
+        }
+        assert!(
+            stored_signals(db_path, "never-synced").is_none(),
+            "no signals row was born at the unknown-source fallback"
+        );
+        assert_eq!(
+            Store::open(db_path).unwrap().outbox_items().unwrap().len(),
+            0,
+            "nothing queued for the fleet either"
+        );
+    }
+
+    #[test]
+    fn record_note_signal_births_the_real_prior_once_the_note_is_visible() {
+        // The other half of refusing the absent case: the signal that lands AFTER the note syncs
+        // down births the row with the note's real prior, so nothing is stuck at the fallback.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+
+        assert!(!engine
             .record_note_signal("n".into(), NoteSignalKind::ReturnVisit)
             .unwrap());
-        assert_eq!(
-            stored_signals(db_path, "n").unwrap()["source_prior"],
-            json!(0.5),
-            "born carrying the unknown-source sentinel"
-        );
-
-        // The note syncs down as `handwritten`; the next signal must heal the prior.
         engine
             .enqueue_note(note_with_source("n", "handwritten"))
             .unwrap();
         assert!(engine
-            .record_note_signal("n".into(), NoteSignalKind::Engagement)
+            .record_note_signal("n".into(), NoteSignalKind::ReturnVisit)
             .unwrap());
-        let sig = stored_signals(db_path, "n").unwrap();
+
+        let sig = stored_signals(db_path, "n").expect("row born once the note is visible");
         assert_eq!(
             sig["source_prior"],
             json!(0.9),
-            "prior healed from the note's real source"
+            "born at the note's real prior, never the fallback"
         );
         assert_eq!(
             sig["return_visits"],
             json!(1),
-            "the earned counter survived the heal"
-        );
-        assert_eq!(
-            sig["importance"],
-            json!(compute_importance(0.9, 1, false, 0)),
-            "importance recomputed on the healed prior"
-        );
-    }
-
-    #[test]
-    fn record_note_signal_heals_the_prior_even_when_the_exposure_is_throttled() {
-        // The heal must be a MUTATION, not a re-read: if it is folded into the pre-image, a
-        // throttled Exposure computes the healed prior, finds `after == before`, no-ops, and the
-        // stored row keeps 0.5. A repeat exposure inside the 1h window is the COMMON case, so that
-        // leaves the note under-scored until some future non-throttled signal happens to fire.
-        let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("t.sqlite");
-        let db_path = db.to_str().unwrap();
-        let engine = engine_at(db_path);
-
-        // Born blind: ReturnVisit also stamps `exposure_recency_at`, so the next Exposure is
-        // throttled by construction — exactly the reported path.
-        assert!(engine
-            .record_note_signal("n".into(), NoteSignalKind::ReturnVisit)
-            .unwrap());
-        assert_eq!(
-            stored_signals(db_path, "n").unwrap()["source_prior"],
-            json!(0.5),
-            "born carrying the unknown-source sentinel"
-        );
-
-        engine
-            .enqueue_note(note_with_source("n", "handwritten"))
-            .unwrap();
-        assert!(
-            engine
-                .record_note_signal("n".into(), NoteSignalKind::Exposure)
-                .unwrap(),
-            "a throttled Exposure still stages, because the heal itself is a change"
-        );
-        let sig = stored_signals(db_path, "n").unwrap();
-        assert_eq!(sig["source_prior"], json!(0.9), "the heal persisted");
-        assert_eq!(
-            sig["exposure_recency_at"],
-            json!(sig["exposure_recency_at"].as_i64().unwrap()),
-            "throttle still suppressed the exposure stamp itself"
-        );
-        assert_eq!(
-            sig["importance"],
-            json!(compute_importance(0.9, 1, false, 0)),
-            "importance recomputed on the healed prior"
-        );
-
-        // Once healed, a further throttled Exposure is a genuine no-op again.
-        assert!(
-            !engine
-                .record_note_signal("n".into(), NoteSignalKind::Exposure)
-                .unwrap(),
-            "nothing left to heal, throttle window still open — no churn"
-        );
-    }
-
-    #[test]
-    fn record_note_signal_blind_device_reverts_a_healed_prior_and_a_visible_one_re_heals() {
-        // The fleet rule, pinned: the heal is best-effort, NOT monotonic. A device that cannot see
-        // the note reads its own stale sentinel, does not heal, and stages 0.5 with a newer
-        // `updated_at` — which wins whole-row LWW and un-heals the row. Any note-visible device
-        // heals it again on its next signal.
-        //
-        // Single-engine by necessity: a true two-device interleave needs the push/pull network path
-        // (no fixture for that here), so this pins the per-device DECISION each side makes, which is
-        // what determines the LWW outcome — not the convergence itself.
-        let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("t.sqlite");
-        let db_path = db.to_str().unwrap();
-        let blind = engine_at(db_path);
-
-        // Blind device: signals row exists at the sentinel, note NOT visible locally.
-        assert!(blind
-            .record_note_signal("n".into(), NoteSignalKind::ReturnVisit)
-            .unwrap());
-        assert_eq!(
-            stored_signals(db_path, "n").unwrap()["source_prior"],
-            json!(0.5)
-        );
-
-        // It keeps staging the sentinel — this is the write that would revert a peer's heal.
-        assert!(blind
-            .record_note_signal("n".into(), NoteSignalKind::Engagement)
-            .unwrap());
-        assert_eq!(
-            stored_signals(db_path, "n").unwrap()["source_prior"],
-            json!(0.5),
-            "a blind device never heals — it pushes the stale sentinel"
-        );
-
-        // The note becomes visible (pulled down); the next signal re-heals.
-        blind.enqueue_note(note_with_source("n", "share")).unwrap();
-        assert!(blind
-            .record_note_signal("n".into(), NoteSignalKind::Engagement)
-            .unwrap());
-        assert_eq!(
-            stored_signals(db_path, "n").unwrap()["source_prior"],
-            json!(0.75),
-            "a note-visible device re-heals it"
-        );
-    }
-
-    #[test]
-    fn record_note_signal_a_genuine_readwise_note_heals_to_the_same_value_without_churn() {
-        // `readwise` derives 0.5, which IS the sentinel — so the heal fires and changes nothing.
-        // Pins the claim that the sentinel test costs nothing: no spurious write, no outbox churn.
-        let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("t.sqlite");
-        let db_path = db.to_str().unwrap();
-        let engine = engine_at(db_path);
-        engine
-            .enqueue_note(note_with_source("n", "readwise"))
-            .unwrap();
-
-        assert!(engine
-            .record_note_signal("n".into(), NoteSignalKind::Exposure)
-            .unwrap());
-        assert_eq!(
-            stored_signals(db_path, "n").unwrap()["source_prior"],
-            json!(0.5)
-        );
-        // Throttled repeat: nothing to heal, nothing to change — a real no-op, not a rewrite.
-        assert!(
-            !engine
-                .record_note_signal("n".into(), NoteSignalKind::Exposure)
-                .unwrap(),
-            "a readwise 0.5 must not re-stage every call"
-        );
-    }
-
-    #[test]
-    fn record_note_signal_keeps_a_real_stored_prior_when_the_note_is_visible() {
-        // The other side of the sentinel rule, and the SUR-956 invariant (v0.9.1) it must not
-        // break: a stored prior that is NOT the 0.5 sentinel is kept verbatim even when the note is
-        // visible and would derive a different number. Only "unknown" heals.
-        let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("t.sqlite");
-        let db_path = db.to_str().unwrap();
-        let engine = engine_at(db_path);
-        engine
-            .enqueue_note(note_with_source("n", "manual"))
-            .unwrap();
-        // Seed a stored prior of 0.9 against a `manual` note (whose source would derive 0.7).
-        engine
-            .enqueue_note_signals("n".into(), 0.9, 0, false, 0, 0, 0, 0.0, 100, false)
-            .unwrap();
-
-        assert!(engine
-            .record_note_signal("n".into(), NoteSignalKind::Engagement)
-            .unwrap());
-        assert_eq!(
-            stored_signals(db_path, "n").unwrap()["source_prior"],
-            json!(0.9),
-            "a real stored prior is never re-derived"
-        );
-    }
-
-    #[test]
-    fn record_note_signal_still_writes_when_the_note_row_is_merely_absent() {
-        // The guard must distinguish DELETED from ABSENT: a note created on another device and not
-        // yet synced down has no local row, and that case is documented as allowed — it births the
-        // signals row with a default `source_prior` rather than dropping the signal.
-        let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("t.sqlite");
-        let db_path = db.to_str().unwrap();
-        let engine = engine_at(db_path);
-
-        assert!(
-            engine
-                .record_note_signal("never-synced".into(), NoteSignalKind::Engagement)
-                .unwrap(),
-            "an absent note row still writes"
-        );
-        assert_eq!(
-            stored_signals(db_path, "never-synced").unwrap()["deleted"],
-            json!(false)
+            "only the landed signal counts"
         );
     }
 

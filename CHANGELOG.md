@@ -34,19 +34,20 @@ SUR-956 margins no-op guard so an already-annotated note still records margin en
   rare, so every call is genuine evidence). Returns `true` when a row was staged, `false` on a
   change-detection / throttle no-op (no `updated_at` bump, no outbox churn). Shares one read-merge-stage
   helper with `replace_handwritten_annotations` so the scoring constants stay in one place.
-  A signal on a **locally-deleted** note is a no-op returning `false`: a callback that lands after the
-  host's delete would otherwise take the resurrect path and drop the queued signals tombstone, leaving
-  live signal metadata for a dead note. An *absent* local note row is unaffected (a note created on
-  another device and not yet synced down still births its signals row with a default `source_prior`).
-  A row born while the note was invisible carries `source_prior`'s unknown-source fallback (0.5), and
-  the **next signal from a device that can see the note re-derives it** from the note's real `source`
-  — without that heal, `handwritten` (0.9), `share` (0.75) and `manual` (0.7) notes stay pinned at 0.5
-  and are under-scored by `compute_importance` forever. Only that sentinel heals: a real stored prior
-  is kept verbatim, preserving SUR-956's "stored prior kept, not re-derived" invariant from v0.9.1.
-  The heal is best-effort across a fleet rather than monotonic: a device that still cannot see the
-  note does not heal, and pushes its stale sentinel with a newer `updated_at`, reverting a healed row
-  under whole-row LWW until any note-visible device signals again.
-  This narrows the orphaned-signals window to the same device; it does not close it fleet-wide. A
+  **Only a locally-visible note earns a signal** — an absent or tombstoned note row is a no-op
+  returning `false`. Deleted, because a callback landing after the host's delete would take the
+  resurrect path and drop the queued signals tombstone, leaving live signal metadata for a dead note.
+  Absent, because with no note there is no `source` to derive `source_prior` from: the row would be
+  born at the unknown-source fallback and pinned there — nothing re-derives a stored prior (SUR-956's
+  "stored prior kept, not re-derived", v0.9.1) — permanently under-scoring `handwritten` (0.9),
+  `share` (0.75) and `manual` (0.7) notes in `compute_importance`. Healing such a row later is not a
+  workable alternative: a stored 0.5 is genuinely ambiguous, since `readwise` derives 0.5 and both
+  import and the blind `enqueue_note_signals` FFI can write a real 0.5 onto a note whose source
+  derives higher, so healing on the value would overwrite legitimate priors. A signal for a note the
+  host cannot render is near-unreachable in practice, and signals are cheap and repeat, so dropping
+  one racing an unsynced note costs nothing next to storing a wrong prior forever.
+  The deleted half of this narrows the orphaned-signals window to the same device; it does not close
+  it fleet-wide. A
   device that has not yet pulled the note's tombstone still sees a live local row, so a signal it
   fires there wins on whole-row LWW and leaves the `note_signals` row live for a deleted note — and
   an absent local row is ambiguous (never-synced-down vs deleted-elsewhere, since a pull skips an
