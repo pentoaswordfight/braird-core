@@ -963,9 +963,10 @@ impl SyncEngine {
     /// (nothing staged, no `updated_at` bump) — or when the note is LOCALLY DELETED, so a signal
     /// callback that lands after the host's delete cannot resurrect the signals tombstone and leak
     /// live metadata for a dead note. If `note_id` has no local note row (created on
-    /// another device, not yet synced down), `source_prior` falls back to the default — the row is
-    /// otherwise correct; a later pull of the note does not retro-correct the prior (accepted:
-    /// signals are derived and self-heal on the next signal).
+    /// another device, not yet synced down), `source_prior` is born carrying its unknown-source
+    /// fallback — the row is otherwise correct. The pull itself does not retro-correct it; the NEXT
+    /// signal does, re-deriving the prior from the note's real `source` once it is visible. Only
+    /// that unknown-source sentinel heals: a real stored prior is never overwritten (SUR-956).
     pub fn record_note_signal(
         &self,
         note_id: String,
@@ -1659,11 +1660,27 @@ impl SyncEngine {
             |field: &str, default: i64| row.get(field).and_then(Value::as_i64).unwrap_or(default);
         // Stored columns verbatim, or birth defaults (`freshNoteSignals`): prior from the note's
         // `source`, zeroed counters. `created_at` is preserved (or born now) around the mutation.
+        //
+        // `source_prior` has one narrow exception, and only one. `record_note_signal` allows a
+        // signal on a note that has not synced down yet; with no note to read, the row is born
+        // carrying `source_prior`'s `_ => 0.5` fallback, which means "source unknown", not "source
+        // is worth 0.5". Kept verbatim, that pins `handwritten` (0.9), `share` (0.75) and `manual`
+        // (0.7) notes at 0.5 forever — silently under-scoring them in `compute_importance` with
+        // nothing in the system to correct it, and making this method's documented "self-heal on
+        // the next signal" a lie. So: when the stored prior is that sentinel AND the note is now
+        // visible, re-derive it. Any OTHER stored value is kept verbatim — SUR-956's "stored prior
+        // kept, not re-derived" invariant (v0.9.1) is deliberately preserved. Healing to the same
+        // 0.5 for a genuine `readwise` note is a no-op, so the sentinel test costs nothing.
+        let stored_prior = row.get("source_prior").and_then(Value::as_f64);
+        let unknown_prior = source_prior(None);
         let before = SignalState {
-            source_prior: row
-                .get("source_prior")
-                .and_then(Value::as_f64)
-                .unwrap_or_else(|| source_prior(note_source)),
+            source_prior: match stored_prior {
+                // `unknown_prior` is 0.5 — exactly representable, so `==` is safe here.
+                Some(p) if p != unknown_prior => p,
+                _ if note_source.is_some() => source_prior(note_source),
+                Some(p) => p,
+                None => unknown_prior,
+            },
             return_visits: int_or("return_visits", 0),
             has_annotation: matches!(row.get("has_annotation"), Some(Value::Bool(true))),
             stitch_spawns: int_or("stitch_spawns", 0),
@@ -4715,6 +4732,80 @@ mod tests {
             payload["deleted"],
             json!(true),
             "what flushes is still the TOMBSTONE — it was not dropped by a resurrect"
+        );
+    }
+
+    #[test]
+    fn record_note_signal_heals_the_unknown_prior_once_the_note_syncs_down() {
+        // The birth-before-note case is allowed, and it stores `source_prior`'s `_ => 0.5` fallback
+        // because there is no note to read. That is only acceptable BECAUSE the next signal heals
+        // it: once the note pulls down, the prior must re-derive from its real `source`
+        // (handwritten = 0.9). Left pinned at 0.5 the note is under-scored in `compute_importance`
+        // forever, and nothing else in the system recomputes it.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+
+        // Signal arrives BEFORE the note exists locally.
+        assert!(engine
+            .record_note_signal("n".into(), NoteSignalKind::ReturnVisit)
+            .unwrap());
+        assert_eq!(
+            stored_signals(db_path, "n").unwrap()["source_prior"],
+            json!(0.5),
+            "born carrying the unknown-source sentinel"
+        );
+
+        // The note syncs down as `handwritten`; the next signal must heal the prior.
+        engine
+            .enqueue_note(note_with_source("n", "handwritten"))
+            .unwrap();
+        assert!(engine
+            .record_note_signal("n".into(), NoteSignalKind::Engagement)
+            .unwrap());
+        let sig = stored_signals(db_path, "n").unwrap();
+        assert_eq!(
+            sig["source_prior"],
+            json!(0.9),
+            "prior healed from the note's real source"
+        );
+        assert_eq!(
+            sig["return_visits"],
+            json!(1),
+            "the earned counter survived the heal"
+        );
+        assert_eq!(
+            sig["importance"],
+            json!(compute_importance(0.9, 1, false, 0)),
+            "importance recomputed on the healed prior"
+        );
+    }
+
+    #[test]
+    fn record_note_signal_keeps_a_real_stored_prior_when_the_note_is_visible() {
+        // The other side of the sentinel rule, and the SUR-956 invariant (v0.9.1) it must not
+        // break: a stored prior that is NOT the 0.5 sentinel is kept verbatim even when the note is
+        // visible and would derive a different number. Only "unknown" heals.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine
+            .enqueue_note(note_with_source("n", "manual"))
+            .unwrap();
+        // Seed a stored prior of 0.9 against a `manual` note (whose source would derive 0.7).
+        engine
+            .enqueue_note_signals("n".into(), 0.9, 0, false, 0, 0, 0, 0.0, 100, false)
+            .unwrap();
+
+        assert!(engine
+            .record_note_signal("n".into(), NoteSignalKind::Engagement)
+            .unwrap());
+        assert_eq!(
+            stored_signals(db_path, "n").unwrap()["source_prior"],
+            json!(0.9),
+            "a real stored prior is never re-derived"
         );
     }
 

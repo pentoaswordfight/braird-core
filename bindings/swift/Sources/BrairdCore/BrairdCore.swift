@@ -847,9 +847,10 @@ public protocol SyncEngineProtocol : AnyObject {
      * (nothing staged, no `updated_at` bump) — or when the note is LOCALLY DELETED, so a signal
      * callback that lands after the host's delete cannot resurrect the signals tombstone and leak
      * live metadata for a dead note. If `note_id` has no local note row (created on
-     * another device, not yet synced down), `source_prior` falls back to the default — the row is
-     * otherwise correct; a later pull of the note does not retro-correct the prior (accepted:
-     * signals are derived and self-heal on the next signal).
+     * another device, not yet synced down), `source_prior` is born carrying its unknown-source
+     * fallback — the row is otherwise correct. The pull itself does not retro-correct it; the NEXT
+     * signal does, re-deriving the prior from the note's real `source` once it is visible. Only
+     * that unknown-source sentinel heals: a real stored prior is never overwritten (SUR-956).
      */
     func recordNoteSignal(noteId: String, kind: NoteSignalKind) throws  -> Bool
     
@@ -1570,9 +1571,10 @@ open func recentNote(nowMs: Int64, seed: UInt64)throws  -> NoteRecord? {
      * (nothing staged, no `updated_at` bump) — or when the note is LOCALLY DELETED, so a signal
      * callback that lands after the host's delete cannot resurrect the signals tombstone and leak
      * live metadata for a dead note. If `note_id` has no local note row (created on
-     * another device, not yet synced down), `source_prior` falls back to the default — the row is
-     * otherwise correct; a later pull of the note does not retro-correct the prior (accepted:
-     * signals are derived and self-heal on the next signal).
+     * another device, not yet synced down), `source_prior` is born carrying its unknown-source
+     * fallback — the row is otherwise correct. The pull itself does not retro-correct it; the NEXT
+     * signal does, re-deriving the prior from the note's real `source` once it is visible. Only
+     * that unknown-source sentinel heals: a real stored prior is never overwritten (SUR-956).
      */
 open func recordNoteSignal(noteId: String, kind: NoteSignalKind)throws  -> Bool {
     return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
@@ -5354,7 +5356,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_braird_core_checksum_method_syncengine_recent_note() != 17557) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_braird_core_checksum_method_syncengine_record_note_signal() != 19533) {
+    if (uniffi_braird_core_checksum_method_syncengine_record_note_signal() != 57406) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_replace_handwritten_annotations() != 3703) {
