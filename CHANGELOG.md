@@ -6,6 +6,81 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-07-20
+
+Nineteenth release batch. Minor release: the native `note_signals` collection surface (SUR-966) —
+`record_note_signal(note_id, kind)` for the three behavioural signals plus
+`soft_delete_signals_for_note(note_id)` on note delete, mirroring the PWA's `applyNoteSignal` /
+delete-tombstone oracle. Two new FFI methods + the `NoteSignalKind` enum, bindings regenerated
+(the enum lowers as one `RustBuffer`, no arm64 >8-slot spill). The counter math lives IN CORE
+because the FFI has no `note_signals` read-back — a host cannot safely mutate a counter it cannot
+read without clobbering another device's earned counters over whole-row LWW. Also widens the
+SUR-956 margins no-op guard so an already-annotated note still records margin engagement. Four
+`native-parity` manifest rows (`bump-exposure`, `bump-engagement`, `record-return-visit`,
+`soft-delete-signals-for-note`) flip waived → core. Consumers bump their pin to v0.10.0.
+
+### Added
+- **`record_note_signal(note_id, kind: NoteSignalKind)` — native `note_signals` collection (SUR-966).**
+  Records a behavioural signal for a note, porting the PWA's `applyNoteSignal`. The per-kind mutation
+  lives IN CORE (the FFI exposes no signals read-back, so a host bump would clobber earned counters over
+  whole-row LWW): reads the stored row — or births defaults with `source_prior` derived from the note's
+  `source` — applies the mutation, recomputes `importance`, and whole-row stages it (`deleted: false`, so
+  a queued tombstone is dropped — the resurrect rule). `ReturnVisit` → `return_visits += 1` and bumps
+  `exposure_recency_at` (deliberately NOT engagement — "re-reading isn't reflection"); `Exposure` → bumps
+  `exposure_recency_at`, throttled by a named 1h `SIGNAL_THROTTLE_MS` dedup window (distinct from
+  `scoring.js`'s 7d `EXPOSURE_COOLDOWN_MS`), with an absent/epoch-0 stamp treated as "never exposed" so a
+  cold-start Exposure after a first-ever signal of another kind always writes (no unsigned underflow, no
+  NULL short-circuit); `Engagement` → bumps `engagement_recency_at`, never throttled (deliberate acts are
+  rare, so every call is genuine evidence). Returns `true` when a row was staged, `false` on a
+  change-detection / throttle no-op (no `updated_at` bump, no outbox churn). Shares one read-merge-stage
+  helper with `replace_handwritten_annotations` so the scoring constants stay in one place.
+  **Only a locally-visible note earns a signal** — an absent or tombstoned note row is a no-op
+  returning `false`. Deleted, because a callback landing after the host's delete would take the
+  resurrect path and drop the queued signals tombstone, leaving live signal metadata for a dead note.
+  Absent, because with no note there is no `source` to derive `source_prior` from: the row would be
+  born at the unknown-source fallback and pinned there — nothing re-derives a stored prior (SUR-956's
+  "stored prior kept, not re-derived", v0.9.1) — permanently under-scoring `handwritten` (0.9),
+  `share` (0.75) and `manual` (0.7) notes in `compute_importance`. Healing such a row later is not a
+  workable alternative: a stored 0.5 is genuinely ambiguous, since `readwise` derives 0.5 and both
+  import and the blind `enqueue_note_signals` FFI can write a real 0.5 onto a note whose source
+  derives higher, so healing on the value would overwrite legitimate priors. A signal for a note the
+  host cannot render is near-unreachable in practice, and signals are cheap and repeat, so dropping
+  one racing an unsynced note costs nothing next to storing a wrong prior forever.
+  The deleted half of this narrows the orphaned-signals window to the same device; it does not close
+  it fleet-wide. A
+  device that has not yet pulled the note's tombstone still sees a live local row, so a signal it
+  fires there wins on whole-row LWW and leaves the `note_signals` row live for a deleted note — and
+  an absent local row is ambiguous (never-synced-down vs deleted-elsewhere, since a pull skips an
+  incoming tombstone when no local row exists). Retiring those needs a post-pull signals
+  reconciliation pass, which does not exist yet.
+- **`soft_delete_signals_for_note(note_id)` — note_signals tombstone on note delete (SUR-966).** ALWAYS
+  stages a whole-shape tombstone even when this device holds no local signals row — the cross-device tail:
+  another device may hold a live cloud row this delete must tear down, else orphaned signal metadata
+  lingers. Staged through the plain `stage_local_writes` path (which stages a `deleted: true` write
+  unconditionally, no existing-live precondition), never `stage_local_write_existing_live` (which would
+  silently drop the no-local-row tombstone). Carries the stored row's full NOT-NULL shape (or birth
+  defaults) — `note_signals` has no sparse-PATCH flush fallback, so a bare `{note_id, deleted}` would risk
+  a NOT-NULL upsert reject that wedges the outbox (the SUR-942 lesson). A repeat call on an already-
+  tombstoned row is a no-op.
+- **`NoteSignalKind` FFI enum (`Exposure` / `Engagement` / `ReturnVisit`).** The signal taxonomy, defined
+  in `src/sync/mod.rs` alongside the collection op that matches on it (there is no `src/ffi.rs` in this
+  crate; the `#[uniffi::export]` surface lives in `src/lib.rs` + `src/sync/mod.rs`). Bindings regenerated:
+  the enum lowers as a single `RustBuffer`, no arm64 slot spill.
+
+### Changed
+- **Widened the SUR-956 margins no-op guard so an already-annotated note still records engagement
+  (SUR-966).** `replace_handwritten_annotations` now fires an `engagement_recency_at` bump on EVERY margin
+  save, including on a note already carrying `has_annotation: true` — "Add the margins" has a single,
+  always-deliberate caller, so it is a genuine engagement signal. The SUR-956 guard skipped an already-
+  flagged live row entirely, which would have meant an already-annotated note NEVER recorded margin
+  engagement; the shared read-merge-stage helper's change-detection still no-ops only when nothing moved.
+  Engagement is never throttled. The recompute-to-false half stays out of scope (SUR-959).
+- **Four `vendored/native-parity/manifest.json` rows flip waived → core (SUR-966).** `bump-exposure`,
+  `bump-engagement`, `record-return-visit`, and `soft-delete-signals-for-note` are now implemented in
+  core, landed in the SAME change as the flip (the status contract: `core` is an implemented-today claim,
+  so the manifest cannot go green ahead of the code). `ensure-note-signals` and `record-stitch-spawn`
+  stay waived (no standalone host writer / no `StitchSpawn` kind yet).
+
 ## [0.9.1] - 2026-07-19
 
 Eighteenth release batch. Patch release: `replace_handwritten_annotations` now refreshes the

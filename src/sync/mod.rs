@@ -237,6 +237,53 @@ pub struct BookUpsert {
     pub clear_nullable_fields: Vec<String>,
 }
 
+/// The kind of behavioural signal a host records for a note (SUR-966), mirroring surfc
+/// `applyNoteSignal`. Collection lives HERE (not host-side) because `note_signals` is a
+/// whole-row LWW table with no FFI read-back — a host can't increment a counter it can't read
+/// without clobbering another device's earned counters. Only the mutation math differs per kind;
+/// `record_note_signal` owns it so the scoring constants stay in one place (the SUR-475
+/// calibration harness retunes them).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum NoteSignalKind {
+    /// The note passed the reader's eyes — bumps `exposure_recency_at`, throttled (see
+    /// [`SIGNAL_THROTTLE_MS`]): a scroll-list re-seeing the same note all afternoon must not
+    /// restage the identical "recently seen" fact fifty times.
+    Exposure,
+    /// A deliberate act on the note (a reflective interaction) — bumps `engagement_recency_at`.
+    /// NOT throttled: engagement fires only on rare, intentional acts, so every call is genuine
+    /// evidence ranking should trust.
+    Engagement,
+    /// The reader returned to re-read the note — `return_visits += 1` and bumps
+    /// `exposure_recency_at`. Deliberately NOT engagement (the PWA: "re-reading isn't reflection").
+    ReturnVisit,
+}
+
+/// Exposure-write dedup window (SUR-966; founder-approved 1 hour). Exposure stores a *timestamp*,
+/// not a count, so a note re-seen inside this window would restage the identical "recently seen"
+/// fact — every scroll-pass another outbox row saying exactly what the first said. Skip the write
+/// when `now - exposure_recency_at` is within it. This does NOT change what the reader sees or the
+/// ranking (the value being written is already "recently"). It is deliberately NOT `scoring.js`'s
+/// `EXPOSURE_COOLDOWN_MS` (7 days — the *selector's* don't-show-again rule): different job, different
+/// number, do not reuse. Applies to [`NoteSignalKind::Exposure`] only — engagement and return-visit
+/// fire on deliberate, inherently-rare acts and are never throttled (LRN-20260610-001: a named
+/// tunable, never inlined at the call site).
+const SIGNAL_THROTTLE_MS: i64 = 60 * 60 * 1000;
+
+/// The mutable counter state of a `note_signals` row, read from the stored row (or birth defaults)
+/// and mutated by a signal write before it is recomputed + staged (SUR-966). `source_prior` and
+/// `created_at` are effectively immutable per note but carried so the whole-row stage preserves
+/// them; `importance` is derived (never mutated directly). Equality drives the change-detection
+/// no-op: a live row a mutation leaves untouched stages nothing.
+#[derive(Clone, PartialEq)]
+struct SignalState {
+    source_prior: f64,
+    return_visits: i64,
+    has_annotation: bool,
+    stitch_spawns: i64,
+    exposure_recency_at: i64,
+    engagement_recency_at: i64,
+}
+
 /// The on-device sync engine. Owns the SQLite [`Store`], the [`PostgrestClient`], the crypto
 /// [`Vault`] (for seal-at-write), and a tokio current-thread runtime. `Arc<SyncEngine>` is the
 /// UniFFI handle; the interior `Mutex`es make it `Send + Sync` for Swift/Kotlin callers on any
@@ -569,14 +616,16 @@ impl SyncEngine {
     ///   child of several parents, or carry a non-handwritten edge (e.g. an imported `related` row); in
     ///   each case deleting the note would dangle another edge or destroy a regular note, so only the
     ///   edge is retired.
-    /// - The parent's `note_signals.has_annotation` rides the SAME batch (SUR-956; the PWA fires
+    /// - The parent's `note_signals` row rides the SAME batch (SUR-956/SUR-966; the PWA fires
     ///   `refreshAnnotationSignal` on every margin save, and importance scoring weights the flag at
     ///   0.3): the stored signals row — or a birth-defaults row with the prior derived from the
-    ///   parent's `source` — is re-staged WHOLE with `has_annotation: true` and `importance`
-    ///   recomputed, preserving earned behavioural counters verbatim. An existing live row already
-    ///   flagged is left untouched (the PWA's change-detection no-op: no `updated_at` bump, no
-    ///   outbox churn). Dropping the flag to false (a margins-delete recompute) is deliberately NOT
-    ///   here — this op never ends with zero margins (SUR-959 owns that path).
+    ///   parent's `source` — is re-staged WHOLE with `has_annotation: true`, an
+    ///   `engagement_recency_at` bump (SUR-966 §2: "Add the margins" is a single, always-deliberate
+    ///   act → a genuine engagement signal), and `importance` recomputed, preserving earned
+    ///   behavioural counters verbatim. The engagement bump fires on EVERY save, including on a note
+    ///   already flagged — the shared [`SyncEngine::stage_signal_write`] helper's change-detection
+    ///   still no-ops only when truly nothing moved. Dropping the flag to false (a margins-delete
+    ///   recompute) is deliberately NOT here — this op never ends with zero margins (SUR-959).
     ///
     /// Returns the count of margin children created.
     pub fn replace_handwritten_annotations(
@@ -867,72 +916,193 @@ impl SyncEngine {
             }
         }
 
-        // SUR-956: the op ends with ≥1 live margin, so the parent's `note_signals.has_annotation`
-        // must ride the same batch (the PWA's `record-annotation` parity behavior). Read-merge-stage
-        // IN CORE: `enqueue_note_signals` is a blind whole-row LWW write a host must never point at
-        // this (it would clobber earned counters), and the FFI has no signals read. Mirrors the
-        // PWA's `applyNoteSignal`:
-        //  - change-detection no-op — an existing LIVE row already flagged stays untouched;
-        //  - otherwise the FULL row is staged: existing columns verbatim, or birth defaults with
-        //    the prior from the parent's `source` (`freshNoteSignals`). Full-row on purpose — the
-        //    enqueued payload is the staged partial, and the server upsert only sets the columns
-        //    the payload names, so a minimal `{has_annotation}` payload would leave a NEW cloud
-        //    row's other columns to server defaults while the PWA enqueues whole rows;
-        //  - `deleted: false` — a live write, so `stage_local_writes` drops any queued signals
-        //    tombstone (resurrect rule).
-        // The recompute-to-FALSE half lives in the future margins-delete path (SUR-959), not here.
-        let signals = store
-            .get_row("note_signals", &parent_id)
-            .map_err(store_err)?;
-        let already_flagged = signals.as_ref().is_some_and(|s| {
-            matches!(s.get("has_annotation"), Some(Value::Bool(true)))
-                && !matches!(s.get("deleted"), Some(Value::Bool(true)))
-        });
-        if !already_flagged {
-            let existing = signals.unwrap_or_default();
-            let prior = existing
-                .get("source_prior")
-                .and_then(Value::as_f64)
-                .unwrap_or_else(|| source_prior(parent.get("source").and_then(Value::as_str)));
-            let int_or = |field: &str, default: i64| {
-                existing
-                    .get(field)
-                    .and_then(Value::as_i64)
-                    .unwrap_or(default)
-            };
-            let return_visits = int_or("return_visits", 0);
-            let stitch_spawns = int_or("stitch_spawns", 0);
-            let mut sig = Map::new();
-            sig.insert("note_id".into(), json!(parent_id));
-            sig.insert("source_prior".into(), json!(prior));
-            sig.insert("return_visits".into(), json!(return_visits));
-            sig.insert("has_annotation".into(), json!(true));
-            sig.insert("stitch_spawns".into(), json!(stitch_spawns));
-            sig.insert(
-                "exposure_recency_at".into(),
-                json!(int_or("exposure_recency_at", 0)),
-            );
-            sig.insert(
-                "engagement_recency_at".into(),
-                json!(int_or("engagement_recency_at", 0)),
-            );
-            sig.insert(
-                "importance".into(),
-                json!(compute_importance(
-                    prior,
-                    return_visits,
-                    true,
-                    stitch_spawns
-                )),
-            );
-            sig.insert("created_at".into(), json!(int_or("created_at", now)));
-            sig.insert("updated_at".into(), json!(now));
-            sig.insert("deleted".into(), json!(false));
+        // SUR-956/SUR-966: the op ends with ≥1 live margin, so the parent's signals row rides the
+        // SAME batch — `has_annotation: true` AND an `engagement_recency_at` bump. Read-merge-stage
+        // IN CORE via the shared helper: `enqueue_note_signals` is a blind whole-row LWW write a
+        // host must never point at this (it would clobber earned counters), and the FFI has no
+        // signals read. "Add the margins" has a single, always-deliberate caller, so it is a genuine
+        // engagement signal (SUR-966 §2/§5 — the ONLY engagement signal that can safely live in
+        // core). Firing engagement UNCONDITIONALLY here (not gated on the old `has_annotation`
+        // no-op) is deliberate: a note already carrying an annotation must STILL get its engagement
+        // bump on every re-save, else already-annotated notes would never record margin engagement.
+        // The helper's change-detection still no-ops when truly nothing moved. Engagement is never
+        // throttled. The recompute-to-FALSE half lives in the future margins-delete path (SUR-959).
+        if let Some(sig) = self.stage_signal_write(
+            &store,
+            &parent_id,
+            parent.get("source").and_then(Value::as_str),
+            now,
+            |s| {
+                s.has_annotation = true;
+                s.engagement_recency_at = now;
+            },
+        )? {
             writes.push(("note_signals", parent_id.clone(), sig));
         }
 
         store.stage_local_writes(writes, now).map_err(store_err)?;
         Ok(children.len() as u32)
+    }
+
+    /// Record a behavioural signal for a note (SUR-966), mirroring surfc `applyNoteSignal`. Owns the
+    /// per-kind mutation IN CORE — the FFI has no `note_signals` read-back, so a host cannot safely
+    /// increment a counter it cannot read (it would clobber another device's earned counters over
+    /// whole-row LWW). Reads the stored row (or births defaults with `source_prior` from the note's
+    /// `source`), applies the mutation for `kind`, recomputes `importance`, and whole-row stages it
+    /// (`deleted: false`, so a queued tombstone is dropped — the resurrect rule):
+    ///  - [`NoteSignalKind::ReturnVisit`] → `return_visits += 1`, `exposure_recency_at = now`
+    ///    (deliberately NOT engagement — "re-reading isn't reflection").
+    ///  - [`NoteSignalKind::Exposure`] → `exposure_recency_at = now`, throttled by
+    ///    [`SIGNAL_THROTTLE_MS`]. An absent/epoch stamp (a first-ever signal of another kind birthed
+    ///    the row) counts as "never exposed", so the first real Exposure always writes — no unsigned
+    ///    underflow, no NULL short-circuit suppressing it.
+    ///  - [`NoteSignalKind::Engagement`] → `engagement_recency_at = now`. NOT throttled: engagement
+    ///    fires only on rare, deliberate acts, so throttling would drop real evidence.
+    ///
+    /// Returns `true` if a row was staged, `false` on a change-detection no-op / throttled write
+    /// (nothing staged, no `updated_at` bump) — or when the note is NOT LOCALLY VISIBLE, i.e. its
+    /// row is absent or tombstoned. Only a note this device can actually see earns a signal:
+    ///  - deleted → staging would take the resurrect path and drop the queued signals tombstone,
+    ///    leaking live metadata for a dead note;
+    ///  - absent → there is no `source` to derive `source_prior` from, so the row would be born at
+    ///    the unknown-source fallback and pinned there (nothing re-derives a stored prior — SUR-956,
+    ///    v0.9.1), permanently under-scoring the note in [`compute_importance`].
+    ///
+    /// A signal for a note the host cannot render is near-unreachable in practice, and signals are
+    /// cheap and repeat, so dropping one racing an unsynced note costs nothing next to storing a
+    /// wrong prior forever.
+    pub fn record_note_signal(
+        &self,
+        note_id: String,
+        kind: NoteSignalKind,
+    ) -> Result<bool, SyncError> {
+        let store = lock!(self.store);
+        let now = epoch_ms();
+        let note = store.get_row("notes", &note_id).map_err(store_err)?;
+        // ONLY A LOCALLY-VISIBLE NOTE EARNS A SIGNAL. Two different leaks close on this one guard:
+        //
+        //  - DELETED: a late callback landing after the host's delete would take the resurrect path
+        //    (`was_live == false` always stages) and `stage_local_writes` would drop the queued
+        //    tombstone — live signal metadata for a dead note.
+        //  - ABSENT: with no note there is no `source`, so the row would be born at the
+        //    unknown-source fallback. Nothing re-derives a stored prior (SUR-956's "stored prior
+        //    kept, not re-derived", v0.9.1), so `handwritten` (0.9), `share` (0.75) and `manual`
+        //    (0.7) notes would sit at 0.5 forever, under-scored by `compute_importance`.
+        //
+        // Refusing the absent case is what lets the prior stay a plain read. The alternative — birth
+        // at a sentinel and heal later — cannot work: a stored 0.5 is genuinely ambiguous (a
+        // `readwise` note derives 0.5, and an import or the blind `enqueue_note_signals` FFI can
+        // write a real 0.5 onto a note whose source derives higher), so healing on the value would
+        // overwrite legitimate priors and break the very invariant it was protecting.
+        //
+        // Same-device only, and deliberately so: it does not close the leak fleet-wide. A device
+        // that has not yet pulled a tombstone still holds a LIVE local row whose signal wins on
+        // whole-row LWW. Retiring those needs a post-pull signals reconciliation pass (none exists).
+        let Some(note) = note.filter(|r| !matches!(r.get("deleted"), Some(Value::Bool(true))))
+        else {
+            return Ok(false);
+        };
+        let note_source = note
+            .get("source")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let write =
+            self.stage_signal_write(&store, &note_id, note_source.as_deref(), now, |s| {
+                match kind {
+                    NoteSignalKind::Exposure => {
+                        // Throttle: skip when exposed within the window. Treat an absent/epoch stamp as
+                        // "never exposed" (cold start) so the first real Exposure always writes.
+                        let never_exposed = s.exposure_recency_at <= 0;
+                        if never_exposed
+                            || now.saturating_sub(s.exposure_recency_at) >= SIGNAL_THROTTLE_MS
+                        {
+                            s.exposure_recency_at = now;
+                        }
+                    }
+                    NoteSignalKind::Engagement => s.engagement_recency_at = now,
+                    NoteSignalKind::ReturnVisit => {
+                        s.return_visits += 1;
+                        s.exposure_recency_at = now;
+                    }
+                }
+            })?;
+        match write {
+            Some(sig) => {
+                store
+                    .stage_local_writes(vec![("note_signals", note_id.clone(), sig)], now)
+                    .map_err(store_err)?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Tombstone a note's `note_signals` row on note delete (SUR-966), mirroring the surfc oracle.
+    /// ALWAYS stages a tombstone even when this device has NO local signals row (a birth row is
+    /// local-only, and another device may hold a live cloud row from its own bump), so the delete
+    /// tears that cross-device row down instead of leaking it as orphaned metadata. A repeat call on
+    /// an already-tombstoned row is a no-op (no `updated_at` churn).
+    ///
+    /// The tombstone carries the stored row's full shape — or birth defaults when absent — NOT a
+    /// bare `{note_id, deleted}`: `note_signals` has no sparse-PATCH flush fallback (only `notes`
+    /// does — `push.rs`), so a minimal payload would risk a NOT-NULL upsert reject that wedges the
+    /// outbox (the SUR-942 note_links lesson). Staged through the plain `stage_local_writes` path,
+    /// which stages a `deleted: true` write unconditionally (no existing-live precondition), so the
+    /// no-local-row tombstone is never silently dropped.
+    pub fn soft_delete_signals_for_note(&self, note_id: String) -> Result<(), SyncError> {
+        let store = lock!(self.store);
+        let now = epoch_ms();
+        let existing = store.get_row("note_signals", &note_id).map_err(store_err)?;
+        if existing
+            .as_ref()
+            .is_some_and(|s| matches!(s.get("deleted"), Some(Value::Bool(true))))
+        {
+            return Ok(()); // already tombstoned locally — don't churn the outbox / bump updated_at
+        }
+        let note_source = store
+            .get_row("notes", &note_id)
+            .map_err(store_err)?
+            .and_then(|r| r.get("source").and_then(Value::as_str).map(str::to_string));
+        let row = existing.unwrap_or_default();
+        let int_or =
+            |field: &str, default: i64| row.get(field).and_then(Value::as_i64).unwrap_or(default);
+        let prior = row
+            .get("source_prior")
+            .and_then(Value::as_f64)
+            .unwrap_or_else(|| source_prior(note_source.as_deref()));
+        let return_visits = int_or("return_visits", 0);
+        let stitch_spawns = int_or("stitch_spawns", 0);
+        let has_annotation = matches!(row.get("has_annotation"), Some(Value::Bool(true)));
+        let mut tomb = Map::new();
+        tomb.insert("note_id".into(), json!(note_id));
+        tomb.insert("source_prior".into(), json!(prior));
+        tomb.insert("return_visits".into(), json!(return_visits));
+        tomb.insert("has_annotation".into(), json!(has_annotation));
+        tomb.insert("stitch_spawns".into(), json!(stitch_spawns));
+        tomb.insert(
+            "exposure_recency_at".into(),
+            json!(int_or("exposure_recency_at", 0)),
+        );
+        tomb.insert(
+            "engagement_recency_at".into(),
+            json!(int_or("engagement_recency_at", 0)),
+        );
+        tomb.insert(
+            "importance".into(),
+            json!(compute_importance(
+                prior,
+                return_visits,
+                has_annotation,
+                stitch_spawns
+            )),
+        );
+        tomb.insert("created_at".into(), json!(int_or("created_at", now)));
+        tomb.insert("updated_at".into(), json!(now));
+        tomb.insert("deleted".into(), json!(true));
+        store
+            .stage_local_writes(vec![("note_signals", note_id.clone(), tomb)], now)
+            .map_err(store_err)?;
+        Ok(())
     }
 
     /// Enqueue a lens upsert (SUR-726) — ONE authored query. Plaintext; `leaf_ids` is a cloud
@@ -1472,6 +1642,101 @@ impl SyncEngine {
 }
 
 impl SyncEngine {
+    /// Read-merge-stage a `note_signals` row (SUR-966; extracted verbatim from SUR-956's inline
+    /// margins block so `replace_handwritten_annotations` and `record_note_signal` share ONE
+    /// read-merge-stage — the FFI has no signals read-back, so this math cannot live host-side
+    /// without clobbering earned counters). Reads the stored row (or births defaults with
+    /// `source_prior` derived from `note_source`), applies `mutate` to the counters, recomputes
+    /// `importance`, and returns the WHOLE row to stage (`deleted: false`) — or `None` when nothing
+    /// moved on a LIVE row (the PWA `applyNoteSignal` change-detection no-op: no `updated_at` bump,
+    /// no outbox churn). A tombstoned or absent row always stages (birth/resurrect): the caller's
+    /// live `deleted: false` write drops any queued tombstone (the [`Store::stage_local_writes`]
+    /// resurrect rule). The caller pushes the returned map into its own `stage_local_writes` batch,
+    /// so the margins op keeps staging the signals row in the SAME transaction as its children.
+    fn stage_signal_write(
+        &self,
+        store: &Store,
+        note_id: &str,
+        note_source: Option<&str>,
+        now: i64,
+        mutate: impl FnOnce(&mut SignalState),
+    ) -> Result<Option<Map<String, Value>>, SyncError> {
+        let existing = store.get_row("note_signals", note_id).map_err(store_err)?;
+        let was_live = existing
+            .as_ref()
+            .is_some_and(|s| !matches!(s.get("deleted"), Some(Value::Bool(true))));
+        let row = existing.unwrap_or_default();
+        let int_or =
+            |field: &str, default: i64| row.get(field).and_then(Value::as_i64).unwrap_or(default);
+        // Stored columns verbatim, or birth defaults (`freshNoteSignals`): prior from the note's
+        // `source`, zeroed counters. `created_at` is preserved (or born now) around the mutation.
+        //
+        // `source_prior` is a PLAIN READ: stored verbatim, or derived at birth from the note's
+        // `source`. Nothing re-derives it afterwards — SUR-956's "stored prior kept, not
+        // re-derived" invariant (v0.9.1). That is only safe because both callers refuse a note they
+        // cannot see (`record_note_signal`'s visibility guard, `replace_handwritten_annotations`'
+        // live-parent requirement), so a row can never be born at the unknown-source fallback and
+        // then be stuck there. Do NOT relax either guard without revisiting this line.
+        //
+        // `before` MIRRORS THE STORED ROW, verbatim. Nothing derived belongs here: the no-op check
+        // below compares against it to decide whether the persisted row already says what we are
+        // about to write, so anything computed into `before` is a change that silently cannot be
+        // detected.
+        //
+        // NOTE: `importance` is deliberately NOT a `SignalState` field — it is staged below but
+        // rides OUTSIDE change-detection, which is sound only because it is a pure function of
+        // fields that are inside it. A stored `importance` that disagrees with the formula (the
+        // blind `enqueue_note_signals` FFI takes one as an argument) is therefore pinned wrong on a
+        // live row by the same mechanism.
+        let before = SignalState {
+            source_prior: row
+                .get("source_prior")
+                .and_then(Value::as_f64)
+                .unwrap_or_else(|| source_prior(note_source)),
+            return_visits: int_or("return_visits", 0),
+            has_annotation: matches!(row.get("has_annotation"), Some(Value::Bool(true))),
+            stitch_spawns: int_or("stitch_spawns", 0),
+            exposure_recency_at: int_or("exposure_recency_at", 0),
+            engagement_recency_at: int_or("engagement_recency_at", 0),
+        };
+        let created_at = int_or("created_at", now);
+        let mut after = before.clone();
+        mutate(&mut after);
+        // Change-detection no-op: a LIVE row the mutation left byte-identical stages nothing (an
+        // Exposure inside the throttle window, a repeat of an already-set flag). A tombstoned or
+        // absent row (`!was_live`) always stages — the resurrect/birth path.
+        if was_live && after == before {
+            return Ok(None);
+        }
+        let mut sig = Map::new();
+        sig.insert("note_id".into(), json!(note_id));
+        sig.insert("source_prior".into(), json!(after.source_prior));
+        sig.insert("return_visits".into(), json!(after.return_visits));
+        sig.insert("has_annotation".into(), json!(after.has_annotation));
+        sig.insert("stitch_spawns".into(), json!(after.stitch_spawns));
+        sig.insert(
+            "exposure_recency_at".into(),
+            json!(after.exposure_recency_at),
+        );
+        sig.insert(
+            "engagement_recency_at".into(),
+            json!(after.engagement_recency_at),
+        );
+        sig.insert(
+            "importance".into(),
+            json!(compute_importance(
+                after.source_prior,
+                after.return_visits,
+                after.has_annotation,
+                after.stitch_spawns,
+            )),
+        );
+        sig.insert("created_at".into(), json!(created_at));
+        sig.insert("updated_at".into(), json!(now));
+        sig.insert("deleted".into(), json!(false));
+        Ok(Some(sig))
+    }
+
     /// Offline-first (§4): stage a local write to BOTH the synced table and the outbox — the local
     /// synced row first (so a read, and pull's LWW compare, see it immediately), then the outbox
     /// (so a later flush pushes it). Both hit SQLite before any cloud call. Mirrors the PWA writing
@@ -4037,7 +4302,10 @@ mod tests {
         assert_eq!(sig["return_visits"], json!(0));
         assert_eq!(sig["stitch_spawns"], json!(0));
         assert_eq!(sig["exposure_recency_at"], json!(0));
-        assert_eq!(sig["engagement_recency_at"], json!(0));
+        assert!(
+            sig["engagement_recency_at"].as_i64().unwrap() > 0,
+            "SUR-966: the margins op is a deliberate act — it bumps engagement_recency_at to now"
+        );
         assert_eq!(
             sig["source_prior"],
             json!(0.7),
@@ -4086,7 +4354,10 @@ mod tests {
         assert_eq!(sig["return_visits"], json!(5), "earned counter preserved");
         assert_eq!(sig["stitch_spawns"], json!(2), "earned counter preserved");
         assert_eq!(sig["exposure_recency_at"], json!(111));
-        assert_eq!(sig["engagement_recency_at"], json!(222));
+        assert!(
+            sig["engagement_recency_at"].as_i64().unwrap() > 222,
+            "SUR-966: the margins op bumps engagement past the seeded stamp (earned, not clobbered elsewhere)"
+        );
         assert_eq!(
             sig["source_prior"],
             json!(0.9),
@@ -4100,9 +4371,12 @@ mod tests {
     }
 
     #[test]
-    fn replace_handwritten_annotations_already_flagged_signals_are_untouched() {
-        // PWA change-detection parity (`applyNoteSignal`'s early return): an already-annotated live
-        // row gets NO write — no `updated_at` bump, no outbox churn, zero LWW clobber exposure.
+    fn replace_handwritten_annotations_already_flagged_still_bumps_engagement() {
+        // SUR-966 regression (the widened guard): the SUR-956 no-op skipped an already-`has_annotation`
+        // live row ENTIRELY. Adding engagement inside that skip would mean an already-annotated note
+        // NEVER records margin engagement — every re-save is a genuine deliberate act. So the margins
+        // op must STILL stage an `engagement_recency_at` bump on an already-flagged row, preserving the
+        // earned counters, and enqueue the signals outbox row (engagement is never throttled).
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.sqlite");
         let db_path = db.to_str().unwrap();
@@ -4111,26 +4385,36 @@ mod tests {
         engine
             .enqueue_note_signals("p".into(), 0.9, 5, true, 2, 111, 222, 1.23, 100, false)
             .unwrap();
-        let before = stored_signals(db_path, "p").expect("seeded");
         drain_outbox(db_path);
 
         engine
             .replace_handwritten_annotations("p".into(), vec![margin("c1", "e1", "a margin")])
             .unwrap();
 
-        assert_eq!(
-            stored_signals(db_path, "p").unwrap(),
-            before,
-            "already-flagged row byte-identical — no updated_at bump"
-        );
+        let after = stored_signals(db_path, "p").expect("signals row live");
+        assert_eq!(after["has_annotation"], json!(true), "flag stays true");
         assert!(
-            !Store::open(db_path)
+            after["engagement_recency_at"].as_i64().unwrap() > 222,
+            "already-annotated note STILL gets its engagement bump (widened guard)"
+        );
+        assert_eq!(after["return_visits"], json!(5), "earned counter preserved");
+        assert_eq!(after["stitch_spawns"], json!(2), "earned counter preserved");
+        assert_eq!(
+            after["exposure_recency_at"],
+            json!(111),
+            "exposure untouched"
+        );
+        assert_eq!(after["created_at"], json!(100), "created_at preserved");
+        assert_eq!(
+            Store::open(db_path)
                 .unwrap()
                 .outbox_items()
                 .unwrap()
                 .iter()
-                .any(|(_, t, _, _, _)| t == "note_signals"),
-            "no signals outbox row enqueued"
+                .filter(|(_, t, _, _, _)| t == "note_signals")
+                .count(),
+            1,
+            "the engagement bump IS enqueued (one signals outbox row)"
         );
     }
 
@@ -4175,6 +4459,450 @@ mod tests {
                 .count(),
             1,
             "the queued tombstone was DROPPED (one live item), not merely outweighed by collapse"
+        );
+    }
+
+    // ─────────────────────────── SUR-966: record_note_signal ───────────────────────────
+
+    fn note_with_source(id: &str, source: &str) -> NoteUpsert {
+        NoteUpsert {
+            source: Some(source.into()),
+            ..note_upsert(id, "a note")
+        }
+    }
+
+    #[test]
+    fn record_note_signal_return_visit_increments_and_bumps_exposure_only() {
+        // ReturnVisit → return_visits += 1, exposure_recency_at = now, engagement UNTOUCHED
+        // (the PWA: "re-reading isn't reflection"). Earned counters on an unrelated field survive.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine
+            .enqueue_note(note_with_source("n", "manual"))
+            .unwrap();
+        engine
+            .enqueue_note_signals("n".into(), 0.7, 3, false, 2, 0, 0, 0.0, 50, false)
+            .unwrap();
+
+        assert!(engine
+            .record_note_signal("n".into(), NoteSignalKind::ReturnVisit)
+            .unwrap());
+
+        let sig = stored_signals(db_path, "n").unwrap();
+        assert_eq!(sig["return_visits"], json!(4), "return_visits incremented");
+        assert!(
+            sig["exposure_recency_at"].as_i64().unwrap() > 0,
+            "exposure bumped to now"
+        );
+        assert_eq!(
+            sig["engagement_recency_at"],
+            json!(0),
+            "engagement left untouched"
+        );
+        assert_eq!(sig["stitch_spawns"], json!(2), "earned counter preserved");
+        assert_eq!(sig["created_at"], json!(50), "created_at preserved");
+        assert!(
+            (sig["importance"].as_f64().unwrap() - compute_importance(0.7, 4, false, 2)).abs()
+                < 1e-12,
+            "importance recomputed over the new counters"
+        );
+    }
+
+    #[test]
+    fn record_note_signal_births_a_full_row_from_the_note_source() {
+        // A first signal on a note with no signals row stages a WHOLE row: source_prior derived from
+        // the note's `source`, every column populated (no server-default holes), importance matching
+        // compute_importance. Outbox row keyed by note_id, no `id` key.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine.enqueue_note(note_with_source("n", "share")).unwrap();
+
+        assert!(engine
+            .record_note_signal("n".into(), NoteSignalKind::Engagement)
+            .unwrap());
+
+        let sig = stored_signals(db_path, "n").expect("birth row staged");
+        assert_eq!(
+            sig["source_prior"],
+            json!(0.75),
+            "prior from source `share`"
+        );
+        assert_eq!(sig["return_visits"], json!(0));
+        assert_eq!(sig["has_annotation"], json!(false));
+        assert_eq!(sig["stitch_spawns"], json!(0));
+        assert_eq!(sig["exposure_recency_at"], json!(0));
+        assert!(sig["engagement_recency_at"].as_i64().unwrap() > 0);
+        assert_eq!(sig["deleted"], json!(false));
+        for col in [
+            "note_id",
+            "source_prior",
+            "return_visits",
+            "has_annotation",
+            "stitch_spawns",
+            "exposure_recency_at",
+            "engagement_recency_at",
+            "importance",
+            "created_at",
+            "updated_at",
+            "deleted",
+        ] {
+            assert!(sig.contains_key(col), "column `{col}` populated (no hole)");
+        }
+        assert!(
+            (sig["importance"].as_f64().unwrap() - compute_importance(0.75, 0, false, 0)).abs()
+                < 1e-12,
+            "importance matches compute_importance"
+        );
+
+        // Outbox row keyed by note_id, omitting `id`.
+        let items = Store::open(db_path).unwrap().outbox_items().unwrap();
+        let (_, table, record_id, payload_json, _) = items
+            .iter()
+            .find(|(_, t, _, _, _)| t == "note_signals")
+            .expect("signals outbox row queued");
+        assert_eq!(table, "note_signals");
+        assert_eq!(record_id.as_deref(), Some("n"), "keyed by note_id");
+        let payload: Value = serde_json::from_str(payload_json).unwrap();
+        assert!(payload.get("id").is_none(), "no `id` key");
+        assert_eq!(payload["note_id"], json!("n"));
+    }
+
+    #[test]
+    fn record_note_signal_exposure_throttled_within_window_stages_nothing() {
+        // Change-detection / throttle no-op: a repeat Exposure inside SIGNAL_THROTTLE_MS stages
+        // nothing, bumps no updated_at, and returns false (two calls in a test are far under 1h).
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine
+            .enqueue_note(note_with_source("n", "manual"))
+            .unwrap();
+
+        assert!(engine
+            .record_note_signal("n".into(), NoteSignalKind::Exposure)
+            .unwrap());
+        let after_first = stored_signals(db_path, "n").unwrap();
+        drain_outbox(db_path);
+
+        assert!(
+            !engine
+                .record_note_signal("n".into(), NoteSignalKind::Exposure)
+                .unwrap(),
+            "repeat Exposure within the window returns false"
+        );
+        assert_eq!(
+            stored_signals(db_path, "n").unwrap(),
+            after_first,
+            "row byte-identical — no updated_at bump"
+        );
+        assert!(
+            !Store::open(db_path)
+                .unwrap()
+                .outbox_items()
+                .unwrap()
+                .iter()
+                .any(|(_, t, _, _, _)| t == "note_signals"),
+            "no signals outbox row enqueued"
+        );
+    }
+
+    #[test]
+    fn record_note_signal_exposure_writes_on_cold_start_over_epoch_zero() {
+        // Cold start: a note whose first-ever signal is Engagement births a row with
+        // exposure_recency_at = 0. The next Exposure must NOT be suppressed by the epoch-0 throttle
+        // comparison (no unsigned underflow, no NULL short-circuit) — absent/epoch = "never exposed".
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine
+            .enqueue_note(note_with_source("n", "manual"))
+            .unwrap();
+
+        assert!(engine
+            .record_note_signal("n".into(), NoteSignalKind::Engagement)
+            .unwrap());
+        assert_eq!(
+            stored_signals(db_path, "n").unwrap()["exposure_recency_at"],
+            json!(0),
+            "birthed with an epoch-0 exposure stamp"
+        );
+
+        assert!(
+            engine
+                .record_note_signal("n".into(), NoteSignalKind::Exposure)
+                .unwrap(),
+            "cold-start Exposure writes over the epoch-0 stamp"
+        );
+        assert!(
+            stored_signals(db_path, "n").unwrap()["exposure_recency_at"]
+                .as_i64()
+                .unwrap()
+                > 0
+        );
+    }
+
+    #[test]
+    fn record_note_signal_resurrects_after_a_soft_delete_dropping_the_tombstone() {
+        // Tombstone-BEFORE-live ordering (distinct from live-write-after-tombstone): soft_delete
+        // stages a tombstone with no local row, THEN record_note_signal for the same id must drop
+        // the queued tombstone (resurrect rule) and stage a live row that flushes LIVE.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine
+            .enqueue_note(note_with_source("n", "manual"))
+            .unwrap();
+
+        engine.soft_delete_signals_for_note("n".into()).unwrap();
+        assert_eq!(
+            stored_signals(db_path, "n").unwrap()["deleted"],
+            json!(true),
+            "tombstoned first"
+        );
+
+        assert!(engine
+            .record_note_signal("n".into(), NoteSignalKind::ReturnVisit)
+            .unwrap());
+        let sig = stored_signals(db_path, "n").unwrap();
+        assert_eq!(sig["deleted"], json!(false), "resurrected live");
+        assert_eq!(sig["return_visits"], json!(1));
+        let payload =
+            collapsed_payload_for(db_path, "note_signals", "n").expect("queued signals row");
+        assert_eq!(
+            payload["deleted"],
+            json!(false),
+            "what flushes is LIVE — the queued tombstone was dropped"
+        );
+        assert_eq!(
+            Store::open(db_path)
+                .unwrap()
+                .outbox_items()
+                .unwrap()
+                .iter()
+                .filter(|(_, t, _, _, _)| t == "note_signals")
+                .count(),
+            1,
+            "the queued tombstone was DROPPED (one live item)"
+        );
+    }
+
+    #[test]
+    fn record_note_signal_on_a_deleted_note_is_a_no_op_and_keeps_the_tombstone_queued() {
+        // The delete/callback race: the host deletes the note and tombstones its signals row, THEN
+        // a late exposure/engagement callback fires. Without the deleted-note guard this takes the
+        // resurrect path (a tombstoned row always stages) and `stage_local_writes` DROPS the queued
+        // tombstone — leaving live signal metadata for a dead note, and losing the retirement.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine
+            .enqueue_note(note_with_source("n", "manual"))
+            .unwrap();
+        engine
+            .record_note_signal("n".into(), NoteSignalKind::ReturnVisit)
+            .unwrap();
+
+        // Host deletes the note, then retires its signals row.
+        let mut tomb = Map::new();
+        tomb.insert("id".into(), json!("n"));
+        tomb.insert("deleted".into(), json!(true));
+        tomb.insert("updated_at".into(), json!(epoch_ms()));
+        Store::open(db_path)
+            .unwrap()
+            .stage_local_writes(vec![("notes", "n".into(), tomb)], epoch_ms())
+            .unwrap();
+        engine.soft_delete_signals_for_note("n".into()).unwrap();
+
+        // Every kind is a no-op — none of them may resurrect the row.
+        for kind in [
+            NoteSignalKind::Exposure,
+            NoteSignalKind::Engagement,
+            NoteSignalKind::ReturnVisit,
+        ] {
+            assert!(
+                !engine.record_note_signal("n".into(), kind).unwrap(),
+                "a signal on a locally-deleted note stages nothing"
+            );
+        }
+
+        assert_eq!(
+            stored_signals(db_path, "n").unwrap()["deleted"],
+            json!(true),
+            "signals row stays tombstoned"
+        );
+        let payload =
+            collapsed_payload_for(db_path, "note_signals", "n").expect("queued signals row");
+        assert_eq!(
+            payload["deleted"],
+            json!(true),
+            "what flushes is still the TOMBSTONE — it was not dropped by a resurrect"
+        );
+    }
+
+    #[test]
+    fn record_note_signal_keeps_a_real_stored_prior_when_the_note_is_visible() {
+        // SUR-956's "stored prior kept, not re-derived" invariant (v0.9.1): a stored prior is kept
+        // verbatim even when the visible note's `source` would derive a different number.
+        //
+        // 0.5 is asserted DELIBERATELY, and is the sharper half. A stored 0.5 is a legitimate value
+        // — `readwise` derives it, and an import or the blind `enqueue_note_signals` FFI can write
+        // it onto a note whose source derives higher. Any scheme that treated 0.5 as an
+        // "unknown source" sentinel and re-derived it would silently overwrite a real prior here.
+        for (seeded, source) in [(0.9_f64, "manual"), (0.5_f64, "handwritten")] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("t.sqlite");
+            let db_path = db.to_str().unwrap();
+            let engine = engine_at(db_path);
+            engine.enqueue_note(note_with_source("n", source)).unwrap();
+            engine
+                .enqueue_note_signals("n".into(), seeded, 0, false, 0, 0, 0, 0.0, 100, false)
+                .unwrap();
+
+            assert!(engine
+                .record_note_signal("n".into(), NoteSignalKind::Engagement)
+                .unwrap());
+            assert_eq!(
+                stored_signals(db_path, "n").unwrap()["source_prior"],
+                json!(seeded),
+                "a real stored prior is never re-derived (seeded {seeded} on a `{source}` note)"
+            );
+        }
+    }
+
+    #[test]
+    fn record_note_signal_on_an_absent_note_is_a_no_op_and_stages_nothing() {
+        // ABSENT is refused for a different reason than DELETED: with no note there is no `source`,
+        // so the row would be born at the unknown-source fallback (0.5) — and nothing re-derives a
+        // stored prior (SUR-956), so `handwritten`/`share`/`manual` notes would sit under-scored
+        // forever. Healing later cannot fix it either: a stored 0.5 is ambiguous (a `readwise` note
+        // derives 0.5, and imports / the blind `enqueue_note_signals` FFI can write a real 0.5), so
+        // healing on the value would overwrite legitimate priors. Refusing the birth is the fix.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+
+        for kind in [
+            NoteSignalKind::Exposure,
+            NoteSignalKind::Engagement,
+            NoteSignalKind::ReturnVisit,
+        ] {
+            assert!(
+                !engine
+                    .record_note_signal("never-synced".into(), kind)
+                    .unwrap(),
+                "a signal on a note this device cannot see stages nothing"
+            );
+        }
+        assert!(
+            stored_signals(db_path, "never-synced").is_none(),
+            "no signals row was born at the unknown-source fallback"
+        );
+        assert_eq!(
+            Store::open(db_path).unwrap().outbox_items().unwrap().len(),
+            0,
+            "nothing queued for the fleet either"
+        );
+    }
+
+    #[test]
+    fn record_note_signal_births_the_real_prior_once_the_note_is_visible() {
+        // The other half of refusing the absent case: the signal that lands AFTER the note syncs
+        // down births the row with the note's real prior, so nothing is stuck at the fallback.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+
+        assert!(!engine
+            .record_note_signal("n".into(), NoteSignalKind::ReturnVisit)
+            .unwrap());
+        engine
+            .enqueue_note(note_with_source("n", "handwritten"))
+            .unwrap();
+        assert!(engine
+            .record_note_signal("n".into(), NoteSignalKind::ReturnVisit)
+            .unwrap());
+
+        let sig = stored_signals(db_path, "n").expect("row born once the note is visible");
+        assert_eq!(
+            sig["source_prior"],
+            json!(0.9),
+            "born at the note's real prior, never the fallback"
+        );
+        assert_eq!(
+            sig["return_visits"],
+            json!(1),
+            "only the landed signal counts"
+        );
+    }
+
+    #[test]
+    fn soft_delete_signals_for_note_stages_tombstone_with_no_local_row_then_no_ops() {
+        // The manifest cross-device tail: ALWAYS stage a tombstone even with no local row (another
+        // device may hold a live cloud row). Full-shape (no NOT-NULL holes, no PATCH fallback for
+        // note_signals). A second call is a no-op.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+
+        engine.soft_delete_signals_for_note("ghost".into()).unwrap();
+        let tomb = stored_signals(db_path, "ghost").expect("tombstone staged with no local row");
+        assert_eq!(tomb["deleted"], json!(true));
+        for col in [
+            "note_id",
+            "source_prior",
+            "return_visits",
+            "has_annotation",
+            "stitch_spawns",
+            "exposure_recency_at",
+            "engagement_recency_at",
+            "importance",
+            "created_at",
+            "updated_at",
+            "deleted",
+        ] {
+            assert!(
+                tomb.contains_key(col),
+                "full-shape tombstone: `{col}` present"
+            );
+        }
+        let (_, table, record_id, payload_json, _) = only_row(db_path);
+        assert_eq!(table, "note_signals");
+        assert_eq!(record_id.as_deref(), Some("ghost"), "keyed by note_id");
+        assert!(
+            serde_json::from_str::<Value>(&payload_json)
+                .unwrap()
+                .get("id")
+                .is_none(),
+            "no `id` key"
+        );
+
+        engine.soft_delete_signals_for_note("ghost".into()).unwrap();
+        assert_eq!(
+            stored_signals(db_path, "ghost").unwrap(),
+            tomb,
+            "second call is a no-op — row byte-identical, no updated_at churn"
+        );
+        assert_eq!(
+            Store::open(db_path)
+                .unwrap()
+                .outbox_items()
+                .unwrap()
+                .iter()
+                .filter(|(_, t, _, _, _)| t == "note_signals")
+                .count(),
+            1,
+            "no new outbox row on the repeat call"
         );
     }
 
