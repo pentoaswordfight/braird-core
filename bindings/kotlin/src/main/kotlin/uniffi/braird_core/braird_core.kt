@@ -1223,7 +1223,7 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_note_link() != 53465.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_note_signals() != 33526.toShort()) {
+    if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_note_signals() != 65282.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_export_snapshot() != 42276.toShort()) {
@@ -1893,6 +1893,11 @@ public interface SyncEngineInterface {
      * CONTRACT (mirror of surfc's `ensureNoteSignals`): hosts must NOT enqueue a fresh "birth" row.
      * A birth row is local-only lazy-init; pushing one would clobber another device's earned counters
      * under whole-row LWW. Enqueue only on a genuine behavioural change.
+     *
+     * `source_prior` and `importance` must be FINITE (SUR-977): `json!` cannot represent a
+     * non-finite f64, so NaN/±inf would be silently laundered to a stored JSON null — which a
+     * later signal must then heal (importance) or derive around (prior). Rejecting at this trust
+     * boundary keeps the stored row numeric, the same posture the import path already takes.
      */
     fun `enqueueNoteSignals`(`noteId`: kotlin.String, `sourcePrior`: kotlin.Double, `returnVisits`: kotlin.Long, `hasAnnotation`: kotlin.Boolean, `stitchSpawns`: kotlin.Long, `exposureRecencyAt`: kotlin.Long, `engagementRecencyAt`: kotlin.Long, `importance`: kotlin.Double, `createdAt`: kotlin.Long, `deleted`: kotlin.Boolean)
     
@@ -2548,6 +2553,11 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
      * CONTRACT (mirror of surfc's `ensureNoteSignals`): hosts must NOT enqueue a fresh "birth" row.
      * A birth row is local-only lazy-init; pushing one would clobber another device's earned counters
      * under whole-row LWW. Enqueue only on a genuine behavioural change.
+     *
+     * `source_prior` and `importance` must be FINITE (SUR-977): `json!` cannot represent a
+     * non-finite f64, so NaN/±inf would be silently laundered to a stored JSON null — which a
+     * later signal must then heal (importance) or derive around (prior). Rejecting at this trust
+     * boundary keeps the stored row numeric, the same posture the import path already takes.
      */
     @Throws(SyncException::class)override fun `enqueueNoteSignals`(`noteId`: kotlin.String, `sourcePrior`: kotlin.Double, `returnVisits`: kotlin.Long, `hasAnnotation`: kotlin.Boolean, `stitchSpawns`: kotlin.Long, `exposureRecencyAt`: kotlin.Long, `engagementRecencyAt`: kotlin.Long, `importance`: kotlin.Double, `createdAt`: kotlin.Long, `deleted`: kotlin.Boolean)
         = 

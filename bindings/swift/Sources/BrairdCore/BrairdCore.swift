@@ -690,6 +690,11 @@ public protocol SyncEngineProtocol : AnyObject {
      * CONTRACT (mirror of surfc's `ensureNoteSignals`): hosts must NOT enqueue a fresh "birth" row.
      * A birth row is local-only lazy-init; pushing one would clobber another device's earned counters
      * under whole-row LWW. Enqueue only on a genuine behavioural change.
+     *
+     * `source_prior` and `importance` must be FINITE (SUR-977): `json!` cannot represent a
+     * non-finite f64, so NaN/±inf would be silently laundered to a stored JSON null — which a
+     * later signal must then heal (importance) or derive around (prior). Rejecting at this trust
+     * boundary keeps the stored row numeric, the same posture the import path already takes.
      */
     func enqueueNoteSignals(noteId: String, sourcePrior: Double, returnVisits: Int64, hasAnnotation: Bool, stitchSpawns: Int64, exposureRecencyAt: Int64, engagementRecencyAt: Int64, importance: Double, createdAt: Int64, deleted: Bool) throws 
     
@@ -1298,6 +1303,11 @@ open func enqueueNoteLink(id: String, fromNoteId: String, toNoteId: String, rela
      * CONTRACT (mirror of surfc's `ensureNoteSignals`): hosts must NOT enqueue a fresh "birth" row.
      * A birth row is local-only lazy-init; pushing one would clobber another device's earned counters
      * under whole-row LWW. Enqueue only on a genuine behavioural change.
+     *
+     * `source_prior` and `importance` must be FINITE (SUR-977): `json!` cannot represent a
+     * non-finite f64, so NaN/±inf would be silently laundered to a stored JSON null — which a
+     * later signal must then heal (importance) or derive around (prior). Rejecting at this trust
+     * boundary keeps the stored row numeric, the same posture the import path already takes.
      */
 open func enqueueNoteSignals(noteId: String, sourcePrior: Double, returnVisits: Int64, hasAnnotation: Bool, stitchSpawns: Int64, exposureRecencyAt: Int64, engagementRecencyAt: Int64, importance: Double, createdAt: Int64, deleted: Bool)throws  {try rustCallWithError(FfiConverterTypeSyncError.lift) {
     uniffi_braird_core_fn_method_syncengine_enqueue_note_signals(self.uniffiClonePointer(),
@@ -5346,7 +5356,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_braird_core_checksum_method_syncengine_enqueue_note_link() != 53465) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_braird_core_checksum_method_syncengine_enqueue_note_signals() != 33526) {
+    if (uniffi_braird_core_checksum_method_syncengine_enqueue_note_signals() != 65282) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_export_snapshot() != 42276) {
