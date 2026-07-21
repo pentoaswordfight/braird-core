@@ -1217,7 +1217,7 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_lens() != 60504.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_note() != 9431.toShort()) {
+    if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_note() != 65440.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_note_link() != 53465.toShort()) {
@@ -1295,7 +1295,7 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_braird_core_checksum_method_syncengine_set_access_token() != 47386.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_braird_core_checksum_method_syncengine_soft_delete_signals_for_note() != 14715.toShort()) {
+    if (lib.uniffi_braird_core_checksum_method_syncengine_soft_delete_signals_for_note() != 25771.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_sync() != 38790.toShort()) {
@@ -1834,6 +1834,14 @@ public interface SyncEngineInterface {
      * treat that typed error as a normal per-note race, skip the note, and re-query their live
      * work list. Column NAMES mirror `upsertNote` in surfc `src/supabase.js` exactly.
      *
+     * ATOMIC SIGNALS RETIRE (SUR-975): a `deleted: true` write — either path — also stages the
+     * note's `note_signals` tombstone (the same full-shape tombstone
+     * [`SyncEngine::soft_delete_signals_for_note`] stages) in the SAME transaction, so a note
+     * tombstone can never commit with its signals tombstone unqueued — the two-separate-calls
+     * crash window this closes. Already-tombstoned signals stage nothing (no `updated_at`
+     * churn), so a host still calling `soft_delete_signals_for_note` afterwards double-stages
+     * nothing. Live writes (`deleted: false`) never touch `note_signals` here.
+     *
      * WIDENED (SUR-741). Carries the full authoring surface: `source`/`source_id`/`source_meta`/
      * `chapter`/`image_path`/`ink_crop_path`. `source_meta_json` takes a serialized JSON **object**
      * string for the `source_meta` jsonb column — the `…Json` suffix is the stated convention for any
@@ -2157,12 +2165,15 @@ public interface SyncEngineInterface {
      * tears that cross-device row down instead of leaking it as orphaned metadata. A repeat call on
      * an already-tombstoned row is a no-op (no `updated_at` churn).
      *
-     * The tombstone carries the stored row's full shape — or birth defaults when absent — NOT a
-     * bare `{note_id, deleted}`: `note_signals` has no sparse-PATCH flush fallback (only `notes`
-     * does — `push.rs`), so a minimal payload would risk a NOT-NULL upsert reject that wedges the
-     * outbox (the SUR-942 note_links lesson). Staged through the plain `stage_local_writes` path,
-     * which stages a `deleted: true` write unconditionally (no existing-live precondition), so the
-     * no-local-row tombstone is never silently dropped.
+     * Since SUR-975 an ordinary note delete no longer needs this call: `enqueue_note` with
+     * `deleted: true` stages the same tombstone (built by [`SyncEngine::build_signals_tombstone`])
+     * in the note tombstone's own transaction. This stays exported for the case `enqueue_note`
+     * cannot cover — retiring signals for a note this device holds NO row for (the cross-device
+     * rule) — and as the no-op-safe second half of the legacy two-call sequence.
+     *
+     * Staged through the plain `stage_local_writes` path, which stages a `deleted: true` write
+     * unconditionally (no existing-live precondition), so the no-local-row tombstone is never
+     * silently dropped.
      */
     fun `softDeleteSignalsForNote`(`noteId`: kotlin.String)
     
@@ -2452,6 +2463,14 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
      * already-tombstoned target returns [`SyncError::PatchTargetMissing`]. Bulk patch hosts should
      * treat that typed error as a normal per-note race, skip the note, and re-query their live
      * work list. Column NAMES mirror `upsertNote` in surfc `src/supabase.js` exactly.
+     *
+     * ATOMIC SIGNALS RETIRE (SUR-975): a `deleted: true` write — either path — also stages the
+     * note's `note_signals` tombstone (the same full-shape tombstone
+     * [`SyncEngine::soft_delete_signals_for_note`] stages) in the SAME transaction, so a note
+     * tombstone can never commit with its signals tombstone unqueued — the two-separate-calls
+     * crash window this closes. Already-tombstoned signals stage nothing (no `updated_at`
+     * churn), so a host still calling `soft_delete_signals_for_note` afterwards double-stages
+     * nothing. Live writes (`deleted: false`) never touch `note_signals` here.
      *
      * WIDENED (SUR-741). Carries the full authoring surface: `source`/`source_id`/`source_meta`/
      * `chapter`/`image_path`/`ink_crop_path`. `source_meta_json` takes a serialized JSON **object**
@@ -3057,12 +3076,15 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
      * tears that cross-device row down instead of leaking it as orphaned metadata. A repeat call on
      * an already-tombstoned row is a no-op (no `updated_at` churn).
      *
-     * The tombstone carries the stored row's full shape — or birth defaults when absent — NOT a
-     * bare `{note_id, deleted}`: `note_signals` has no sparse-PATCH flush fallback (only `notes`
-     * does — `push.rs`), so a minimal payload would risk a NOT-NULL upsert reject that wedges the
-     * outbox (the SUR-942 note_links lesson). Staged through the plain `stage_local_writes` path,
-     * which stages a `deleted: true` write unconditionally (no existing-live precondition), so the
-     * no-local-row tombstone is never silently dropped.
+     * Since SUR-975 an ordinary note delete no longer needs this call: `enqueue_note` with
+     * `deleted: true` stages the same tombstone (built by [`SyncEngine::build_signals_tombstone`])
+     * in the note tombstone's own transaction. This stays exported for the case `enqueue_note`
+     * cannot cover — retiring signals for a note this device holds NO row for (the cross-device
+     * rule) — and as the no-op-safe second half of the legacy two-call sequence.
+     *
+     * Staged through the plain `stage_local_writes` path, which stages a `deleted: true` write
+     * unconditionally (no existing-live precondition), so the no-local-row tombstone is never
+     * silently dropped.
      */
     @Throws(SyncException::class)override fun `softDeleteSignalsForNote`(`noteId`: kotlin.String)
         = 

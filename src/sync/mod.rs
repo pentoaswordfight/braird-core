@@ -393,6 +393,14 @@ impl SyncEngine {
     /// treat that typed error as a normal per-note race, skip the note, and re-query their live
     /// work list. Column NAMES mirror `upsertNote` in surfc `src/supabase.js` exactly.
     ///
+    /// ATOMIC SIGNALS RETIRE (SUR-975): a `deleted: true` write — either path — also stages the
+    /// note's `note_signals` tombstone (the same full-shape tombstone
+    /// [`SyncEngine::soft_delete_signals_for_note`] stages) in the SAME transaction, so a note
+    /// tombstone can never commit with its signals tombstone unqueued — the two-separate-calls
+    /// crash window this closes. Already-tombstoned signals stage nothing (no `updated_at`
+    /// churn), so a host still calling `soft_delete_signals_for_note` afterwards double-stages
+    /// nothing. Live writes (`deleted: false`) never touch `note_signals` here.
+    ///
     /// WIDENED (SUR-741). Carries the full authoring surface: `source`/`source_id`/`source_meta`/
     /// `chapter`/`image_path`/`ink_crop_path`. `source_meta_json` takes a serialized JSON **object**
     /// string for the `source_meta` jsonb column — the `…Json` suffix is the stated convention for any
@@ -487,6 +495,24 @@ impl SyncEngine {
                     json!(source.unwrap_or_else(|| "manual".into())),
                 );
                 row.insert("created_at".into(), json!(created_at));
+                if deleted {
+                    // SUR-975: the note tombstone and its signals tombstone commit together.
+                    // The full write always has a real `source` in hand (explicit or the
+                    // "manual" default) — pass it so a tombstone born here seeds the true
+                    // prior, never the unknown-source fallback.
+                    let store = lock!(self.store);
+                    let note_source = row
+                        .get("source")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    let mut writes = vec![("notes", id.clone(), row)];
+                    if let Some(tomb) =
+                        self.build_signals_tombstone(&store, &id, note_source.as_deref(), now)?
+                    {
+                        writes.push(("note_signals", id.clone(), tomb));
+                    }
+                    return store.stage_local_writes(writes, now).map_err(store_err);
+                }
                 self.stage_write("notes", &id, row)
             }
             None => {
@@ -501,7 +527,7 @@ impl SyncEngine {
                     ));
                 }
                 insert_opt(&mut row, "source", source);
-                self.stage_existing_live_note_patch(&id, row)
+                self.stage_existing_live_note_patch(&id, row, deleted)
             }
         }
     }
@@ -1049,80 +1075,28 @@ impl SyncEngine {
     /// tears that cross-device row down instead of leaking it as orphaned metadata. A repeat call on
     /// an already-tombstoned row is a no-op (no `updated_at` churn).
     ///
-    /// The tombstone carries the stored row's full shape — or birth defaults when absent — NOT a
-    /// bare `{note_id, deleted}`: `note_signals` has no sparse-PATCH flush fallback (only `notes`
-    /// does — `push.rs`), so a minimal payload would risk a NOT-NULL upsert reject that wedges the
-    /// outbox (the SUR-942 note_links lesson). Staged through the plain `stage_local_writes` path,
-    /// which stages a `deleted: true` write unconditionally (no existing-live precondition), so the
-    /// no-local-row tombstone is never silently dropped.
+    /// Since SUR-975 an ordinary note delete no longer needs this call: `enqueue_note` with
+    /// `deleted: true` stages the same tombstone (built by [`SyncEngine::build_signals_tombstone`])
+    /// in the note tombstone's own transaction. This stays exported for the case `enqueue_note`
+    /// cannot cover — retiring signals for a note this device holds NO row for (the cross-device
+    /// rule) — and as the no-op-safe second half of the legacy two-call sequence.
+    ///
+    /// Staged through the plain `stage_local_writes` path, which stages a `deleted: true` write
+    /// unconditionally (no existing-live precondition), so the no-local-row tombstone is never
+    /// silently dropped.
     pub fn soft_delete_signals_for_note(&self, note_id: String) -> Result<(), SyncError> {
         let store = lock!(self.store);
         let now = epoch_ms();
-        let existing = store.get_row("note_signals", &note_id).map_err(store_err)?;
-        if existing
-            .as_ref()
-            .is_some_and(|s| matches!(s.get("deleted"), Some(Value::Bool(true))))
-        {
-            return Ok(()); // already tombstoned locally — don't churn the outbox / bump updated_at
-        }
         let note_source = store
             .get_row("notes", &note_id)
             .map_err(store_err)?
             .and_then(|r| r.get("source").and_then(Value::as_str).map(str::to_string));
-        let row = existing.unwrap_or_default();
-        let int_or =
-            |field: &str, default: i64| row.get(field).and_then(Value::as_i64).unwrap_or(default);
-        // ACCEPTED: with no local signals row AND no local note row, this fabricates the
-        // unknown-source fallback — and that value is not inert. The tombstone IS a local row, so a
-        // later resurrect (`stage_signal_write`'s `!was_live` path) reads this prior VERBATIM;
-        // nothing re-derives it. A `handwritten` note that gets retired here and later arrives live
-        // therefore resurrects pinned at 0.5, under-scored in `compute_importance` and pushed
-        // fleet-wide over whole-row LWW.
-        //
-        // Not fixable by refusing, the way `record_note_signal` refuses: the cross-device contract
-        // REQUIRES staging a tombstone even with no local row (another device may hold a live cloud
-        // row from its own bump), and the flush shape has no room to omit the column. Reaching it is
-        // narrow — the host must retire signals for a note it holds no row for, whereas an ordinary
-        // delete reads the tombstoned note's `source` fine (the lookup above deliberately omits the
-        // `deleted` filter). Tracked as part of SUR-976. Pinned by
-        // `soft_delete_with_no_note_row_seeds_the_fallback_prior_for_a_later_resurrect`.
-        let prior = row
-            .get("source_prior")
-            .and_then(Value::as_f64)
-            .unwrap_or_else(|| source_prior(note_source.as_deref()));
-        let return_visits = int_or("return_visits", 0);
-        let stitch_spawns = int_or("stitch_spawns", 0);
-        let has_annotation = matches!(row.get("has_annotation"), Some(Value::Bool(true)));
-        let mut tomb = Map::new();
-        tomb.insert("note_id".into(), json!(note_id));
-        tomb.insert("source_prior".into(), json!(prior));
-        tomb.insert("return_visits".into(), json!(return_visits));
-        tomb.insert("has_annotation".into(), json!(has_annotation));
-        tomb.insert("stitch_spawns".into(), json!(stitch_spawns));
-        tomb.insert(
-            "exposure_recency_at".into(),
-            json!(int_or("exposure_recency_at", 0)),
-        );
-        tomb.insert(
-            "engagement_recency_at".into(),
-            json!(int_or("engagement_recency_at", 0)),
-        );
-        tomb.insert(
-            "importance".into(),
-            json!(compute_importance(
-                prior,
-                return_visits,
-                has_annotation,
-                stitch_spawns
-            )),
-        );
-        tomb.insert("created_at".into(), json!(int_or("created_at", now)));
-        tomb.insert("updated_at".into(), json!(now));
-        tomb.insert("deleted".into(), json!(true));
-        store
-            .stage_local_writes(vec![("note_signals", note_id.clone(), tomb)], now)
-            .map_err(store_err)?;
-        Ok(())
+        match self.build_signals_tombstone(&store, &note_id, note_source.as_deref(), now)? {
+            Some(tomb) => store
+                .stage_local_writes(vec![("note_signals", note_id, tomb)], now)
+                .map_err(store_err),
+            None => Ok(()),
+        }
     }
 
     /// Enqueue a lens upsert (SUR-726) — ONE authored query. Plaintext; `leaf_ids` is a cloud
@@ -1765,6 +1739,88 @@ impl SyncEngine {
         Ok(Some(sig))
     }
 
+    /// Build the full-shape `note_signals` tombstone for `note_id` — build-don't-write, the
+    /// tombstone twin of [`SyncEngine::stage_signal_write`]: the caller stages the returned row in
+    /// its own batch. Returns `None` when the row is already tombstoned locally (repeat delete —
+    /// stage nothing, no `updated_at` churn). Shared by `soft_delete_signals_for_note` and
+    /// `enqueue_note`'s `deleted: true` paths (SUR-975).
+    ///
+    /// `note_source` is a plain pass-through like `stage_signal_write`'s: used only to seed
+    /// `source_prior` when there is no stored row, never to re-derive a stored prior (SUR-956).
+    /// Callers supply the freshest source they hold — the full-write delete passes the source it
+    /// is staging right now; the patch/standalone paths read the stored note's.
+    ///
+    /// Full shape — or birth defaults when absent — NOT a bare `{note_id, deleted}`:
+    /// `note_signals` has no sparse-PATCH flush fallback (only `notes` does — `push.rs`), so a
+    /// minimal payload would risk a NOT-NULL upsert reject that wedges the outbox (the SUR-942
+    /// note_links lesson).
+    fn build_signals_tombstone(
+        &self,
+        store: &Store,
+        note_id: &str,
+        note_source: Option<&str>,
+        now: i64,
+    ) -> Result<Option<Map<String, Value>>, SyncError> {
+        let existing = store.get_row("note_signals", note_id).map_err(store_err)?;
+        if existing
+            .as_ref()
+            .is_some_and(|s| matches!(s.get("deleted"), Some(Value::Bool(true))))
+        {
+            return Ok(None); // already tombstoned locally — don't churn the outbox / bump updated_at
+        }
+        let row = existing.unwrap_or_default();
+        let int_or =
+            |field: &str, default: i64| row.get(field).and_then(Value::as_i64).unwrap_or(default);
+        // ACCEPTED: with no local signals row AND no source to derive from (no local note row on
+        // the standalone path), this fabricates the unknown-source fallback — and that value is
+        // not inert. The tombstone IS a local row, so a later resurrect (`stage_signal_write`'s
+        // `!was_live` path) reads this prior VERBATIM; nothing re-derives it. A `handwritten` note
+        // that gets retired that way and later arrives live therefore resurrects pinned at 0.5,
+        // under-scored in `compute_importance` and pushed fleet-wide over whole-row LWW.
+        //
+        // Not fixable by refusing, the way `record_note_signal` refuses: the cross-device contract
+        // REQUIRES staging a tombstone even with no local row (another device may hold a live
+        // cloud row from its own bump), and the flush shape has no room to omit the column.
+        // Reaching it is narrow — an ordinary delete reads the note's `source` fine (the callers'
+        // lookups deliberately omit the `deleted` filter), and `enqueue_note`'s full-write delete
+        // always has a real source in hand. Tracked as part of SUR-976. Pinned by
+        // `soft_delete_with_no_note_row_seeds_the_fallback_prior_for_a_later_resurrect`.
+        let prior = row
+            .get("source_prior")
+            .and_then(Value::as_f64)
+            .unwrap_or_else(|| source_prior(note_source));
+        let return_visits = int_or("return_visits", 0);
+        let stitch_spawns = int_or("stitch_spawns", 0);
+        let has_annotation = matches!(row.get("has_annotation"), Some(Value::Bool(true)));
+        let mut tomb = Map::new();
+        tomb.insert("note_id".into(), json!(note_id));
+        tomb.insert("source_prior".into(), json!(prior));
+        tomb.insert("return_visits".into(), json!(return_visits));
+        tomb.insert("has_annotation".into(), json!(has_annotation));
+        tomb.insert("stitch_spawns".into(), json!(stitch_spawns));
+        tomb.insert(
+            "exposure_recency_at".into(),
+            json!(int_or("exposure_recency_at", 0)),
+        );
+        tomb.insert(
+            "engagement_recency_at".into(),
+            json!(int_or("engagement_recency_at", 0)),
+        );
+        tomb.insert(
+            "importance".into(),
+            json!(compute_importance(
+                prior,
+                return_visits,
+                has_annotation,
+                stitch_spawns
+            )),
+        );
+        tomb.insert("created_at".into(), json!(int_or("created_at", now)));
+        tomb.insert("updated_at".into(), json!(now));
+        tomb.insert("deleted".into(), json!(true));
+        Ok(Some(tomb))
+    }
+
     /// Offline-first (§4): stage a local write to BOTH the synced table and the outbox — the local
     /// synced row first (so a read, and pull's LWW compare, see it immediately), then the outbox
     /// (so a later flush pushes it). Both hit SQLite before any cloud call. Mirrors the PWA writing
@@ -1788,13 +1844,38 @@ impl SyncEngine {
             .map_err(|e| SyncError::Store(e.to_string()))
     }
 
+    /// Stage a plaintext-free note patch behind the existing-live precondition. When the patch is
+    /// a DELETE (`retire_signals`), the note's `note_signals` tombstone rides the same transaction
+    /// as an extra write (SUR-975) — so a failed precondition stages neither, and a committed note
+    /// tombstone always has its signals tombstone queued.
     fn stage_existing_live_note_patch(
         &self,
         record_id: &str,
         row: Map<String, Value>,
+        retire_signals: bool,
     ) -> Result<(), SyncError> {
-        lock!(self.store)
-            .stage_local_write_existing_live("notes", record_id, row, epoch_ms())
+        let store = lock!(self.store);
+        let now = epoch_ms();
+        let mut extra_writes = Vec::new();
+        if retire_signals {
+            // Prefer a source the patch itself carries; else the stored note's (the read
+            // deliberately ignores its `deleted` flag — a re-delete still reads it fine, though
+            // the precondition below then rejects the patch before anything stages).
+            let note_source = match row.get("source").and_then(Value::as_str) {
+                Some(source) => Some(source.to_string()),
+                None => store
+                    .get_row("notes", record_id)
+                    .map_err(store_err)?
+                    .and_then(|r| r.get("source").and_then(Value::as_str).map(str::to_string)),
+            };
+            if let Some(tomb) =
+                self.build_signals_tombstone(&store, record_id, note_source.as_deref(), now)?
+            {
+                extra_writes.push(("note_signals", record_id.to_string(), tomb));
+            }
+        }
+        store
+            .stage_local_write_existing_live("notes", record_id, row, extra_writes, now)
             .map_err(|error| match error {
                 StageExistingWriteError::TargetMissing => SyncError::PatchTargetMissing,
                 StageExistingWriteError::Sql(error) => SyncError::Store(error.to_string()),
@@ -2577,10 +2658,24 @@ mod tests {
         assert_eq!(row["deleted"], json!(true));
         assert_eq!(row["text"], json!(original_text));
         assert_eq!(row["content_tag"], json!(original_tag));
-        let payload: Value = serde_json::from_str(&store.outbox_items().unwrap()[0].3).unwrap();
+        // SUR-975: the delete-patch stages TWO rows — the note tombstone plus the signals
+        // tombstone riding the same transaction.
+        let items = store.outbox_items().unwrap();
+        assert_eq!(items.len(), 2, "note tombstone + signals tombstone");
+        let note_payload_json = &items
+            .iter()
+            .find(|(_, t, _, _, _)| t == "notes")
+            .expect("notes outbox row")
+            .3;
+        let payload: Value = serde_json::from_str(note_payload_json).unwrap();
         assert_eq!(payload["deleted"], json!(true));
         assert!(payload.get("text").is_none());
         assert!(payload.get("content_tag").is_none());
+        assert_eq!(
+            store.get_row("note_signals", "n1").unwrap().unwrap()["deleted"],
+            json!(true),
+            "the signals tombstone landed with the note tombstone"
+        );
     }
 
     #[test]
@@ -5072,6 +5167,279 @@ mod tests {
                 .count(),
             1,
             "no new outbox row on the repeat call"
+        );
+    }
+
+    #[test]
+    fn enqueue_note_full_write_delete_stages_note_and_signals_tombstones_in_one_batch() {
+        // SUR-975: the note tombstone and its signals tombstone commit together — one transaction,
+        // one outbox enqueue stamp — and the tombstone preserves the earned counters verbatim.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine
+            .enqueue_note(note_with_source("n", "manual"))
+            .unwrap();
+        assert!(engine
+            .record_note_signal("n".into(), NoteSignalKind::Engagement)
+            .unwrap());
+        assert!(engine
+            .record_note_signal("n".into(), NoteSignalKind::ReturnVisit)
+            .unwrap());
+
+        engine
+            .enqueue_note(NoteUpsert {
+                deleted: true,
+                ..note_with_source("n", "manual")
+            })
+            .unwrap();
+
+        let store = Store::open(db_path).unwrap();
+        assert_eq!(
+            store.get_row("notes", "n").unwrap().unwrap()["deleted"],
+            json!(true)
+        );
+        let tomb = stored_signals(db_path, "n").unwrap();
+        assert_eq!(tomb["deleted"], json!(true));
+        assert_eq!(
+            tomb["return_visits"],
+            json!(1),
+            "earned counters survive onto the tombstone"
+        );
+        assert_eq!(
+            tomb["source_prior"],
+            json!(0.7),
+            "the stored prior is carried, not re-derived"
+        );
+        // The two delete rows are the LAST two queued and share one enqueue stamp (one tx).
+        let items = store.outbox_items().unwrap();
+        let deletes: Vec<_> = items
+            .iter()
+            .filter(|(_, _, _, payload, _)| {
+                serde_json::from_str::<Value>(payload).unwrap()["deleted"] == json!(true)
+            })
+            .collect();
+        let tables: std::collections::BTreeSet<&str> =
+            deletes.iter().map(|(_, t, _, _, _)| t.as_str()).collect();
+        assert_eq!(
+            tables,
+            ["note_signals", "notes"].into(),
+            "exactly one tombstone row per table"
+        );
+        assert_eq!(deletes.len(), 2);
+        assert_eq!(
+            deletes[0].4, deletes[1].4,
+            "one enqueue stamp — both tombstones rode one transaction"
+        );
+    }
+
+    #[test]
+    fn enqueue_note_full_write_delete_seeds_the_signals_prior_from_the_row_in_hand() {
+        // SUR-975 narrows the ACCEPTED fallback wart: the full-write delete always has a real
+        // `source` in the row it is staging, so a signals tombstone born HERE seeds the true
+        // prior — unlike the standalone no-note-row path, which must fabricate 0.5.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+
+        // No prior note row, no prior signals row — a tombstone arriving out of nowhere.
+        engine
+            .enqueue_note(NoteUpsert {
+                deleted: true,
+                ..note_with_source("n", "handwritten")
+            })
+            .unwrap();
+
+        let tomb = stored_signals(db_path, "n").expect("signals tombstone born with the delete");
+        assert_eq!(tomb["deleted"], json!(true));
+        assert_eq!(
+            tomb["source_prior"],
+            json!(0.9),
+            "seeded from the write's own source, not the unknown-source fallback"
+        );
+    }
+
+    #[test]
+    fn enqueue_note_patch_delete_stages_note_and_signals_tombstones_in_one_batch() {
+        // The plaintext-free delete (the PWA-shaped patch) folds the signals tombstone into the
+        // same transaction as the existing-live-precondition write.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine.enqueue_note(note_with_source("n", "share")).unwrap();
+        assert!(engine
+            .record_note_signal("n".into(), NoteSignalKind::Engagement)
+            .unwrap());
+
+        engine
+            .enqueue_note(NoteUpsert {
+                deleted: true,
+                ..note_patch("n")
+            })
+            .unwrap();
+
+        let store = Store::open(db_path).unwrap();
+        assert_eq!(
+            store.get_row("notes", "n").unwrap().unwrap()["deleted"],
+            json!(true)
+        );
+        let tomb = stored_signals(db_path, "n").unwrap();
+        assert_eq!(tomb["deleted"], json!(true));
+        assert_eq!(
+            tomb["source_prior"],
+            json!(0.75),
+            "stored prior carried verbatim"
+        );
+        assert!(
+            tomb["engagement_recency_at"].as_i64().unwrap() > 0,
+            "earned recency survives onto the tombstone"
+        );
+        assert_eq!(
+            store
+                .outbox_items()
+                .unwrap()
+                .iter()
+                .filter(|(_, t, _, _, _)| t == "note_signals")
+                .count(),
+            2,
+            "the live engagement row + the delete's tombstone row"
+        );
+    }
+
+    #[test]
+    fn enqueue_note_patch_delete_of_a_dead_target_stages_no_signals_tombstone_either() {
+        // The existing-live precondition guards the WHOLE batch: when the note patch is rejected,
+        // the signals tombstone that would have ridden along must not stage either.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+
+        // A live signals row with NO note row (arrived by pull/import) — the sharp case: a
+        // rejected delete-patch must not retire it as a side effect.
+        engine
+            .enqueue_note_signals("orphan".into(), 0.9, 2, false, 0, 5, 5, 0.9, 1, false)
+            .unwrap();
+        let live_before = stored_signals(db_path, "orphan").unwrap();
+        let outbox_before = Store::open(db_path).unwrap().outbox_items().unwrap().len();
+
+        let err = engine
+            .enqueue_note(NoteUpsert {
+                deleted: true,
+                ..note_patch("orphan")
+            })
+            .unwrap_err();
+        assert!(matches!(err, SyncError::PatchTargetMissing));
+        assert_eq!(
+            stored_signals(db_path, "orphan").unwrap(),
+            live_before,
+            "the signals row is untouched when the note precondition fails"
+        );
+        assert_eq!(
+            Store::open(db_path).unwrap().outbox_items().unwrap().len(),
+            outbox_before,
+            "nothing new queued"
+        );
+    }
+
+    #[test]
+    fn enqueue_note_re_delete_stages_no_second_signals_tombstone() {
+        // Idempotence via the full-write branch (a patch re-delete is rejected by the
+        // precondition): the second delete re-stages the note row but the already-tombstoned
+        // signals row stages nothing — byte-identical, no new outbox row.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        let delete = || NoteUpsert {
+            deleted: true,
+            ..note_with_source("n", "manual")
+        };
+        engine.enqueue_note(delete()).unwrap();
+        let tomb = stored_signals(db_path, "n").unwrap();
+
+        engine.enqueue_note(delete()).unwrap();
+        assert_eq!(
+            stored_signals(db_path, "n").unwrap(),
+            tomb,
+            "re-delete leaves the signals tombstone byte-identical"
+        );
+        assert_eq!(
+            Store::open(db_path)
+                .unwrap()
+                .outbox_items()
+                .unwrap()
+                .iter()
+                .filter(|(_, t, _, _, _)| t == "note_signals")
+                .count(),
+            1,
+            "no second note_signals outbox row"
+        );
+    }
+
+    #[test]
+    fn enqueue_note_live_writes_never_touch_note_signals() {
+        // The SUR-975 fold is delete-only: live full writes and live patches stage exactly the
+        // notes row, as before.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+
+        engine.enqueue_note(note_upsert("n", "a note")).unwrap();
+        engine
+            .enqueue_note(NoteUpsert {
+                tags: vec!["t".into()],
+                ..note_patch("n")
+            })
+            .unwrap();
+
+        assert!(
+            stored_signals(db_path, "n").is_none(),
+            "no signals row born"
+        );
+        let store = Store::open(db_path).unwrap();
+        assert!(
+            store
+                .outbox_items()
+                .unwrap()
+                .iter()
+                .all(|(_, t, _, _, _)| t == "notes"),
+            "only notes rows queued"
+        );
+    }
+
+    #[test]
+    fn enqueue_note_delete_then_record_note_signal_still_refuses() {
+        // The SUR-966 visibility guard composes with the SUR-975 fold: after the atomic delete a
+        // late signal callback is refused and the signals tombstone stays a tombstone.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine
+            .enqueue_note(note_with_source("n", "manual"))
+            .unwrap();
+        engine
+            .enqueue_note(NoteUpsert {
+                deleted: true,
+                ..note_with_source("n", "manual")
+            })
+            .unwrap();
+
+        assert!(
+            !engine
+                .record_note_signal("n".into(), NoteSignalKind::Engagement)
+                .unwrap(),
+            "a signal on a deleted note stages nothing"
+        );
+        assert_eq!(
+            stored_signals(db_path, "n").unwrap()["deleted"],
+            json!(true),
+            "the tombstone was not resurrected"
         );
     }
 

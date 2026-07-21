@@ -833,11 +833,18 @@ impl Store {
     /// The precondition check and the local-row/outbox write share one transaction. This prevents
     /// a stale patch from creating a missing row or resurrecting a soft-deleted row between a
     /// separate preflight read and the stage.
+    ///
+    /// `extra_writes` ride the SAME transaction and the SAME precondition (SUR-975): a note
+    /// delete-patch stages its `note_signals` tombstone here, so the note tombstone can never
+    /// commit with the signals tombstone unqueued — and a failed precondition stages NEITHER.
+    /// Each extra follows [`stage_local_writes`]' per-row resurrect rule (a LIVE extra drops its
+    /// queued tombstone first; a `deleted: true` extra leaves the queue untouched).
     pub(crate) fn stage_local_write_existing_live(
         &self,
         table: &str,
         record_id: &str,
         partial: Map<String, Value>,
+        extra_writes: Vec<(&str, String, Map<String, Value>)>,
         created_at: i64,
     ) -> Result<(), StageExistingWriteError> {
         let tx = self.conn.unchecked_transaction()?;
@@ -852,6 +859,12 @@ impl Store {
             return Err(StageExistingWriteError::TargetMissing);
         }
         self.stage_write_inner(table, record_id, partial, created_at)?;
+        for (extra_table, extra_id, extra_row) in extra_writes {
+            if !matches!(extra_row.get("deleted"), Some(Value::Bool(true))) {
+                self.drop_pending_deletes_inner(extra_table, &extra_id)?;
+            }
+            self.stage_write_inner(extra_table, &extra_id, extra_row, created_at)?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -1158,10 +1171,18 @@ mod tests {
             "deleted": false
         });
 
+        // A signals-tombstone extra rides along (SUR-975) — the failed precondition must stage
+        // NEITHER the primary nor the extra.
+        let extra = json!({ "note_id": "n1", "updated_at": 2, "deleted": true });
         let missing = store.stage_local_write_existing_live(
             "notes",
             "n1",
             partial.as_object().unwrap().clone(),
+            vec![(
+                "note_signals",
+                "n1".into(),
+                extra.as_object().unwrap().clone(),
+            )],
             100,
         );
         assert!(matches!(
@@ -1169,6 +1190,10 @@ mod tests {
             Err(StageExistingWriteError::TargetMissing)
         ));
         assert!(store.get_row("notes", "n1").unwrap().is_none());
+        assert!(
+            store.get_row("note_signals", "n1").unwrap().is_none(),
+            "a failed precondition stages no extra_writes either"
+        );
         assert!(store.outbox_items().unwrap().is_empty());
 
         let tombstone = json!({
@@ -1185,10 +1210,16 @@ mod tests {
             .unwrap();
         let before = store.get_row("notes", "n1").unwrap().unwrap();
 
+        let extra = json!({ "note_id": "n1", "updated_at": 3, "deleted": true });
         let deleted = store.stage_local_write_existing_live(
             "notes",
             "n1",
             partial.as_object().unwrap().clone(),
+            vec![(
+                "note_signals",
+                "n1".into(),
+                extra.as_object().unwrap().clone(),
+            )],
             101,
         );
         assert!(matches!(
@@ -1196,6 +1227,10 @@ mod tests {
             Err(StageExistingWriteError::TargetMissing)
         ));
         assert_eq!(store.get_row("notes", "n1").unwrap().unwrap(), before);
+        assert!(
+            store.get_row("note_signals", "n1").unwrap().is_none(),
+            "a tombstoned target stages no extra_writes either"
+        );
         assert!(store.outbox_items().unwrap().is_empty());
     }
 
@@ -1226,6 +1261,7 @@ mod tests {
             "notes",
             "n1",
             partial.as_object().unwrap().clone(),
+            vec![],
             100,
         );
 

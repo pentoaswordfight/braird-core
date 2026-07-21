@@ -699,6 +699,48 @@ class RoundTripTest {
         }
     }
 
+    /** SUR-975: a host note delete (`enqueueNote(deleted = true)` — exactly Android's SUR-890 shape)
+     * retires the note's signals row in the SAME transaction; no second FFI call needed. No signals
+     * read-back exists, so the discriminator is the throttle: after delete + resurrect, an Exposure
+     * inside the throttle window returns TRUE only because the delete tombstoned the signals row
+     * (the resurrect/birth path always stages). If the delete ever stops folding the tombstone in,
+     * the row stays live, the Exposure is throttled, and this returns false. */
+    @Test
+    fun noteDeleteRetiresSignalsInTheSameTransactionOverFfi() {
+        val db = File.createTempFile("braird-delete-signals", ".sqlite").apply { deleteOnExit() }
+        val engine = SyncEngine.open(db.absolutePath, "https://x.supabase.co", "anon", Vault.generate())
+        try {
+            fun upsert(deleted: Boolean) = NoteUpsert(
+                id = "n", bookId = null, plaintext = "a note", page = null, tags = emptyList(),
+                source = "manual", sourceId = null, sourceMetaJson = null, chapter = null,
+                imagePath = null, inkCropPath = null, createdAt = 1L, deleted = deleted,
+                clearNullableFields = emptyList(),
+            )
+            engine.enqueueNote(upsert(deleted = false))
+            assertTrue(engine.recordNoteSignal("n", NoteSignalKind.EXPOSURE), "first Exposure writes")
+            assertFalse(
+                engine.recordNoteSignal("n", NoteSignalKind.EXPOSURE),
+                "repeat Exposure is inside the throttle window — the row is live",
+            )
+
+            // The single-call delete: no softDeleteSignalsForNote companion call.
+            engine.enqueueNote(upsert(deleted = true))
+            assertFalse(
+                engine.recordNoteSignal("n", NoteSignalKind.EXPOSURE),
+                "a deleted note earns nothing (SUR-966 visibility guard)",
+            )
+
+            engine.enqueueNote(upsert(deleted = false)) // resurrect the note
+            assertTrue(
+                engine.recordNoteSignal("n", NoteSignalKind.EXPOSURE),
+                "still inside the throttle window, so TRUE proves the delete tombstoned the " +
+                    "signals row and this is the resurrect path — a live row would throttle to false",
+            )
+        } finally {
+            engine.close()
+        }
+    }
+
     /** SUR-911 deliberately exposes protective Merge only; no destructive Replace entrypoint. */
     @Test
     fun generatedSnapshotSurfaceHasNoReplaceApi() {

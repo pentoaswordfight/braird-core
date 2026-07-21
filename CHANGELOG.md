@@ -6,6 +6,30 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+### Changed
+- **`enqueue_note(deleted: true)` also stages the note's `note_signals` tombstone — in the SAME
+  transaction (SUR-975).** A native note delete was two separate FFI calls in two transactions
+  (`enqueue_note` + `soft_delete_signals_for_note`), so a crash between them committed the note
+  tombstone and left the cloud signals row live forever (the Codex durability finding deferred out
+  of SUR-966's scope). Core now owns the atomicity: both delete paths — the full-write tombstone
+  (Android's SUR-890 shape) and the plaintext-free patch — build the same full-shape signals
+  tombstone `soft_delete_signals_for_note` stages and commit it with the note row in one
+  transaction (one outbox enqueue stamp). A note tombstone can no longer commit with its signals
+  tombstone unqueued. On the patch path the existing-live precondition now guards the whole batch:
+  a rejected delete-patch (`PatchTargetMissing`) stages neither row. Live writes (`deleted: false`)
+  never touch `note_signals`. No FFI signature change — hosts keep their single `enqueue_note`
+  delete call and simply stop needing the second one; a legacy second
+  `soft_delete_signals_for_note` call remains a no-op (already-tombstoned guard), which stays
+  exported for the one case `enqueue_note` cannot cover (retiring signals for a note this device
+  holds no row for — the cross-device rule).
+- A signals tombstone **born by the full-write delete seeds `source_prior` from the write's own
+  `source`** (explicit or the `"manual"` default) — a real prior, not the 0.5 unknown-source
+  fallback. The ACCEPTED fallback wart narrows to the standalone no-note-row path (tracked with
+  SUR-976). Doc-comment updates moved the UniFFI method checksums; bindings regenerated, new
+  Kotlin + Swift round-trip tests drive an actual `enqueueNote(deleted: true)` delete (neither
+  harness ever exercised a note delete before) with a throttle-based discriminator proving the
+  tombstone landed.
+
 ## [0.10.0] - 2026-07-20
 
 Nineteenth release batch. Minor release: the native `note_signals` collection surface (SUR-966) —

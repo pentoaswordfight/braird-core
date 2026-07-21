@@ -738,6 +738,44 @@ final class RoundTripTests: XCTestCase {
             "a live signal after soft-delete resurrects the row")
     }
 
+    /// SUR-975: a host note delete (`enqueueNote(deleted: true)`) retires the note's signals row in
+    /// the SAME transaction; no second FFI call needed. No signals read-back exists, so the
+    /// discriminator is the throttle: after delete + resurrect, an Exposure inside the throttle
+    /// window returns TRUE only because the delete tombstoned the signals row (the resurrect/birth
+    /// path always stages). If the delete ever stops folding the tombstone in, the row stays live,
+    /// the Exposure is throttled, and this returns false.
+    func testNoteDeleteRetiresSignalsInTheSameTransactionOverFfi() throws {
+        let db = FileManager.default.temporaryDirectory
+            .appendingPathComponent("braird-delete-signals-\(UUID().uuidString).sqlite")
+        let engine = try SyncEngine.open(
+            dbPath: db.path, supabaseUrl: "https://x.supabase.co", anonKey: "anon",
+            vault: Vault.generate())
+        func upsert(deleted: Bool) -> NoteUpsert {
+            NoteUpsert(
+                id: "n", bookId: nil, plaintext: "a note", page: nil, tags: [], source: "manual",
+                sourceId: nil, sourceMetaJson: nil, chapter: nil, imagePath: nil, inkCropPath: nil,
+                createdAt: 1, deleted: deleted, clearNullableFields: [])
+        }
+
+        try engine.enqueueNote(draft: upsert(deleted: false))
+        XCTAssertTrue(try engine.recordNoteSignal(noteId: "n", kind: .exposure), "first Exposure writes")
+        XCTAssertFalse(
+            try engine.recordNoteSignal(noteId: "n", kind: .exposure),
+            "repeat Exposure is inside the throttle window — the row is live")
+
+        // The single-call delete: no softDeleteSignalsForNote companion call.
+        try engine.enqueueNote(draft: upsert(deleted: true))
+        XCTAssertFalse(
+            try engine.recordNoteSignal(noteId: "n", kind: .exposure),
+            "a deleted note earns nothing (SUR-966 visibility guard)")
+
+        try engine.enqueueNote(draft: upsert(deleted: false))  // resurrect the note
+        XCTAssertTrue(
+            try engine.recordNoteSignal(noteId: "n", kind: .exposure),
+            "still inside the throttle window, so TRUE proves the delete tombstoned the signals row "
+                + "and this is the resurrect path — a live row would throttle to false")
+    }
+
     /// SUR-911 deliberately exposes protective Merge only; no destructive Replace entrypoint.
     func testGeneratedSnapshotSurfaceHasNoReplaceApi() throws {
         let sourceURL = repoRoot()
