@@ -6,6 +6,20 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+### Fixed
+- **`importance` now participates in signal change-detection (SUR-977).** It was computed and
+  staged by `stage_signal_write` but invisible to the `SignalState` no-op compare — sound only
+  while every stored value agreed with the formula, and the blind `enqueue_note_signals` FFI can
+  write one that doesn't. Such a value then sat on a live row forever, feeding ranking: the exact
+  SUR-956/966 `source_prior` bug class one field over. `importance` is now a `SignalState` field
+  with an asymmetric contract — `before` reads the STORED value verbatim (the pre-image invariant),
+  `after` recomputes from the post-mutation fields — so a disagreement is a plain diff and the next
+  signal, even a throttled no-op Exposure, stages the correction (counters and stored prior
+  untouched). Zero churn on consistent rows: the recompute is bit-identical for agreeing inputs, so
+  every existing no-op still no-ops. Import already recomputed on entry (unchanged), and the PWA
+  recomputes on every write, so the blind FFI was the one open door. Internal-only — no FFI
+  surface change, bindings untouched.
+
 ### Added
 - **Post-pull `note_signals` reconciliation — `reconcile_note_signals` (SUR-976).** `note_signals`
   converges by whole-row LWW, so a device that had not yet pulled a note's tombstone could record

@@ -271,8 +271,15 @@ const SIGNAL_THROTTLE_MS: i64 = 60 * 60 * 1000;
 /// The mutable counter state of a `note_signals` row, read from the stored row (or birth defaults)
 /// and mutated by a signal write before it is recomputed + staged (SUR-966). `source_prior` and
 /// `created_at` are effectively immutable per note but carried so the whole-row stage preserves
-/// them; `importance` is derived (never mutated directly). Equality drives the change-detection
-/// no-op: a live row a mutation leaves untouched stages nothing.
+/// them. Equality drives the change-detection no-op: a live row a mutation leaves untouched stages
+/// nothing.
+///
+/// `importance` is INSIDE change-detection (SUR-977) with an asymmetric contract: `before` reads
+/// the STORED value verbatim (the pre-image invariant — nothing derived may enter it), `after` is
+/// recomputed from the post-mutation fields, and mutation closures never touch it. So a stored
+/// value that disagrees with the formula for its own row IS a diff, and the next signal — even a
+/// throttled no-op one — stages the correction; a consistent row recomputes to the bit-identical
+/// f64 and still no-ops.
 #[derive(Clone, PartialEq)]
 struct SignalState {
     source_prior: f64,
@@ -281,6 +288,7 @@ struct SignalState {
     stitch_spawns: i64,
     exposure_recency_at: i64,
     engagement_recency_at: i64,
+    importance: f64,
 }
 
 /// The on-device sync engine. Owns the SQLite [`Store`], the [`PostgrestClient`], the crypto
@@ -1687,14 +1695,10 @@ impl SyncEngine {
         // `before` MIRRORS THE STORED ROW, verbatim. Nothing derived belongs here: the no-op check
         // below compares against it to decide whether the persisted row already says what we are
         // about to write, so anything computed into `before` is a change that silently cannot be
-        // detected.
-        //
-        // NOTE: `importance` is deliberately NOT a `SignalState` field — it is staged below but
-        // rides OUTSIDE change-detection, which is sound only because it is a pure function of
-        // fields that are inside it. A stored `importance` that disagrees with the formula (the
-        // blind `enqueue_note_signals` FFI takes one as an argument) is therefore pinned wrong on a
-        // live row by the same mechanism.
-        let before = SignalState {
+        // detected. (`importance`'s birth default is the one exception in LETTER, not spirit —
+        // with no stored row there is nothing to mirror, `!was_live` always stages, and the value
+        // never reaches a comparison.)
+        let mut before = SignalState {
             source_prior: row
                 .get("source_prior")
                 .and_then(Value::as_f64)
@@ -1704,10 +1708,32 @@ impl SyncEngine {
             stitch_spawns: int_or("stitch_spawns", 0),
             exposure_recency_at: int_or("exposure_recency_at", 0),
             engagement_recency_at: int_or("engagement_recency_at", 0),
+            importance: 0.0, // placeholder — replaced on the next line, see below
         };
+        before.importance = row
+            .get("importance")
+            .and_then(Value::as_f64)
+            .unwrap_or_else(|| {
+                compute_importance(
+                    before.source_prior,
+                    before.return_visits,
+                    before.has_annotation,
+                    before.stitch_spawns,
+                )
+            });
         let created_at = int_or("created_at", now);
         let mut after = before.clone();
         mutate(&mut after);
+        // `importance` is recomputed on the AFTER side only (SUR-977): derived values belong
+        // there, never in the pre-image. A stored value disagreeing with the formula for its own
+        // row therefore differs from `after` even when the mutation changed nothing — the
+        // correction stages. A consistent row recomputes bit-identically and still no-ops.
+        after.importance = compute_importance(
+            after.source_prior,
+            after.return_visits,
+            after.has_annotation,
+            after.stitch_spawns,
+        );
         // Change-detection no-op: a LIVE row the mutation left byte-identical stages nothing (an
         // Exposure inside the throttle window, a repeat of an already-set flag). A tombstoned or
         // absent row (`!was_live`) always stages — the resurrect/birth path.
@@ -1728,15 +1754,7 @@ impl SyncEngine {
             "engagement_recency_at".into(),
             json!(after.engagement_recency_at),
         );
-        sig.insert(
-            "importance".into(),
-            json!(compute_importance(
-                after.source_prior,
-                after.return_visits,
-                after.has_annotation,
-                after.stitch_spawns,
-            )),
-        );
+        sig.insert("importance".into(), json!(after.importance));
         sig.insert("created_at".into(), json!(created_at));
         sig.insert("updated_at".into(), json!(now));
         sig.insert("deleted".into(), json!(false));
@@ -5034,6 +5052,62 @@ mod tests {
                 "a real stored prior is never re-derived (seeded {seeded} on a `{source}` note)"
             );
         }
+    }
+
+    #[test]
+    fn a_throttled_signal_corrects_a_stored_importance_that_disagrees_with_the_formula() {
+        // SUR-977: `importance` was staged but invisible to change-detection, so a stored value
+        // disagreeing with the formula (writable via the blind `enqueue_note_signals` FFI) sat on
+        // a live row forever — the SUR-956/966 `source_prior` bug class, one field over. With
+        // importance inside `SignalState` (before = stored verbatim, after = recomputed), the
+        // disagreement IS a diff: even a throttled Exposure — the no-op path that used to
+        // preserve the lie — now stages the correction.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine
+            .enqueue_note(note_with_source("n", "manual"))
+            .unwrap();
+        // The blind FFI writes importance: 999 against counters whose formula value differs;
+        // exposure stamped fresh so the next Exposure is inside the throttle window.
+        let now = epoch_ms();
+        engine
+            .enqueue_note_signals("n".into(), 0.7, 2, false, 0, now, 0, 999.0, 1, false)
+            .unwrap();
+
+        assert!(
+            engine
+                .record_note_signal("n".into(), NoteSignalKind::Exposure)
+                .unwrap(),
+            "a throttled Exposure on a lying row stages the correction instead of no-opping"
+        );
+        let row = stored_signals(db_path, "n").unwrap();
+        assert_eq!(
+            row["importance"],
+            json!(compute_importance(0.7, 2, false, 0)),
+            "corrected to the formula for the row's own stored fields"
+        );
+        assert_eq!(row["return_visits"], json!(2), "earned counters untouched");
+        assert_eq!(
+            row["source_prior"],
+            json!(0.7),
+            "stored prior untouched (SUR-956)"
+        );
+
+        // Once consistent, the throttle no-op is back — no churn on healthy rows.
+        let before = stored_signals(db_path, "n").unwrap();
+        assert!(
+            !engine
+                .record_note_signal("n".into(), NoteSignalKind::Exposure)
+                .unwrap(),
+            "consistent row: the throttled Exposure no-ops again"
+        );
+        assert_eq!(
+            stored_signals(db_path, "n").unwrap(),
+            before,
+            "no updated_at churn once corrected"
+        );
     }
 
     #[test]
