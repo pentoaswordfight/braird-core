@@ -968,9 +968,10 @@ public protocol SyncEngineProtocol : AnyObject {
      * cannot cover — retiring signals for a note with no LIVE local row, i.e. ABSENT (the
      * cross-device rule) or already TOMBSTONED (e.g. a pre-SUR-975 device crashed inside the old
      * two-call window and pushed a note tombstone with its signals row still live; the delete-
-     * patch path refuses a dead target, so THIS is the host's repair entrypoint until SUR-976's
-     * post-pull reconciler retires such orphans systematically) — and as the no-op-safe second
-     * half of the legacy two-call sequence.
+     * patch path refuses a dead target). For the tombstoned case the post-pull reconciler
+     * (`reconcile_note_signals`, SUR-976) also retires such orphans systematically on the next
+     * pull — this call remains the ON-DEMAND repair for a host that wants it fixed sooner — and
+     * it stays the no-op-safe second half of the legacy two-call sequence.
      *
      * Staged through the plain `stage_local_writes` path, which stages a `deleted: true` write
      * unconditionally (no existing-live precondition), so the no-local-row tombstone is never
@@ -1737,9 +1738,10 @@ open func setAccessToken(jwt: String) {try! rustCall() {
      * cannot cover — retiring signals for a note with no LIVE local row, i.e. ABSENT (the
      * cross-device rule) or already TOMBSTONED (e.g. a pre-SUR-975 device crashed inside the old
      * two-call window and pushed a note tombstone with its signals row still live; the delete-
-     * patch path refuses a dead target, so THIS is the host's repair entrypoint until SUR-976's
-     * post-pull reconciler retires such orphans systematically) — and as the no-op-safe second
-     * half of the legacy two-call sequence.
+     * patch path refuses a dead target). For the tombstoned case the post-pull reconciler
+     * (`reconcile_note_signals`, SUR-976) also retires such orphans systematically on the next
+     * pull — this call remains the ON-DEMAND repair for a host that wants it fixed sooner — and
+     * it stays the no-op-safe second half of the legacy two-call sequence.
      *
      * Staged through the plain `stage_local_writes` path, which stages a `deleted: true` write
      * unconditionally (no existing-live precondition), so the no-local-row tombstone is never
@@ -3972,17 +3974,13 @@ public func FfiConverterTypePullSummary_lower(_ value: PullSummary) -> RustBuffe
  * The result of the post-pull reconciliation pass across the FFI (SUR-820): books backfilled by
  * id (a note's `book_id` referenced a book absent locally), notes rehomed to a known
  * offline-merge survivor vs. detached locally-only when no survivor is known, custom ideas
- * created for a note tag orphaned from the current canon, and duplicate notes collapsed by shared
- * `content_tag` (SUR-835). Nested onto [`PullSummary`] (not flattened) — a pull-mechanics count
- * (`pulled`/`merged`) and a reconciliation-outcome count are different concerns. A reconciliation
- * failure never fails the `pull`/`sync` it's attached to (best-effort — see [`reconcile`]); this
- * summary is all-zero in that case.
- * offline-merge survivor vs. detached locally-only when no survivor is known, and custom ideas
- * created for a note tag orphaned from the current canon, and book covers resolved via Open
- * Library for natively-created books (SUR-828). Nested onto [`PullSummary`] (not flattened) — a
- * pull-mechanics count (`pulled`/`merged`) and a reconciliation-outcome count are different
- * concerns. A reconciliation failure never fails the `pull`/`sync` it's attached to (best-effort —
- * see [`reconcile`]); this summary is all-zero in that case.
+ * created for a note tag orphaned from the current canon, duplicate notes collapsed by shared
+ * `content_tag` (SUR-835), `note_signals` rows retired for locally-tombstoned notes (SUR-976),
+ * and book covers resolved via Open Library for natively-created books (SUR-828). Nested onto
+ * [`PullSummary`] (not flattened) — a pull-mechanics count (`pulled`/`merged`) and a
+ * reconciliation-outcome count are different concerns. A reconciliation failure never fails the
+ * `pull`/`sync` it's attached to (best-effort — see [`reconcile`]); this summary is all-zero in
+ * that case.
  */
 public struct ReconcileSummary {
     public var booksBackfilled: UInt32
@@ -3990,16 +3988,24 @@ public struct ReconcileSummary {
     public var notesDetached: UInt32
     public var ideasCreated: UInt32
     public var dupesCollapsed: UInt32
+    /**
+     * `note_signals` rows retired for a locally-tombstoned note (SUR-976).
+     */
+    public var signalsRetired: UInt32
     public var coversResolved: UInt32
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(booksBackfilled: UInt32, notesRehomed: UInt32, notesDetached: UInt32, ideasCreated: UInt32, dupesCollapsed: UInt32, coversResolved: UInt32) {
+    public init(booksBackfilled: UInt32, notesRehomed: UInt32, notesDetached: UInt32, ideasCreated: UInt32, dupesCollapsed: UInt32, 
+        /**
+         * `note_signals` rows retired for a locally-tombstoned note (SUR-976).
+         */signalsRetired: UInt32, coversResolved: UInt32) {
         self.booksBackfilled = booksBackfilled
         self.notesRehomed = notesRehomed
         self.notesDetached = notesDetached
         self.ideasCreated = ideasCreated
         self.dupesCollapsed = dupesCollapsed
+        self.signalsRetired = signalsRetired
         self.coversResolved = coversResolved
     }
 }
@@ -4023,6 +4029,9 @@ extension ReconcileSummary: Equatable, Hashable {
         if lhs.dupesCollapsed != rhs.dupesCollapsed {
             return false
         }
+        if lhs.signalsRetired != rhs.signalsRetired {
+            return false
+        }
         if lhs.coversResolved != rhs.coversResolved {
             return false
         }
@@ -4035,6 +4044,7 @@ extension ReconcileSummary: Equatable, Hashable {
         hasher.combine(notesDetached)
         hasher.combine(ideasCreated)
         hasher.combine(dupesCollapsed)
+        hasher.combine(signalsRetired)
         hasher.combine(coversResolved)
     }
 }
@@ -4052,6 +4062,7 @@ public struct FfiConverterTypeReconcileSummary: FfiConverterRustBuffer {
                 notesDetached: FfiConverterUInt32.read(from: &buf), 
                 ideasCreated: FfiConverterUInt32.read(from: &buf), 
                 dupesCollapsed: FfiConverterUInt32.read(from: &buf), 
+                signalsRetired: FfiConverterUInt32.read(from: &buf), 
                 coversResolved: FfiConverterUInt32.read(from: &buf)
         )
     }
@@ -4062,6 +4073,7 @@ public struct FfiConverterTypeReconcileSummary: FfiConverterRustBuffer {
         FfiConverterUInt32.write(value.notesDetached, into: &buf)
         FfiConverterUInt32.write(value.ideasCreated, into: &buf)
         FfiConverterUInt32.write(value.dupesCollapsed, into: &buf)
+        FfiConverterUInt32.write(value.signalsRetired, into: &buf)
         FfiConverterUInt32.write(value.coversResolved, into: &buf)
     }
 }
@@ -5406,7 +5418,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_braird_core_checksum_method_syncengine_set_access_token() != 47386) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_braird_core_checksum_method_syncengine_soft_delete_signals_for_note() != 21314) {
+    if (uniffi_braird_core_checksum_method_syncengine_soft_delete_signals_for_note() != 38804) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_sync() != 38790) {

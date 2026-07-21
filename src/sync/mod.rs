@@ -105,17 +105,13 @@ pub struct SupersededEdit {
 /// The result of the post-pull reconciliation pass across the FFI (SUR-820): books backfilled by
 /// id (a note's `book_id` referenced a book absent locally), notes rehomed to a known
 /// offline-merge survivor vs. detached locally-only when no survivor is known, custom ideas
-/// created for a note tag orphaned from the current canon, and duplicate notes collapsed by shared
-/// `content_tag` (SUR-835). Nested onto [`PullSummary`] (not flattened) — a pull-mechanics count
-/// (`pulled`/`merged`) and a reconciliation-outcome count are different concerns. A reconciliation
-/// failure never fails the `pull`/`sync` it's attached to (best-effort — see [`reconcile`]); this
-/// summary is all-zero in that case.
-/// offline-merge survivor vs. detached locally-only when no survivor is known, and custom ideas
-/// created for a note tag orphaned from the current canon, and book covers resolved via Open
-/// Library for natively-created books (SUR-828). Nested onto [`PullSummary`] (not flattened) — a
-/// pull-mechanics count (`pulled`/`merged`) and a reconciliation-outcome count are different
-/// concerns. A reconciliation failure never fails the `pull`/`sync` it's attached to (best-effort —
-/// see [`reconcile`]); this summary is all-zero in that case.
+/// created for a note tag orphaned from the current canon, duplicate notes collapsed by shared
+/// `content_tag` (SUR-835), `note_signals` rows retired for locally-tombstoned notes (SUR-976),
+/// and book covers resolved via Open Library for natively-created books (SUR-828). Nested onto
+/// [`PullSummary`] (not flattened) — a pull-mechanics count (`pulled`/`merged`) and a
+/// reconciliation-outcome count are different concerns. A reconciliation failure never fails the
+/// `pull`/`sync` it's attached to (best-effort — see [`reconcile`]); this summary is all-zero in
+/// that case.
 #[derive(Debug, Default, uniffi::Record)]
 pub struct ReconcileSummary {
     pub books_backfilled: u32,
@@ -123,6 +119,8 @@ pub struct ReconcileSummary {
     pub notes_detached: u32,
     pub ideas_created: u32,
     pub dupes_collapsed: u32,
+    /// `note_signals` rows retired for a locally-tombstoned note (SUR-976).
+    pub signals_retired: u32,
     pub covers_resolved: u32,
 }
 
@@ -134,6 +132,7 @@ impl From<reconcile::ReconcileResult> for ReconcileSummary {
             notes_detached: r.notes_detached as u32,
             ideas_created: r.ideas_created as u32,
             dupes_collapsed: r.dupes_collapsed as u32,
+            signals_retired: r.signals_retired as u32,
             covers_resolved: r.covers_resolved as u32,
         }
     }
@@ -507,7 +506,7 @@ impl SyncEngine {
                         .map(str::to_string);
                     let mut writes = vec![("notes", id.clone(), row)];
                     if let Some(tomb) =
-                        self.build_signals_tombstone(&store, &id, note_source.as_deref(), now)?
+                        Self::build_signals_tombstone(&store, &id, note_source.as_deref(), now)?
                     {
                         writes.push(("note_signals", id.clone(), tomb));
                     }
@@ -1081,9 +1080,10 @@ impl SyncEngine {
     /// cannot cover — retiring signals for a note with no LIVE local row, i.e. ABSENT (the
     /// cross-device rule) or already TOMBSTONED (e.g. a pre-SUR-975 device crashed inside the old
     /// two-call window and pushed a note tombstone with its signals row still live; the delete-
-    /// patch path refuses a dead target, so THIS is the host's repair entrypoint until SUR-976's
-    /// post-pull reconciler retires such orphans systematically) — and as the no-op-safe second
-    /// half of the legacy two-call sequence.
+    /// patch path refuses a dead target). For the tombstoned case the post-pull reconciler
+    /// (`reconcile_note_signals`, SUR-976) also retires such orphans systematically on the next
+    /// pull — this call remains the ON-DEMAND repair for a host that wants it fixed sooner — and
+    /// it stays the no-op-safe second half of the legacy two-call sequence.
     ///
     /// Staged through the plain `stage_local_writes` path, which stages a `deleted: true` write
     /// unconditionally (no existing-live precondition), so the no-local-row tombstone is never
@@ -1095,7 +1095,7 @@ impl SyncEngine {
             .get_row("notes", &note_id)
             .map_err(store_err)?
             .and_then(|r| r.get("source").and_then(Value::as_str).map(str::to_string));
-        match self.build_signals_tombstone(&store, &note_id, note_source.as_deref(), now)? {
+        match Self::build_signals_tombstone(&store, &note_id, note_source.as_deref(), now)? {
             Some(tomb) => store
                 .stage_local_writes(vec![("note_signals", note_id, tomb)], now)
                 .map_err(store_err),
@@ -1758,8 +1758,10 @@ impl SyncEngine {
     /// `note_signals` has no sparse-PATCH flush fallback (only `notes` does — `push.rs`), so a
     /// minimal payload would risk a NOT-NULL upsert reject that wedges the outbox (the SUR-942
     /// note_links lesson).
-    fn build_signals_tombstone(
-        &self,
+    // An associated fn, not a method: it never touches `self` (the caller supplies the already-
+    // locked `&Store`), and the SUR-976 reconcile pass — which runs under the engine's held store
+    // lock with no `&self` in reach — calls it as `SyncEngine::build_signals_tombstone`.
+    pub(crate) fn build_signals_tombstone(
         store: &Store,
         note_id: &str,
         note_source: Option<&str>,
@@ -1820,7 +1822,18 @@ impl SyncEngine {
             )),
         );
         tomb.insert("created_at".into(), json!(int_or("created_at", now)));
-        tomb.insert("updated_at".into(), json!(now));
+        // MONOTONE OVER THE ROW IT RETIRES (SUR-976 sync-reviewer): the server's `t01_lww_guard`
+        // SILENTLY cancels a strictly-older write (statement still 2xx, no change_seq bump), and
+        // the flush would clear the outbox row as if it landed — with this device already locally
+        // tombstoned, nothing would ever retry: a retry-immune divergence. Reachable whenever this
+        // device's clock trails the stamp on a just-pulled foreign row (the reconcile retirement
+        // races a stamp only seconds old; the delete paths share the smaller human-scale window).
+        // Clamping to strictly-after the stored stamp restores the 0050 §4.1 monotonicity
+        // assumption for every signals-tombstone path.
+        tomb.insert(
+            "updated_at".into(),
+            json!(now.max(int_or("updated_at", 0) + 1)),
+        );
         tomb.insert("deleted".into(), json!(true));
         Ok(Some(tomb))
     }
@@ -1876,7 +1889,7 @@ impl SyncEngine {
                     .and_then(|r| r.get("source").and_then(Value::as_str).map(str::to_string)),
             };
             if let Some(tomb) =
-                self.build_signals_tombstone(&store, record_id, note_source.as_deref(), now)?
+                Self::build_signals_tombstone(&store, record_id, note_source.as_deref(), now)?
             {
                 extra_writes.push(("note_signals", record_id.to_string(), tomb));
             }

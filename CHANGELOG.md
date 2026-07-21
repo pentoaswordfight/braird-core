@@ -6,6 +6,35 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+### Added
+- **Post-pull `note_signals` reconciliation — `reconcile_note_signals` (SUR-976).** `note_signals`
+  converges by whole-row LWW, so a device that had not yet pulled a note's tombstone could record
+  a signal whose newer live row legitimately won the cloud row back from the deleting device's
+  tombstone (the server's `t01_lww_guard` accepts equal-or-newer) — a live signals row for a
+  fleet-deleted note, permanently, with nothing anywhere to retire it. SUR-966 closed the
+  same-device callback half and SUR-975 the same-device delete half; this closes the cross-device
+  half, which is inherent to LWW and unfixable at any call site. A seventh reconcile pass (slotted
+  right after content-dedup, so same-cycle merge losers retire immediately) sweeps live
+  `note_signals` rows and retires any whose LOCAL `notes` row is tombstoned — full-shape tombstone,
+  earned counters preserved verbatim, staged through the outbox so the same `pull_then_flush`
+  converges the cloud row too. The same sweep closes every other door into the state: dedup merge
+  losers (counters deliberately discarded, not folded), retired margin children, pre-SUR-975 crash
+  strands arriving by pull, and imported orphans. A signals row with NO local notes row is
+  deliberately left alone (founder decision): the pull tombstone-skip makes absent genuinely
+  ambiguous (never-synced vs deleted-elsewhere), and the row self-resolves once the note arrives.
+  No oracle counterpart — the PWA's 8 post-sync steps have no signals pass, so this is core-first.
+  `ReconcileSummary` gains `signals_retired` (bindings regenerated — a record-shape change, PR
+  labelled `touches-ffi`); the fabricated-prior resurrect wart stays accepted as pinned (healing
+  was reconsidered and re-rejected here — a stored 0.5 is still ambiguous, SUR-956).
+- **Two-engine sync fixture (`tests/common`).** The first bidirectional in-process cloud
+  (`SharedCloud`: server-side `t01_lww_guard` conflict rule + `t02_change_seq` stamping +
+  keyset `fetch_page`) with real-`SyncEngine` `Device`s, driven through the free
+  `pull_then_flush`/`push::flush` seams. `tests/sync_976_integration.rs` pins the exact
+  cross-device interleave end to end — including the cloud row and the second device converging —
+  plus the good path (a device that pulls first never creates the orphan, and the tombstone-skip
+  materializes no dead row). Reusable for any future sync-surface interleave test; every SUR-966
+  test to date was single-device, which is exactly why this interleave went unpinned.
+
 ### Changed
 - **`enqueue_note(deleted: true)` also stages the note's `note_signals` tombstone — in the SAME
   transaction (SUR-975).** A native note delete was two separate FFI calls in two transactions
