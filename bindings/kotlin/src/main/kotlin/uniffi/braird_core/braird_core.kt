@@ -4660,6 +4660,10 @@ data class ReconcileSummary (
     var `notesDetached`: kotlin.UInt, 
     var `ideasCreated`: kotlin.UInt, 
     var `dupesCollapsed`: kotlin.UInt, 
+    /**
+     * `note_signals` rows retired for a locally-tombstoned note (SUR-976).
+     */
+    var `signalsRetired`: kotlin.UInt, 
     var `coversResolved`: kotlin.UInt
 ) {
     
@@ -4678,6 +4682,7 @@ public object FfiConverterTypeReconcileSummary: FfiConverterRustBuffer<Reconcile
             FfiConverterUInt.read(buf),
             FfiConverterUInt.read(buf),
             FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
         )
     }
 
@@ -4687,6 +4692,7 @@ public object FfiConverterTypeReconcileSummary: FfiConverterRustBuffer<Reconcile
             FfiConverterUInt.allocationSize(value.`notesDetached`) +
             FfiConverterUInt.allocationSize(value.`ideasCreated`) +
             FfiConverterUInt.allocationSize(value.`dupesCollapsed`) +
+            FfiConverterUInt.allocationSize(value.`signalsRetired`) +
             FfiConverterUInt.allocationSize(value.`coversResolved`)
     )
 
@@ -4696,6 +4702,7 @@ public object FfiConverterTypeReconcileSummary: FfiConverterRustBuffer<Reconcile
             FfiConverterUInt.write(value.`notesDetached`, buf)
             FfiConverterUInt.write(value.`ideasCreated`, buf)
             FfiConverterUInt.write(value.`dupesCollapsed`, buf)
+            FfiConverterUInt.write(value.`signalsRetired`, buf)
             FfiConverterUInt.write(value.`coversResolved`, buf)
     }
 }

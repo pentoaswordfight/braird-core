@@ -3990,16 +3990,24 @@ public struct ReconcileSummary {
     public var notesDetached: UInt32
     public var ideasCreated: UInt32
     public var dupesCollapsed: UInt32
+    /**
+     * `note_signals` rows retired for a locally-tombstoned note (SUR-976).
+     */
+    public var signalsRetired: UInt32
     public var coversResolved: UInt32
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(booksBackfilled: UInt32, notesRehomed: UInt32, notesDetached: UInt32, ideasCreated: UInt32, dupesCollapsed: UInt32, coversResolved: UInt32) {
+    public init(booksBackfilled: UInt32, notesRehomed: UInt32, notesDetached: UInt32, ideasCreated: UInt32, dupesCollapsed: UInt32, 
+        /**
+         * `note_signals` rows retired for a locally-tombstoned note (SUR-976).
+         */signalsRetired: UInt32, coversResolved: UInt32) {
         self.booksBackfilled = booksBackfilled
         self.notesRehomed = notesRehomed
         self.notesDetached = notesDetached
         self.ideasCreated = ideasCreated
         self.dupesCollapsed = dupesCollapsed
+        self.signalsRetired = signalsRetired
         self.coversResolved = coversResolved
     }
 }
@@ -4023,6 +4031,9 @@ extension ReconcileSummary: Equatable, Hashable {
         if lhs.dupesCollapsed != rhs.dupesCollapsed {
             return false
         }
+        if lhs.signalsRetired != rhs.signalsRetired {
+            return false
+        }
         if lhs.coversResolved != rhs.coversResolved {
             return false
         }
@@ -4035,6 +4046,7 @@ extension ReconcileSummary: Equatable, Hashable {
         hasher.combine(notesDetached)
         hasher.combine(ideasCreated)
         hasher.combine(dupesCollapsed)
+        hasher.combine(signalsRetired)
         hasher.combine(coversResolved)
     }
 }
@@ -4052,6 +4064,7 @@ public struct FfiConverterTypeReconcileSummary: FfiConverterRustBuffer {
                 notesDetached: FfiConverterUInt32.read(from: &buf), 
                 ideasCreated: FfiConverterUInt32.read(from: &buf), 
                 dupesCollapsed: FfiConverterUInt32.read(from: &buf), 
+                signalsRetired: FfiConverterUInt32.read(from: &buf), 
                 coversResolved: FfiConverterUInt32.read(from: &buf)
         )
     }
@@ -4062,6 +4075,7 @@ public struct FfiConverterTypeReconcileSummary: FfiConverterRustBuffer {
         FfiConverterUInt32.write(value.notesDetached, into: &buf)
         FfiConverterUInt32.write(value.ideasCreated, into: &buf)
         FfiConverterUInt32.write(value.dupesCollapsed, into: &buf)
+        FfiConverterUInt32.write(value.signalsRetired, into: &buf)
         FfiConverterUInt32.write(value.coversResolved, into: &buf)
     }
 }

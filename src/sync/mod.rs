@@ -123,6 +123,8 @@ pub struct ReconcileSummary {
     pub notes_detached: u32,
     pub ideas_created: u32,
     pub dupes_collapsed: u32,
+    /// `note_signals` rows retired for a locally-tombstoned note (SUR-976).
+    pub signals_retired: u32,
     pub covers_resolved: u32,
 }
 
@@ -134,6 +136,7 @@ impl From<reconcile::ReconcileResult> for ReconcileSummary {
             notes_detached: r.notes_detached as u32,
             ideas_created: r.ideas_created as u32,
             dupes_collapsed: r.dupes_collapsed as u32,
+            signals_retired: r.signals_retired as u32,
             covers_resolved: r.covers_resolved as u32,
         }
     }
@@ -507,7 +510,7 @@ impl SyncEngine {
                         .map(str::to_string);
                     let mut writes = vec![("notes", id.clone(), row)];
                     if let Some(tomb) =
-                        self.build_signals_tombstone(&store, &id, note_source.as_deref(), now)?
+                        Self::build_signals_tombstone(&store, &id, note_source.as_deref(), now)?
                     {
                         writes.push(("note_signals", id.clone(), tomb));
                     }
@@ -1095,7 +1098,7 @@ impl SyncEngine {
             .get_row("notes", &note_id)
             .map_err(store_err)?
             .and_then(|r| r.get("source").and_then(Value::as_str).map(str::to_string));
-        match self.build_signals_tombstone(&store, &note_id, note_source.as_deref(), now)? {
+        match Self::build_signals_tombstone(&store, &note_id, note_source.as_deref(), now)? {
             Some(tomb) => store
                 .stage_local_writes(vec![("note_signals", note_id, tomb)], now)
                 .map_err(store_err),
@@ -1758,8 +1761,10 @@ impl SyncEngine {
     /// `note_signals` has no sparse-PATCH flush fallback (only `notes` does — `push.rs`), so a
     /// minimal payload would risk a NOT-NULL upsert reject that wedges the outbox (the SUR-942
     /// note_links lesson).
-    fn build_signals_tombstone(
-        &self,
+    // An associated fn, not a method: it never touches `self` (the caller supplies the already-
+    // locked `&Store`), and the SUR-976 reconcile pass — which runs under the engine's held store
+    // lock with no `&self` in reach — calls it as `SyncEngine::build_signals_tombstone`.
+    pub(crate) fn build_signals_tombstone(
         store: &Store,
         note_id: &str,
         note_source: Option<&str>,
@@ -1876,7 +1881,7 @@ impl SyncEngine {
                     .and_then(|r| r.get("source").and_then(Value::as_str).map(str::to_string)),
             };
             if let Some(tomb) =
-                self.build_signals_tombstone(&store, record_id, note_source.as_deref(), now)?
+                Self::build_signals_tombstone(&store, record_id, note_source.as_deref(), now)?
             {
                 extra_writes.push(("note_signals", record_id.to_string(), tomb));
             }

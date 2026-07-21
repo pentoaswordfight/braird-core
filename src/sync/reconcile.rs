@@ -40,7 +40,17 @@
 //!    converge on the SAME keeper. The losers' tags, image, `note_links` edges and
 //!    `collection_memberships` are merged onto the survivor and the losers soft-deleted — all
 //!    through the outbox (LWW-safe).
-//! 5. **`reconcile_covers`** (SUR-828; `resolveCover` in `surfc/src/lib/coverResolver.js`) —
+//! 5. **`reconcile_note_signals`** (SUR-976; NO oracle counterpart — `note_signals` collection is
+//!    core-only, SUR-966) — a live `note_signals` row whose LOCAL `notes` row is tombstoned is
+//!    retired with a full-shape tombstone through the outbox. Closes the cross-device
+//!    orphaned-signals leak whole-row LWW makes inherent (a not-yet-pulled device's later signal
+//!    wins the cloud row back from the deleting device's tombstone), plus every other door into
+//!    the same state: same-cycle content-dedup merge losers (hence its slot right after pass 4),
+//!    retired margin children, pre-SUR-975 crash strands, and imported orphans. A signals row
+//!    with NO local notes row is deliberately left alone — the pull tombstone-skip makes absent
+//!    ambiguous (never-synced vs deleted-elsewhere), and the row self-resolves once the note
+//!    arrives.
+//! 6. **`reconcile_covers`** (SUR-828; `resolveCover` in `surfc/src/lib/coverResolver.js`) —
 //!    a coverless book gets its cover resolved via Open Library (ISBN → a deterministic
 //!    `covers.openlibrary.org` URL by pure construction, no egress; no-ISBN → the Search API for a
 //!    `cover_i`/healed ISBN), persisting `cover_url` + `cover_source` + `cover_resolved_at` through
@@ -53,7 +63,8 @@
 //! **Error handling (deliberately asymmetric, mirroring the oracle):** the oracle does NOT wrap
 //! steps 2b/2c in a try/catch (an error there aborts the whole `fetchAllCloud` call), but DOES
 //! wrap step 2d ("Best-effort: a failure must never block the sync"). [`reconcile`] mirrors that
-//! shape internally — a `reconcile_dropped_tags`, `reconcile_content_dupes`, or `reconcile_covers`
+//! shape internally — a `reconcile_dropped_tags`, `reconcile_content_dupes`,
+//! `reconcile_note_signals`, or `reconcile_covers`
 //! failure is caught and logged here, never propagated. Whatever `reconcile` itself returns is, in
 //! turn, treated as best-effort by ITS
 //! callers ([`super::SyncEngine::pull`], [`super::pull_then_flush`]) — a reconciliation hiccup
@@ -71,6 +82,7 @@ use super::epoch_ms;
 use super::http::{CoverEgress, PostgrestSink};
 use super::outbox::resolve_book_id;
 use super::read::decrypt_note_text;
+use super::SyncEngine;
 use crate::store::Store;
 use crate::vault::Vault;
 
@@ -88,6 +100,7 @@ pub struct ReconcileResult {
     pub notes_detached: usize,
     pub ideas_created: usize,
     pub dupes_collapsed: usize,
+    pub signals_retired: usize,
     pub covers_resolved: usize,
 }
 
@@ -113,10 +126,12 @@ const MERGED_BOOK_IDS_KEY: &str = "mergedBookIds";
 
 /// Run the full post-pull reconciliation pass. Order: books-backfill first (so a book fetched
 /// this pass is visible to the stranded-notes check that follows), then stranded-notes, then
-/// dropped-tags, then content-tag self-heal, then content-dedup, then cover-resolution
-/// (independent of the others). Self-heal runs AFTER stranded-notes (which nulls a rehomed note's
-/// now-stale `content_tag`) and immediately BEFORE content-dedup, so a note that lost its tag this
-/// pass is re-tagged in time to be clustered this same pass instead of waiting for its next edit.
+/// dropped-tags, then content-tag self-heal, then content-dedup, then signals-retire, then
+/// cover-resolution (independent of the others). Self-heal runs AFTER stranded-notes (which nulls
+/// a rehomed note's now-stale `content_tag`) and immediately BEFORE content-dedup, so a note that
+/// lost its tag this pass is re-tagged in time to be clustered this same pass instead of waiting
+/// for its next edit. Signals-retire runs AFTER content-dedup so a merge loser tombstoned this
+/// same cycle has its signals row retired now, not next pull.
 /// `user_id` is the token's `sub` — needed only for the dropped-tag pass's user-scoped custom-idea
 /// id. `vault` decrypts each tagless note to re-derive its tag (SUR-884) — the ONLY pass that needs
 /// keys; every other pass works on stored fields alone.
@@ -155,6 +170,15 @@ pub async fn reconcile<S: PostgrestSink + CoverEgress>(
         eprintln!("reconcile: content-dedup pass failed (non-fatal, retries next pull): {e}");
         0
     });
+    // Best-effort, same posture (SUR-976). Runs immediately AFTER content-dedup ON PURPOSE: the
+    // dedup's merge tombstones loser notes in this same cycle, and this pass retires their
+    // signals rows without waiting a full extra pull. It has no oracle counterpart (note_signals
+    // is core-only), so nothing dictates fatality — and it's a pure hygiene sweep nothing later
+    // in this function reads.
+    let signals_retired = reconcile_note_signals(store).unwrap_or_else(|e| {
+        eprintln!("reconcile: signals-retire pass failed (non-fatal, retries next pull): {e}");
+        0
+    });
     // Best-effort, same posture: an Open Library outage (or a kill-switch read blip) must never
     // fail the pull it follows — cover resolution simply retries next pull.
     let covers_resolved = reconcile_covers(store, sink).await.unwrap_or_else(|e| {
@@ -167,8 +191,69 @@ pub async fn reconcile<S: PostgrestSink + CoverEgress>(
         notes_detached,
         ideas_created,
         dupes_collapsed,
+        signals_retired,
         covers_resolved,
     })
+}
+
+/// Step 2g (SUR-976) — retire the `note_signals` row of any note whose LOCAL row is tombstoned.
+/// Closes the cross-device half of the orphaned-signals leak that `record_note_signal`'s
+/// visibility guard (same-device, SUR-966) and `enqueue_note`'s atomic delete (same-device,
+/// SUR-975) cannot: under whole-row LWW a not-yet-pulled device's later signal legitimately wins
+/// the cloud row back from the deleting device's tombstone (the server's `t01_lww_guard` accepts
+/// equal-or-newer), and nothing else ever retires it. The same sweep catches every other door —
+/// same-cycle content-dedup merge losers (hence this pass's slot right after it), retired margin
+/// children, pre-SUR-975 crash strands, and imported orphans.
+///
+/// LOCAL-ONLY RULE (founder decision): a signals row whose `notes` row is ABSENT is left alone —
+/// the pull tombstone-skip makes absent genuinely ambiguous ("never synced down" vs "deleted
+/// elsewhere"), and retiring a not-yet-pulled live note's signals would destroy real evidence.
+/// Such rows wait until the note itself arrives (live: row is legitimate; tombstoned: retired
+/// next pass).
+///
+/// Each retirement stages the full-shape tombstone ([`SyncEngine::build_signals_tombstone`] —
+/// counters preserved verbatim, no counter-folding for merge losers, founder decision) through
+/// [`Store::stage_local_write`], so it PROPAGATES via the outbox and the same
+/// `pull_then_flush` that ran this pass converges the cloud row too. Per-row isolated (a
+/// transient failure on one row must not block the rest — the `merge_into_survivor` posture);
+/// idempotent by scan construction (a retired row is no longer live, so a second pass sees
+/// nothing and stages nothing).
+fn reconcile_note_signals(store: &Store) -> Result<usize, String> {
+    let live_signals = store
+        .list_live("note_signals", None, -1, 0)
+        .map_err(|e| e.to_string())?;
+    let now = super::epoch_ms();
+    let mut retired = 0usize;
+    for sig in live_signals {
+        let Some(note_id) = sig.get("note_id").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(note) = store.get_row("notes", note_id).map_err(|e| e.to_string())? else {
+            continue; // absent note — ambiguous, the local-only rule leaves it (see doc above)
+        };
+        if !matches!(note.get("deleted"), Some(Value::Bool(true))) {
+            continue; // live note — its signals row is legitimate evidence
+        }
+        // The tombstoned notes row is in hand, so the (rarely-needed) birth-prior fallback derives
+        // from its real `source` — never the unknown-source 0.5 (the lookup deliberately reads a
+        // dead row's columns, same as an ordinary delete).
+        let note_source = note.get("source").and_then(Value::as_str);
+        match SyncEngine::build_signals_tombstone(store, note_id, note_source, now) {
+            // None can't occur off a `list_live` scan under the engine's held store lock (the row
+            // was live moments ago) — but the guard costs nothing and stays correct if it ever does.
+            Ok(None) => {}
+            Ok(Some(tomb)) => match store.stage_local_write("note_signals", note_id, tomb, now) {
+                Ok(()) => retired += 1,
+                Err(e) => eprintln!(
+                    "reconcile: signals-retire stage for {note_id} failed (non-fatal, retries next pull): {e}"
+                ),
+            },
+            Err(e) => eprintln!(
+                "reconcile: signals-retire build for {note_id} failed (non-fatal, retries next pull): {e}"
+            ),
+        }
+    }
+    Ok(retired)
 }
 
 /// Step 2b — backfill a book referenced by a live note but absent from the local store, by
@@ -1832,6 +1917,7 @@ mod tests {
                 notes_detached: 0,
                 ideas_created: 1,
                 dupes_collapsed: 0, // the fixtures carry no content_tag, so nothing to dedup
+                signals_retired: 0, // no note_signals rows seeded — nothing to retire
                 covers_resolved: 0, // kill-switch off — no cover work this pass
             }
         );
@@ -3212,5 +3298,165 @@ mod tests {
                                                                                            // survivor with no content_tag can't anchor an exact cluster.
         put(&store, "notes", &note("untagged", None, &["x"], 1));
         assert!(merge_content_duplicates(&store, "untagged", &["live".into()], false).is_err());
+    }
+
+    // ── reconcile_note_signals (SUR-976) ─────────────────────────────────────
+
+    fn signals(note_id: &str, deleted: bool) -> Value {
+        json!({
+            "note_id": note_id, "source_prior": 0.7, "return_visits": 3, "has_annotation": true,
+            "stitch_spawns": 1, "exposure_recency_at": 100, "engagement_recency_at": 200,
+            "importance": 0.9, "created_at": 1, "updated_at": 1, "deleted": deleted
+        })
+    }
+
+    fn tombstoned_note(id: &str) -> Value {
+        json!({ "id": id, "text": "enc:v2:x", "tags": [], "source": "handwritten",
+                "created_at": 1, "updated_at": 2, "deleted": true })
+    }
+
+    #[test]
+    fn retires_signals_for_a_note_whose_local_row_exists_and_is_deleted() {
+        let store = Store::open_in_memory().unwrap();
+        put(&store, "notes", &tombstoned_note("n"));
+        put(&store, "note_signals", &signals("n", false));
+
+        assert_eq!(reconcile_note_signals(&store).unwrap(), 1);
+        assert!(is_deleted(&store, "note_signals", "n"));
+    }
+
+    #[test]
+    fn leaves_signals_alone_for_a_live_note() {
+        let store = Store::open_in_memory().unwrap();
+        put(&store, "notes", &note("n", None, &[], 1));
+        put(&store, "note_signals", &signals("n", false));
+        let before = store.get_row("note_signals", "n").unwrap().unwrap();
+
+        assert_eq!(reconcile_note_signals(&store).unwrap(), 0);
+        assert_eq!(
+            store.get_row("note_signals", "n").unwrap().unwrap(),
+            before,
+            "a live note's signals row is legitimate evidence — untouched"
+        );
+        assert!(store.outbox_items().unwrap().is_empty());
+    }
+
+    #[test]
+    fn leaves_signals_alone_when_no_local_notes_row_exists() {
+        // The founder's local-only rule: absent is ambiguous (the pull tombstone-skip makes
+        // "never synced down" and "deleted elsewhere" indistinguishable), so the pass must not
+        // guess — retiring a not-yet-pulled live note's signals would destroy real evidence.
+        let store = Store::open_in_memory().unwrap();
+        put(&store, "note_signals", &signals("ghost", false));
+        let before = store.get_row("note_signals", "ghost").unwrap().unwrap();
+
+        assert_eq!(reconcile_note_signals(&store).unwrap(), 0);
+        assert_eq!(
+            store.get_row("note_signals", "ghost").unwrap().unwrap(),
+            before
+        );
+        assert!(store.outbox_items().unwrap().is_empty());
+    }
+
+    #[test]
+    fn is_idempotent_on_a_second_run() {
+        let store = Store::open_in_memory().unwrap();
+        put(&store, "notes", &tombstoned_note("n"));
+        put(&store, "note_signals", &signals("n", false));
+
+        assert_eq!(reconcile_note_signals(&store).unwrap(), 1);
+        let tomb = store.get_row("note_signals", "n").unwrap().unwrap();
+        let queued = store.outbox_items().unwrap().len();
+
+        assert_eq!(reconcile_note_signals(&store).unwrap(), 0);
+        assert_eq!(
+            store.get_row("note_signals", "n").unwrap().unwrap(),
+            tomb,
+            "second run stages nothing — no updated_at churn"
+        );
+        assert_eq!(
+            store.outbox_items().unwrap().len(),
+            queued,
+            "no new outbox row"
+        );
+    }
+
+    #[test]
+    fn preserves_earned_counters_onto_the_tombstone() {
+        let store = Store::open_in_memory().unwrap();
+        put(&store, "notes", &tombstoned_note("n"));
+        put(&store, "note_signals", &signals("n", false));
+
+        reconcile_note_signals(&store).unwrap();
+        let tomb = store.get_row("note_signals", "n").unwrap().unwrap();
+        assert_eq!(tomb["return_visits"], json!(3));
+        assert_eq!(tomb["stitch_spawns"], json!(1));
+        assert_eq!(tomb["has_annotation"], json!(true));
+        assert_eq!(
+            tomb["source_prior"],
+            json!(0.7),
+            "the STORED prior is carried verbatim, never re-derived from the note's source \
+             (which would give 0.9 here) — SUR-956"
+        );
+    }
+
+    #[test]
+    fn propagates_via_the_outbox_as_a_full_shape_row() {
+        let store = Store::open_in_memory().unwrap();
+        put(&store, "notes", &tombstoned_note("n"));
+        put(&store, "note_signals", &signals("n", false));
+
+        reconcile_note_signals(&store).unwrap();
+        let items = store.outbox_items().unwrap();
+        assert_eq!(items.len(), 1);
+        let (_, table, record_id, payload_json, _) = &items[0];
+        assert_eq!(table, "note_signals");
+        assert_eq!(
+            record_id.as_deref(),
+            Some("n"),
+            "keyed by note_id (the collapse key)"
+        );
+        let payload: Value = serde_json::from_str(payload_json).unwrap();
+        for col in [
+            "note_id",
+            "source_prior",
+            "return_visits",
+            "has_annotation",
+            "stitch_spawns",
+            "exposure_recency_at",
+            "engagement_recency_at",
+            "importance",
+            "created_at",
+            "updated_at",
+            "deleted",
+        ] {
+            assert!(
+                payload.get(col).is_some(),
+                "full-shape tombstone (no sparse-PATCH fallback for note_signals): `{col}` present"
+            );
+        }
+        assert_eq!(payload["deleted"], json!(true));
+    }
+
+    #[test]
+    fn merge_loser_signals_retire_in_the_same_reconcile_cycle() {
+        // Pins the pass-ordering decision: content-dedup tombstones the loser, then the
+        // signals-retire pass running right after it catches the loser's row THIS cycle. The
+        // loser's counters are discarded, not folded into the survivor (founder decision).
+        let store = Store::open_in_memory().unwrap();
+        put(&store, "notes", &note_ct("keep", None, "TAG", &["a", "b"]));
+        put(&store, "notes", &note_ct("lose", None, "TAG", &["a"]));
+        put(&store, "note_signals", &signals("lose", false));
+        let survivor_absent_before = store.get_row("note_signals", "keep").unwrap().is_none();
+
+        assert_eq!(reconcile_content_dupes(&store).unwrap(), 1);
+        assert!(is_deleted(&store, "notes", "lose"));
+        assert_eq!(reconcile_note_signals(&store).unwrap(), 1);
+
+        assert!(is_deleted(&store, "note_signals", "lose"));
+        assert!(
+            survivor_absent_before && store.get_row("note_signals", "keep").unwrap().is_none(),
+            "no counter-folding: the survivor gains no signals row from the loser's"
+        );
     }
 }
