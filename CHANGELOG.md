@@ -6,6 +6,22 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-07-22
+
+Twentieth release batch. Minor release: the note_signals hardening arc lands whole —
+SUR-975 (a note delete stages its `note_signals` tombstone in the SAME transaction, both
+`enqueue_note` paths; hosts drop the second call they never wired), SUR-976 (the post-pull
+`reconcile_note_signals` pass retires orphaned signal rows for fleet-deleted notes — the
+cross-device LWW door, merge losers, retired margin children, pre-975 strands, imported orphans —
+with a monotone retirement stamp so the server's `t01_lww_guard` can never silently cancel it;
+plus the first two-engine in-process sync fixture), and SUR-977 (`importance` inside signal
+change-detection with an epsilon compare and a finite-boundary guard on the blind FFI).
+`ReconcileSummary` gains `signals_retired` (record-shape change, bindings regenerated). With
+SUR-966's visibility guard (v0.10.0), the collection surface is now guarded same-device,
+cross-device, and at the change-detection layer. Consumers bump their pin to v0.11.0; no host
+code changes required — the Android SUR-890 delete's stranded-signals leak heals on the pin bump
+alone.
+
 ### Fixed
 - **`importance` now participates in signal change-detection (SUR-977).** It was computed and
   staged by `stage_signal_write` but invisible to the `SignalState` no-op compare — sound only
