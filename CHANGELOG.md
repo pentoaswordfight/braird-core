@@ -6,6 +6,21 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+### Fixed
+- **`reconcile.rs` `repoint_note_links` now stages the full NOT-NULL shape (SUR-954).** A
+  content-dedupe merge (`reconcile_content_dupes` → `merge_into_survivor` → `repoint_note_links`)
+  staged sparse `note_links` payloads — a `{id, deleted, updated_at}` tombstone and a
+  `{id, from_note_id, to_note_id, updated_at}` repoint — both missing the server's NOT-NULL
+  `created_at` (and the tombstone its from/to/relation_type). `note_links` has no sparse-payload
+  PATCH flush fallback (`push.rs patch_group` covers `notes` only), so once the affected edge's
+  create had already flushed — i.e. almost always, since reconcile runs post-pull on synced data —
+  the sparse row stood alone as a fresh PostgREST INSERT candidate and 23502'd on every flush,
+  wedging the outbox permanently (and reading as never-synced to the SUR-882 import gate). Both
+  branches now carry `from_note_id`/`to_note_id`/`relation_type`/`created_at` (preserved) +
+  fresh `updated_at`, mirroring `replace_handwritten_annotations`' SUR-952 edge-tombstone shape;
+  the values were already in hand from `list_live`, so no extra read. Pre-existing on `main` (found
+  by the SUR-952 pre-push sweep), not introduced by that PR. Spine (sync); sync-reviewer.
+
 ## [0.11.0] - 2026-07-22
 
 Twentieth release batch. Minor release: the note_signals hardening arc lands whole —

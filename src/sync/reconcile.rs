@@ -741,19 +741,34 @@ fn repoint_note_links(
             from0
         };
         let to = if loser_ids.contains(to0) { sid } else { to0 };
-        let key = edge_key(from, to, row_str(e, "relation_type"));
+        let rel = row_str(e, "relation_type");
+        let key = edge_key(from, to, rel);
         let eid = row_str(e, "id").to_string();
         let mut patch = Map::new();
         patch.insert("id".into(), json!(eid));
+        // Full NOT-NULL shape on every staged row (SUR-954): `note_links` has no sparse-payload
+        // PATCH flush fallback (`push.rs` patches `notes` only), so a `{id, deleted}` tombstone or a
+        // `created_at`-less repoint 23502s on the PostgREST upsert once this edge's create has
+        // already flushed — wedging the outbox forever. Mirror `replace_handwritten_annotations`'
+        // edge-tombstone shape: `relation_type` + `created_at` preserved from the stored row, fresh
+        // `updated_at`. `created_at` is already in hand from `list_live` — no extra read.
+        patch.insert("relation_type".into(), json!(rel));
+        patch.insert(
+            "created_at".into(),
+            e.get("created_at").cloned().unwrap_or_else(|| json!(now)),
+        );
+        patch.insert("updated_at".into(), json!(now));
         if from == to || seen.contains(&key) {
             // Self-loop (a loser linked to the survivor) or a duplicate of an existing edge → drop.
+            // Keep the stored from/to (the row's real identity), as the SUR-952 tombstone does.
+            patch.insert("from_note_id".into(), json!(from0));
+            patch.insert("to_note_id".into(), json!(to0));
             patch.insert("deleted".into(), json!(true));
         } else {
             seen.insert(key);
             patch.insert("from_note_id".into(), json!(from));
             patch.insert("to_note_id".into(), json!(to));
         }
-        patch.insert("updated_at".into(), json!(now));
         // Propagate (do NOT swallow): the caller must not soft-delete a loser whose edge failed to
         // re-point, or the edge would be stranded live against a tombstoned note (see
         // `merge_into_survivor`'s ordering invariant).
@@ -2071,6 +2086,20 @@ mod tests {
         })
     }
 
+    /// The staged outbox PAYLOAD (not the local row) for a `note_links` id. The local row stays
+    /// complete through a sparse `stage_local_write` merge — the SUR-954 defect is visible ONLY in
+    /// the payload the flush pushes, so a row-state assertion can't see it.
+    fn staged_note_link(store: &Store, id: &str) -> Map<String, Value> {
+        store
+            .outbox_items()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.1 == "note_links")
+            .map(|r| serde_json::from_str::<Map<String, Value>>(&r.3).unwrap())
+            .find(|p| p.get("id") == Some(&json!(id)))
+            .unwrap_or_else(|| panic!("no staged note_links payload for {id}"))
+    }
+
     #[test]
     fn note_links_repoint_to_survivor_dropping_self_loops_and_duplicates() {
         let store = Store::open_in_memory().unwrap();
@@ -2139,6 +2168,65 @@ mod tests {
             json!("S")
         );
         assert!(is_deleted(&store, "note_links", "e2"));
+    }
+
+    #[test]
+    fn repointed_and_tombstoned_edges_stage_the_full_not_null_shape() {
+        // SUR-954: `repoint_note_links` must stage the server's NOT-NULL columns
+        // (from/to/relation_type/created_at) on BOTH the repoint and the tombstone. `note_links`
+        // has no sparse-PATCH flush fallback (`push.rs` patches `notes` only), so once an edge's
+        // create has flushed, a sparse merge payload stands alone as a fresh INSERT candidate and
+        // 23502s on every flush — wedging the outbox. Seeding via `apply_row` enqueues nothing, so
+        // the merge payload IS alone here: the exact post-flush wire condition.
+        let store = Store::open_in_memory().unwrap();
+        put(&store, "notes", &cnote("S", "T", &["a", "b"], 1, None));
+        put(&store, "notes", &cnote("L", "T", &["a"], 2, None));
+        put(
+            &store,
+            "notes",
+            &json!({ "id": "X", "text": "enc:v2:x", "tags": [],
+            "created_at": 1, "updated_at": 1, "deleted": false }),
+        );
+        put(&store, "note_links", &edge("e1", "X", "L", "ref")); // → repoint to X→S (live)
+        put(&store, "note_links", &edge("e2", "L", "S", "ref")); // → self-loop S→S, tombstoned
+
+        reconcile_content_dupes(&store).unwrap();
+
+        // Every staged edge — repoint AND tombstone — carries the full NOT-NULL shape.
+        for id in ["e1", "e2"] {
+            let p = staged_note_link(&store, id);
+            for col in [
+                "id",
+                "from_note_id",
+                "to_note_id",
+                "relation_type",
+                "created_at",
+                "updated_at",
+            ] {
+                assert!(
+                    p.contains_key(col),
+                    "{id} outbox payload missing NOT-NULL column `{col}`: {p:?}"
+                );
+            }
+            assert!(!p["from_note_id"].is_null() && !p["to_note_id"].is_null());
+            assert_eq!(
+                p["created_at"],
+                json!(1),
+                "{id} preserves the STORED created_at, not a fresh stamp"
+            );
+            assert_eq!(p["relation_type"], json!("ref"));
+        }
+
+        // The repoint carries the redirected target and stays live (no sticky tombstone).
+        let e1 = staged_note_link(&store, "e1");
+        assert_eq!(e1["from_note_id"], json!("X"));
+        assert_eq!(e1["to_note_id"], json!("S"), "e1 repointed L→S");
+        assert_ne!(e1.get("deleted"), Some(&json!(true)));
+        // The tombstone keeps the stored identity (the SUR-952 `{...l, deleted: 1}` convention).
+        let e2 = staged_note_link(&store, "e2");
+        assert_eq!(e2["deleted"], json!(true));
+        assert_eq!(e2["from_note_id"], json!("L"));
+        assert_eq!(e2["to_note_id"], json!("S"));
     }
 
     fn membership(id: &str, note: &str, collection: &str, deleted: bool, created_at: i64) -> Value {
