@@ -19,7 +19,12 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   (`useNoteActions.js`/`db.js`), including the `!existing && !hasLive` skip-create guard, and — because
   the child-leg scope leaves a deleted parent's outgoing edge live — a **parent-liveness guard** so a
   child deleted AFTER its parent never resurrects the dead parent's tombstoned signals row (the PWA
-  avoids this structurally: its full edge cascade retires the edge with the parent). Scope
+  avoids this structurally: its full edge cascade retires the edge with the parent). The edge
+  tombstone's `updated_at` is clamped strictly above the stored row (SUR-976 monotonicity — else a
+  clock-skewed stamp from a pulled foreign edge lets the server's t01 LWW guard silently drop the
+  delete, leaving the edge live fleet-wide), and an absent `relation_type` is treated as
+  `handwritten_annotation` (the margins-code default) in both the retire filter and the surviving-edge
+  scan. Scope
   (founder 2026-07-22): handwritten-only, child-leg — a deleted PARENT's outgoing edges and any
   non-`handwritten_annotation` edge are the broader note-delete edge cascade (SUR-84 parity), tracked
   separately. `refresh-annotation-signal` in the native-parity manifest flips from waived to core.

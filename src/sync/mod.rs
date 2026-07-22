@@ -2001,15 +2001,18 @@ impl SyncEngine {
         now: i64,
     ) -> Result<Vec<(&'static str, String, Map<String, Value>)>, SyncError> {
         const HANDWRITTEN: &str = "handwritten_annotation";
+        // An absent `relation_type` defaults to `handwritten_annotation` everywhere else in the
+        // margins code (`enqueue_note_link`, the replace path's reuse check `.is_none_or(...)`) —
+        // treat None the same here, in BOTH the retire filter and the surviving-edge scan, or a
+        // default-handwritten edge with a NULL column is left live and the recompute is skipped.
+        let is_handwritten = |rt: &Option<String>| rt.as_deref().is_none_or(|r| r == HANDWRITTEN);
         let mut writes: Vec<(&'static str, String, Map<String, Value>)> = Vec::new();
 
         // Edges where the deleted note is the handwritten CHILD → retire; their parents may recompute.
         let retiring: Vec<NoteLinkRecord> = read::note_links_for_note(store, deleted_note_id)
             .map_err(store_err)?
             .into_iter()
-            .filter(|e| {
-                e.to_note_id == deleted_note_id && e.relation_type.as_deref() == Some(HANDWRITTEN)
-            })
+            .filter(|e| e.to_note_id == deleted_note_id && is_handwritten(&e.relation_type))
             .collect();
         if retiring.is_empty() {
             return Ok(writes);
@@ -2033,7 +2036,12 @@ impl SyncEngine {
                     .unwrap_or_else(|| HANDWRITTEN.into())),
             );
             tomb.insert("created_at".into(), json!(edge.created_at));
-            tomb.insert("updated_at".into(), json!(now));
+            // MONOTONE over the row it retires (SUR-976, as `build_signals_tombstone`): the server's
+            // `t01_lww_guard` SILENTLY cancels a strictly-older write and the flush clears the outbox
+            // as if it landed — with the edge already locally tombstoned nothing retries, a
+            // retry-immune divergence that leaves the edge live fleet-wide. Reachable when this
+            // device's clock trails a just-pulled foreign edge's stamp.
+            tomb.insert("updated_at".into(), json!(now.max(edge.updated_at + 1)));
             tomb.insert("deleted".into(), json!(true));
             writes.push(("note_links", edge.id.clone(), tomb));
         }
@@ -2066,7 +2074,7 @@ impl SyncEngine {
                 .iter()
                 .any(|l| {
                     l.from_note_id == parent_id
-                        && l.relation_type.as_deref() == Some(HANDWRITTEN)
+                        && is_handwritten(&l.relation_type)
                         && !retiring_ids.contains(l.id.as_str())
                 });
             // Skip-create (PWA `refreshAnnotationSignal`): no signals row AND no live edge → nothing
@@ -4233,6 +4241,82 @@ mod tests {
             Some(true),
             "parent p's local signals row stays tombstoned"
         );
+    }
+
+    #[test]
+    fn edge_tombstone_stamp_is_clamped_above_a_future_foreign_updated_at() {
+        // Review regression (PR #68): a margin edge pulled from a device with a faster clock carries
+        // an `updated_at` ahead of ours. The tombstone must be stamped STRICTLY after it, or the
+        // server's t01 LWW guard silently drops the delete and the edge stays live fleet-wide.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine.enqueue_note(parent_with_book("p", "b1")).unwrap();
+        engine
+            .replace_handwritten_annotations("p".into(), vec![margin("c1", "e1", "a margin")])
+            .unwrap();
+        // Simulate the pulled foreign stamp: overwrite e1's updated_at far into the future.
+        let future = 9_999_999_999_999i64;
+        {
+            let store = Store::open(db_path).unwrap();
+            let mut e1row = store.get_row("note_links", "e1").unwrap().unwrap();
+            e1row.insert("updated_at".into(), json!(future));
+            store.apply_row("note_links", &e1row).unwrap();
+        }
+        drain_outbox(db_path);
+
+        engine
+            .enqueue_note(NoteUpsert {
+                deleted: true,
+                ..note_patch("c1")
+            })
+            .unwrap();
+
+        let e1 = collapsed_payload_for(db_path, "note_links", "e1").expect("edge tombstone queued");
+        assert_eq!(e1["deleted"], json!(true));
+        assert_eq!(
+            e1["updated_at"],
+            json!(future + 1),
+            "edge tombstone clamped strictly above the stored foreign stamp"
+        );
+    }
+
+    #[test]
+    fn margin_edge_with_null_relation_type_is_retired_as_handwritten() {
+        // Review regression (PR #68): an absent relation_type defaults to handwritten_annotation in
+        // the rest of the margins code, so a NULL-relation margin edge whose child is deleted must be
+        // retired (not left live) and count toward the parent recompute.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine.enqueue_note(note_upsert("p", "the parent")).unwrap();
+        engine.enqueue_note(note_upsert("c", "the child")).unwrap();
+        {
+            let store = Store::open(db_path).unwrap();
+            store
+                .apply_row(
+                    "note_links",
+                    json!({ "id": "e1", "from_note_id": "p", "to_note_id": "c",
+                    "relation_type": null, "created_at": 1, "updated_at": 1, "deleted": false })
+                    .as_object()
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        drain_outbox(db_path);
+
+        engine
+            .enqueue_note(NoteUpsert {
+                deleted: true,
+                ..note_patch("c")
+            })
+            .unwrap();
+
+        let e1 = collapsed_payload_for(db_path, "note_links", "e1")
+            .expect("NULL-relation edge retired as handwritten");
+        assert_eq!(e1["deleted"], json!(true));
     }
 
     #[test]
