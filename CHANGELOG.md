@@ -16,7 +16,10 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   edges (importance re-derived, counters preserved, change-detection no-op when unchanged). Without
   it, deleting the last margin note left the parent's `has_annotation: true` forever, crediting the
   0.3 annotation weight to importance fleet-wide. Mirrors the PWA `deleteNote` → `refreshAnnotationSignal`
-  (`useNoteActions.js`/`db.js`), including the `!existing && !hasLive` skip-create guard. Scope
+  (`useNoteActions.js`/`db.js`), including the `!existing && !hasLive` skip-create guard, and — because
+  the child-leg scope leaves a deleted parent's outgoing edge live — a **parent-liveness guard** so a
+  child deleted AFTER its parent never resurrects the dead parent's tombstoned signals row (the PWA
+  avoids this structurally: its full edge cascade retires the edge with the parent). Scope
   (founder 2026-07-22): handwritten-only, child-leg — a deleted PARENT's outgoing edges and any
   non-`handwritten_annotation` edge are the broader note-delete edge cascade (SUR-84 parity), tracked
   separately. `refresh-annotation-signal` in the native-parity manifest flips from waived to core.

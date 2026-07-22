@@ -2045,6 +2045,20 @@ impl SyncEngine {
             if parent_id == deleted_note_id || !seen.insert(parent_id) {
                 continue; // a degenerate p→p self-edge parent IS the note we're deleting; else once
             }
+            // Only a LIVE parent needs has_annotation tracked. If the parent note is missing or
+            // already tombstoned, its signals must STAY retired: `stage_signal_write` treats a
+            // tombstoned row as a birth/resurrect and would stage `deleted: false`, re-creating live
+            // signal metadata for a dead note. This child-leg-only cascade leaves a deleted parent's
+            // outgoing edge LIVE (SUR-84 scope), so deleting a margin child AFTER its parent still
+            // reaches it here — the PWA never does (its full edge cascade tombstoned that edge with
+            // the parent, so `refreshAnnotationSignal` is never called for a dead parent).
+            let parent_note = store.get_row("notes", parent_id).map_err(store_err)?;
+            let parent_live = parent_note
+                .as_ref()
+                .is_some_and(|r| !matches!(r.get("deleted"), Some(Value::Bool(true))));
+            if !parent_live {
+                continue;
+            }
             // Any SURVIVING live handwritten edge from this parent? Exclude the ids we're retiring —
             // they are not committed yet, so `note_links_for_note` still returns them live.
             let has_live = read::note_links_for_note(store, parent_id)
@@ -2065,9 +2079,7 @@ impl SyncEngine {
             {
                 continue;
             }
-            let parent_source = store
-                .get_row("notes", parent_id)
-                .map_err(store_err)?
+            let parent_source = parent_note
                 .and_then(|r| r.get("source").and_then(Value::as_str).map(str::to_string));
             if let Some(sig) =
                 self.stage_signal_write(store, parent_id, parent_source.as_deref(), now, |s| {
@@ -4127,12 +4139,13 @@ mod tests {
     #[test]
     fn margin_delete_without_a_parent_signal_row_creates_none() {
         // Skip-create parity (PWA `refreshAnnotationSignal`: `!existing && !hasLive` → no row). A
-        // handwritten edge whose parent never got a signals row (edge added directly, not via the
-        // margins op) must not birth one on delete.
+        // LIVE parent that never got a signals row (edge added directly, not via the margins op)
+        // must not birth one on delete.
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.sqlite");
         let db_path = db.to_str().unwrap();
         let engine = engine_at(db_path);
+        engine.enqueue_note(note_upsert("p", "the parent")).unwrap();
         engine.enqueue_note(note_upsert("c", "the child")).unwrap();
         engine
             .enqueue_note_link(
@@ -4160,7 +4173,65 @@ mod tests {
         );
         assert!(
             collapsed_payload_for(db_path, "note_signals", "p").is_none(),
-            "no prior signal row + no surviving edge → skip-create, not a birthed false row"
+            "live parent, no prior signal row + no surviving edge → skip-create, not a birthed row"
+        );
+    }
+
+    #[test]
+    fn deleting_a_margin_child_after_its_parent_does_not_resurrect_the_parents_signals() {
+        // Review regression (PR #68): child-leg-only cascade leaves a deleted parent's outgoing edge
+        // LIVE, so deleting the child LATER still reaches the parent recompute. The parent note and
+        // its signals are already tombstoned — the recompute must NOT resurrect them (`deleted:false`)
+        // and re-create live signal metadata for a dead note. Covers BOTH branches: the surviving
+        // edge here (c2/e2 kept live by the child-leg scope) means has_live=true, which the
+        // skip-create guard alone would not catch — only the parent-liveness guard does.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let db_path = db.to_str().unwrap();
+        let engine = engine_at(db_path);
+        engine.enqueue_note(parent_with_book("p", "b1")).unwrap();
+        engine
+            .replace_handwritten_annotations(
+                "p".into(),
+                vec![margin("c1", "e1", "first"), margin("c2", "e2", "second")],
+            )
+            .unwrap();
+        // Delete the PARENT first: p note + p signals tombstoned; e1/e2 stay live (child-leg scope).
+        engine
+            .enqueue_note(NoteUpsert {
+                deleted: true,
+                ..note_patch("p")
+            })
+            .unwrap();
+        drain_outbox(db_path);
+
+        // Now delete a (still-live) margin child.
+        engine
+            .enqueue_note(NoteUpsert {
+                deleted: true,
+                ..note_patch("c1")
+            })
+            .unwrap();
+
+        // The edge is tombstoned (child-leg), but the deleted parent's signals stay retired.
+        assert_eq!(
+            collapsed_payload_for(db_path, "note_links", "e1").expect("edge tombstone queued")
+                ["deleted"],
+            json!(true)
+        );
+        assert!(
+            collapsed_payload_for(db_path, "note_signals", "p").is_none(),
+            "parent p is deleted — its signals must NOT be resurrected to deleted:false"
+        );
+        // And the local row stays a tombstone (never flipped live).
+        let p_sig = Store::open(db_path)
+            .unwrap()
+            .get_row("note_signals", "p")
+            .unwrap();
+        assert_eq!(
+            p_sig.and_then(|r| r.get("deleted").and_then(Value::as_bool)),
+            Some(true),
+            "parent p's local signals row stays tombstoned"
         );
     }
 
