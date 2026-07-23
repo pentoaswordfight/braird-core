@@ -1400,6 +1400,18 @@ pub fn merge_books(
 /// (`content_tag` nulled to re-derive), each loser book is un-tombstoned, the survivor's prior
 /// `created_at` is restored, and ONLY the `mergedBookIds` entries still pointing at THIS merge's
 /// survivor are removed (a later merge into the same survivor keeps its own entries). Idempotent.
+///
+/// ACCEPTED RESIDUAL — cross-device stragglers rehomed mid-window (SUR-1005, founder 2026-07-23).
+/// Undo reverses only the note reassignments in THIS device's `undo` token. If the merge was
+/// flushed and, before the undo fired, another device pulled the synced `merged_into` pointer and
+/// rehomed ITS OWN straggler onto the survivor (staging + pushing that note — see
+/// [`reconcile_stranded_notes`]), that remote note is invisible here and stays on the survivor
+/// after undo: it now points at a live book, so no later reconcile re-strands it, and there is no
+/// fleet-wide "rehomed-from-loser" record to reverse. Accepted as a best-effort-within-the-window
+/// limit, like the exact-ms-tie and resumed-partial-merge residuals. (The only clean fix is to
+/// delay fleet-visibility of the merge until the window is final — core's outbox collapse already
+/// makes pre-flush undo clean — which needs a host↔core window-close contract landed PWA+core in
+/// lockstep; deferred, not attempted here. This is the SAME residual the merged PWA #362 carries.)
 pub fn unmerge_books(store: &Store, undo: &BookMergeUndo) -> Result<(), String> {
     if undo.loser_ids.is_empty() {
         return Ok(());

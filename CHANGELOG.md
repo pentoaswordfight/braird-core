@@ -24,7 +24,13 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   terminal's liveness is unknown and a rehome onto it could park the fleet on a ghost
   the later local-only detach can't correct. This is the always-to-survivor convergence the PWA
   gained in surfc#362; deploy order: surfc release → this core release → app pin
-  bumps (SUR-863/877 — no host code change expected).
+  bumps (SUR-863/877 — no host code change expected). **Accepted residual** (founder,
+  2026-07-23): a book-merge undo reverses only the reassignments in this device's undo
+  token, so a cross-device straggler another device rehomed onto the survivor via the
+  synced `merged_into` during the undo window stays on the survivor after undo — a
+  best-effort-within-the-window limit shared with the PWA (see `unmerge_books` docs). The
+  clean fix (delay fleet-visibility until the window is final) is deferred to a PWA+core
+  follow-up.
 
 - **SUR-1005 — generic additive local-DB column migration in `init_schema`.** Core
   had no local-schema migration path: a descriptor-only column addition broke
