@@ -6,6 +6,18 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-07-23
+
+Twenty-first release batch. Patch release: two sync-engine fixes on the `note_links` /
+`note_signals` seam, both merged since v0.11.0. SUR-954 — `repoint_note_links` now stages the full
+NOT-NULL `note_links` shape on the content-dedupe merge path (a pre-existing sparse-payload 23502
+that could permanently wedge the outbox once the affected edge's create had flushed). SUR-959 — a
+margin-child delete recomputes the parent's `has_annotation` the other direction from SUR-956 (the
+recompute-to-false leg, staged in the same delete batch, with parent-liveness, monotone-stamp, and
+null-`relation_type` guards); `refresh-annotation-signal` flips waived→core in the native-parity
+manifest. No FFI or record-shape change → no bindings regen; consumers bump their pin to v0.11.1,
+no host code changes required.
+
 ### Added
 - **A margin-child delete now recomputes the parent's `has_annotation` (SUR-959).** `enqueue_note`'s
   two delete paths (the full-write `deleted: true` arm and the plaintext-free patch arm) now cascade
