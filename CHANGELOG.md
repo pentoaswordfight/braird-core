@@ -19,7 +19,10 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   as fallback — walking chained A→B→C transitively with `resolve_book_id`'s hop-cap
   discipline, then rehoming via a staged outbox write. A PWA-mirrored liveness guard
   detaches instead of parking a note on a still-deleted terminus (merge cycle /
-  plain-deleted chain end). This is the always-to-survivor convergence the PWA
+  plain-deleted chain end); a survivor not materialized locally is DEFERRED (left for
+  a later pass), never pushed — core's pull skips absent-row tombstones, so an absent
+  terminal's liveness is unknown and a rehome onto it could park the fleet on a ghost
+  the later local-only detach can't correct. This is the always-to-survivor convergence the PWA
   gained in surfc#362; deploy order: surfc release → this core release → app pin
   bumps (SUR-863/877 — no host code change expected).
 
