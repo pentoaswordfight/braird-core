@@ -6,6 +6,34 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+### Added
+
+- **SUR-1005 — consume the synced `books.merged_into` pointer for stranded-note
+  convergence (SUR-916 Option 1 part B).** A book-merge's loser→survivor mapping
+  previously lived only in the device-local `mergedBookIds` map, so a device that
+  pulled the merge without the map could only *detach* a stranded note. The books
+  descriptor now carries `merged_into` (re-vendored from surfc/main after part A,
+  surfc#362), `merge_books` stamps it on loser tombstones, `unmerge_books` nulls it
+  so undo propagates, and `reconcile_stranded_notes` resolves the survivor from BOTH
+  sources — the stored row's `merged_into` first (fleet-wide record), the local map
+  as fallback — walking chained A→B→C transitively with `resolve_book_id`'s hop-cap
+  discipline, then rehoming via a staged outbox write. A PWA-mirrored liveness guard
+  detaches instead of parking a note on a still-deleted terminus (merge cycle /
+  plain-deleted chain end). This is the always-to-survivor convergence the PWA
+  gained in surfc#362; deploy order: surfc release → this core release → app pin
+  bumps (SUR-863/877 — no host code change expected).
+
+- **SUR-1005 — generic additive local-DB column migration in `init_schema`.** Core
+  had no local-schema migration path: a descriptor-only column addition broke
+  existing devices at `apply_row` ("no column named …") because every store
+  read/write names the full descriptor column set. `init_schema` now diffs `PRAGMA
+  table_info` against the descriptor per synced table and `ALTER TABLE … ADD
+  COLUMN`s anything missing (NULL-backfilled, idempotent, order-independent — no
+  reader uses `SELECT *`). The next additive descriptor column needs no new code.
+  Deliberate skips: `BookRecord`/FFI unchanged (hosts don't consume the pointer; no
+  bindings regen, no `touches-ffi`), export/import column maps unchanged (a dropped
+  `mergedInto` on import re-materializes from the cloud via `reconcile_books`).
+
 ## [0.11.1] - 2026-07-23
 
 Twenty-first release batch. Patch release: two sync-engine fixes on the `note_links` /

@@ -19,6 +19,7 @@
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::{Map, Value};
+use std::collections::BTreeSet;
 
 /// One `outbox` row read back by [`Store::outbox_items`]: `(id, table_name, record_id,
 /// payload_json, created_at)`. Aliased so the 5-tuple stays readable at the call site (and
@@ -215,6 +216,7 @@ pub fn synced_schema() -> &'static [TableSchema] {
                 ("cover_url", Text),
                 ("cover_source", Text),
                 ("cover_resolved_at", Int),
+                ("merged_into", Text), // SUR-1005 synced loser→survivor pointer (SUR-916 Option 1)
                 ("created_at", Int),
                 ("updated_at", Int),
                 ("deleted", Bool),
@@ -421,10 +423,33 @@ impl Store {
     }
 
     /// Idempotently create every table (synced + local-only). `IF NOT EXISTS`, so
-    /// re-opening an existing store is a no-op.
+    /// re-opening an existing store is a no-op — plus the additive column migration
+    /// below for stores created before a descriptor column existed.
     fn init_schema(&self) -> rusqlite::Result<()> {
         for t in synced_schema() {
             self.conn.execute_batch(&create_table_sql(t))?;
+            // SUR-1005 — additive local-DB migration. `CREATE IF NOT EXISTS` is a no-op on
+            // an existing store, but `apply_row`/`get_row`/`list_live` name EVERY descriptor
+            // column, so a store predating a descriptor column would fail its first
+            // pull-apply ("no column named …"). Diff the live table against the descriptor
+            // and `ALTER TABLE … ADD COLUMN` the missing ones (NULL-backfilled, matching the
+            // cloud's additive-nullable column contract). Generic: the next descriptor
+            // column is picked up with no new code. Dropped/renamed descriptor columns are
+            // NOT handled — those are breaking cloud migrations, not additive drift.
+            let existing: BTreeSet<String> = self
+                .table_columns(t.name)?
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect();
+            for (name, ty) in t.columns {
+                if !existing.contains(*name) {
+                    self.conn.execute_batch(&format!(
+                        "ALTER TABLE {} ADD COLUMN {name} {};",
+                        t.name,
+                        ty.sqlite(),
+                    ))?;
+                }
+            }
             self.conn.execute_batch(&create_updated_at_index_sql(t))?;
         }
         for ddl in LOCAL_ONLY_DDL {
@@ -1055,6 +1080,67 @@ mod tests {
         );
     }
 
+    // ── SUR-1005 additive column migration ───────────────────────────────────
+
+    #[test]
+    fn init_schema_alters_an_existing_store_missing_a_descriptor_column() {
+        // A store created BEFORE merged_into existed: hand-create books with the old DDL
+        // (CREATE IF NOT EXISTS makes init_schema's create a no-op on it), then run the
+        // normal open path. The ALTER diff must add the missing column — without it,
+        // apply_row's INSERT names merged_into and every pull-apply on the device fails.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE books (id TEXT, title TEXT, author TEXT, isbn TEXT, \
+             cover_url TEXT, cover_source TEXT, cover_resolved_at INTEGER, \
+             created_at INTEGER, updated_at INTEGER, deleted INTEGER, PRIMARY KEY (id));",
+        )
+        .unwrap();
+        let store = Store::from_conn(conn).unwrap();
+
+        let cols = store.table_columns("books").unwrap();
+        let merged = cols.iter().find(|(n, _)| n == "merged_into");
+        assert_eq!(
+            merged,
+            Some(&("merged_into".to_string(), "TEXT".to_string())),
+            "ALTER must add the missing descriptor column with its descriptor affinity"
+        );
+
+        // The failure mode this machinery exists for: applying a pulled row that carries
+        // the new column round-trips instead of erroring "no column named merged_into".
+        let row = serde_json::json!({
+            "id": "l1", "title": "T", "merged_into": "s1",
+            "created_at": 1, "updated_at": 2, "deleted": true,
+        });
+        store.apply_row("books", row.as_object().unwrap()).unwrap();
+        let got = store.get_row("books", "l1").unwrap().unwrap();
+        assert_eq!(got.get("merged_into"), Some(&Value::String("s1".into())));
+
+        // Idempotent: a second init pass (every future open) finds nothing missing.
+        store.init_schema().unwrap();
+        assert_eq!(store.table_columns("books").unwrap(), cols);
+    }
+
+    #[test]
+    fn fresh_and_altered_stores_expose_the_same_books_column_set() {
+        // A fresh store (full CREATE) and a migrated store (CREATE minus merged_into,
+        // then ALTER) must agree on the column SET — physical order may differ (ALTER
+        // appends), which is fine: every reader names its columns, none use SELECT *.
+        let fresh = Store::open_in_memory().unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE books (id TEXT, title TEXT, author TEXT, isbn TEXT, \
+             cover_url TEXT, cover_source TEXT, cover_resolved_at INTEGER, \
+             created_at INTEGER, updated_at INTEGER, deleted INTEGER, PRIMARY KEY (id));",
+        )
+        .unwrap();
+        let altered = Store::from_conn(conn).unwrap();
+
+        let set = |s: &Store| -> BTreeSet<(String, String)> {
+            s.table_columns("books").unwrap().into_iter().collect()
+        };
+        assert_eq!(set(&fresh), set(&altered));
+    }
+
     // ── SUR-725 synced-table read/write + pull cursors ────────────────────────
 
     #[test]
@@ -1512,7 +1598,7 @@ mod tests {
         let book = json!({
             "id":"b1", "title":"Imported", "author":null, "isbn":null,
             "cover_url":null, "cover_source":null, "cover_resolved_at":null,
-            "created_at":1, "updated_at":99, "deleted":false
+            "merged_into":null, "created_at":1, "updated_at":99, "deleted":false
         });
         let note = json!({
             "id":"n1", "book_id":"b1", "text":"enc:v2:cipher", "page":null,

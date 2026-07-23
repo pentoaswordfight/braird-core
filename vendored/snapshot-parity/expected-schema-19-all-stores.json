@@ -132,6 +132,7 @@
         "cover_url": "https://example.invalid/cover.jpg",
         "cover_source": "openlibrary",
         "cover_resolved_at": 19001,
+        "merged_into": null,
         "created_at": 19000,
         "updated_at": 1700000000000,
         "deleted": false

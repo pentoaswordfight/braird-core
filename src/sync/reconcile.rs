@@ -241,12 +241,64 @@ async fn reconcile_books<S: PostgrestSink>(store: &Store, sink: &S) -> Result<us
     Ok(backfilled)
 }
 
+/// SUR-1005 — resolve a stranded note's target book. From its (soft-deleted) book, follow
+/// the synced `merged_into` pointer on the stored row, falling back to the device-local
+/// map at each hop — `merged_into` wins (it's the fleet-wide record; the map fills
+/// local-only gaps). Hop-capped like [`resolve_book_id`] (cycle-safe; same cap of 20).
+/// Behavior-equivalent to the PWA's fold-`merged_into`-over-map + walk (surfc PR #362) —
+/// implemented as a stored-row walk so no full deleted-books scan is needed.
+///
+/// Returns `(terminal_id, safe_to_rehome)`. Safe = the terminal row is live locally, or
+/// absent (not yet pulled — the real target; it materializes on the next pull). A terminal
+/// row that is itself soft-deleted — a merge CYCLE the hop cap bailed out of (concurrent
+/// A→B and B→A merges are individually-valid LWW writes), or a chain terminus later
+/// removed by a plain book delete (no `merged_into`) — is NOT safe: parking a note there,
+/// and then PUSHING that book_id fleet-wide, would defeat the no-dangling invariant, so
+/// the caller detaches instead (the PWA's liveness guard, mirrored). A mid-walk read
+/// error is `Err` — the caller skips the note this pass (per-note isolation) rather than
+/// guessing.
+fn resolve_survivor(
+    store: &Store,
+    start_id: &str,
+    start_row: &Map<String, Value>,
+    map: &BTreeMap<String, String>,
+) -> Result<(String, bool), String> {
+    let mut id = start_id.to_string();
+    let mut row: Option<Map<String, Value>> = Some(start_row.clone());
+    for _ in 0..20 {
+        let next: Option<String> = row
+            .as_ref()
+            .and_then(|r| r.get("merged_into"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty()) // mirror the PWA's falsy-skip: '' is absent
+            .map(str::to_string)
+            .or_else(|| map.get(&id).cloned());
+        match next {
+            Some(n) if n != id => {
+                row = store
+                    .get_row("books", &n)
+                    .map_err(|e| format!("walk merged_into {id}→{n}: {e}"))?;
+                id = n;
+            }
+            _ => break,
+        }
+    }
+    let safe = match &row {
+        Some(r) => !matches!(r.get("deleted"), Some(Value::Bool(true))),
+        None => true, // not yet pulled — the real target, materializes next pull
+    };
+    Ok((id, safe))
+}
+
 /// Step 2c — repair a live note pointing at a book that's present locally but soft-deleted (an
-/// offline book-merge this device didn't itself perform). Resolves via the local
-/// `mergedBookIds` survivor map (reusing [`resolve_book_id`]'s hop-capped walk — the same shape
-/// `push.rs` already uses for the unrelated `bookIdRemap`), repointing to a known survivor and
-/// pushing that correction, or detaching to `null` locally-only when no survivor is known.
-/// Returns `(rehomed, detached)`.
+/// offline book-merge this device didn't itself perform). Resolves the survivor from TWO
+/// sources via [`resolve_survivor`]: the pulled loser row's synced `merged_into` pointer
+/// (SUR-1005 — so a device that never received the merge's device-local map still converges
+/// the straggler; the always-to-survivor convergence SUR-916 wanted) and the local
+/// `mergedBookIds` map (the fast path, and the only source for pre-`merged_into` merges).
+/// A safe survivor is a genuine mutation — staged through the outbox so the fleet
+/// converges; no survivor (or a survivor that resolved onto a still-deleted book — the
+/// liveness guard) detaches to `null` locally-only. Returns `(rehomed, detached)`.
 fn reconcile_stranded_notes(store: &Store) -> Result<(usize, usize), String> {
     let merged_book_ids = load_merged_book_ids(store)?;
     let notes = store
@@ -279,8 +331,15 @@ fn reconcile_stranded_notes(store: &Store) -> Result<(usize, usize), String> {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        let survivor = resolve_book_id(book_id, &merged_book_ids);
-        if survivor != book_id {
+        let (survivor, survivor_safe) =
+            match resolve_survivor(store, book_id, &book, &merged_book_ids) {
+                Ok(resolved) => resolved,
+                Err(e) => {
+                    eprintln!("reconcile_stranded_notes: note {note_id}: {e}, skipping");
+                    continue; // left stranded this pass — retried next reconcile
+                }
+            };
+        if survivor != book_id && survivor_safe {
             // A known survivor — a genuine mutation the fleet must converge on, so it goes
             // through the normal write path (bump updated_at, enter the outbox).
             let mut patch = Map::new();
@@ -298,7 +357,8 @@ fn reconcile_stranded_notes(store: &Store) -> Result<(usize, usize), String> {
                 ),
             }
         } else {
-            // No known survivor — detach locally only, NEVER pushed. Mirrors the oracle's
+            // No known survivor — or one that resolved onto a still-deleted book (the
+            // liveness guard) — detach locally only, NEVER pushed. Mirrors the oracle's
             // explicit LWW-safety rule exactly: propagating a map-less detach could overwrite
             // the survivor truth a map-holding device is still converging toward.
             let mut detached_row = row.clone();
@@ -1275,6 +1335,10 @@ pub fn merge_books(
         let mut patch = Map::new();
         patch.insert("id".into(), json!(lid));
         patch.insert("deleted".into(), json!(true));
+        // SUR-1005 — the synced loser→survivor pointer (SUR-916 Option 1): rides the
+        // tombstone fleet-wide so a device without this merge's local map still converges
+        // stragglers via `reconcile_stranded_notes` (and the PWA via rehomeStrandedNotes).
+        patch.insert("merged_into".into(), json!(survivor_id));
         patch.insert("updated_at".into(), json!(now));
         store
             .stage_local_write("books", lid, patch, now)
@@ -1318,6 +1382,9 @@ pub fn unmerge_books(store: &Store, undo: &BookMergeUndo) -> Result<(), String> 
         let mut patch = Map::new();
         patch.insert("id".into(), json!(lid));
         patch.insert("deleted".into(), json!(false));
+        // SUR-1005 — clear the synced pointer so the undo propagates fleet-wide: a device
+        // that already pulled `merged_into` stops rehoming stragglers onto the survivor.
+        patch.insert("merged_into".into(), Value::Null);
         patch.insert("updated_at".into(), json!(now));
         store
             .stage_local_write_resurrecting("books", lid, patch, now)
@@ -3223,6 +3290,236 @@ mod tests {
         let (rehomed, _) = reconcile_stranded_notes(&dev_b).unwrap();
         assert_eq!(rehomed, 1);
         assert_eq!(book_id_of(&dev_b, "bad").as_deref(), Some("s"));
+    }
+
+    // ── SUR-1005: synced merged_into consumption (SUR-916 Option 1 part B) ──
+
+    /// The collapsed outbox payload for one record — the row as it would flush.
+    fn collapsed_payload(store: &Store, table: &str, record_id: &str) -> Option<Map<String, Value>> {
+        let items: Vec<crate::sync::outbox::OutboxItem> = store
+            .outbox_items()
+            .unwrap()
+            .into_iter()
+            .map(|(id, table_name, record_id, payload, created_at)| {
+                crate::sync::outbox::OutboxItem {
+                    id,
+                    table_name,
+                    record_id,
+                    payload: serde_json::from_str(&payload).unwrap(),
+                    created_at,
+                }
+            })
+            .collect();
+        crate::sync::outbox::collapse(items, &BTreeMap::new())
+            .into_iter()
+            .find(|g| {
+                g.table == table && g.payload.get("id").and_then(Value::as_str) == Some(record_id)
+            })
+            .map(|g| g.payload)
+    }
+
+    fn deleted_book_mi(id: &str, merged_into: Option<&str>) -> Value {
+        json!({ "id": id, "title": "T", "merged_into": merged_into,
+                "created_at": 5, "updated_at": 9, "deleted": true })
+    }
+
+    #[test]
+    fn stranded_note_converges_via_pulled_merged_into_with_no_local_map() {
+        // Device B never received the merge map — the pulled loser's synced merged_into is
+        // the ONLY survivor source. The whole point of SUR-916 Option 1: rehome, don't detach.
+        let store = Store::open_in_memory().unwrap();
+        put(&store, "books", &book_at("s", 5));
+        put(&store, "books", &deleted_book_mi("l1", Some("s")));
+        put(&store, "notes", &note_ct("n1", Some("l1"), "STALE-TAG", &[]));
+
+        let (rehomed, detached) = reconcile_stranded_notes(&store).unwrap();
+
+        assert_eq!((rehomed, detached), (1, 0));
+        assert_eq!(book_id_of(&store, "n1").as_deref(), Some("s"));
+        let row = store.get_row("notes", "n1").unwrap().unwrap();
+        assert_eq!(
+            row.get("content_tag"),
+            Some(&Value::Null),
+            "content_tag is book-id-keyed (HMAC input) — must null for re-derive"
+        );
+        // A genuine mutation: staged through the outbox so the fleet converges.
+        let wire = collapsed_payload(&store, "notes", "n1").expect("rehome is pushed");
+        assert_eq!(wire.get("book_id").and_then(Value::as_str), Some("s"));
+    }
+
+    #[test]
+    fn stranded_note_chain_resolves_transitively_via_merged_into() {
+        // A→B→C recorded purely in synced pointers (two merges on other devices) → terminal C.
+        let store = Store::open_in_memory().unwrap();
+        put(&store, "books", &book_at("c", 5));
+        put(&store, "books", &deleted_book_mi("b", Some("c")));
+        put(&store, "books", &deleted_book_mi("a", Some("b")));
+        put(&store, "notes", &note("n1", Some("a"), &[], 1));
+
+        let (rehomed, _) = reconcile_stranded_notes(&store).unwrap();
+
+        assert_eq!(rehomed, 1);
+        assert_eq!(book_id_of(&store, "n1").as_deref(), Some("c"));
+    }
+
+    #[test]
+    fn stranded_note_chain_alternates_merged_into_and_the_local_map() {
+        // Hop 1 from the synced pointer, hop 2 from the device-local map — the two sources
+        // compose (the PWA folds merged_into over the map; the walk is behavior-equivalent).
+        let store = Store::open_in_memory().unwrap();
+        put(&store, "books", &book_at("c", 5));
+        put(&store, "books", &deleted_book_mi("b", None)); // no pointer — map's turn
+        put(&store, "books", &deleted_book_mi("a", Some("b")));
+        put(&store, "notes", &note("n1", Some("a"), &[], 1));
+        save_merged_book_ids(&store, &BTreeMap::from([("b".into(), "c".into())])).unwrap();
+
+        let (rehomed, _) = reconcile_stranded_notes(&store).unwrap();
+
+        assert_eq!(rehomed, 1);
+        assert_eq!(book_id_of(&store, "n1").as_deref(), Some("c"));
+    }
+
+    #[test]
+    fn merged_into_wins_over_a_conflicting_local_map_entry() {
+        // The synced pointer is the fleet-wide record; a stale local map entry must lose.
+        let store = Store::open_in_memory().unwrap();
+        put(&store, "books", &book_at("s", 5));
+        put(&store, "books", &book_at("x", 6));
+        put(&store, "books", &deleted_book_mi("l1", Some("s")));
+        put(&store, "notes", &note("n1", Some("l1"), &[], 1));
+        save_merged_book_ids(&store, &BTreeMap::from([("l1".into(), "x".into())])).unwrap();
+
+        reconcile_stranded_notes(&store).unwrap();
+
+        assert_eq!(book_id_of(&store, "n1").as_deref(), Some("s"));
+    }
+
+    #[test]
+    fn merge_cycle_detaches_instead_of_parking_on_a_ghost() {
+        // Concurrent opposite-direction merges (A→B on one device, B→A on another) are each
+        // individually-valid LWW writes, so the fleet can hold both pointers. The hop cap
+        // bails out ON a soft-deleted book — the liveness guard must detach, never park the
+        // note on a ghost (and never push that ghost fleet-wide). Mirrors surfc PR #362.
+        let store = Store::open_in_memory().unwrap();
+        put(&store, "books", &deleted_book_mi("a", Some("b")));
+        put(&store, "books", &deleted_book_mi("b", Some("a")));
+        put(&store, "notes", &note("n1", Some("a"), &[], 1));
+
+        let (rehomed, detached) = reconcile_stranded_notes(&store).unwrap();
+
+        assert_eq!((rehomed, detached), (0, 1));
+        assert_eq!(book_id_of(&store, "n1"), None, "detached, not parked");
+        assert!(
+            collapsed_payload(&store, "notes", "n1").is_none(),
+            "detach is local-only — never pushed"
+        );
+    }
+
+    #[test]
+    fn plain_deleted_chain_terminus_detaches() {
+        // A→B but B was later deleted outright (deleteBook — no merged_into). The walk ends
+        // on a soft-deleted row with no onward pointer → liveness guard → detach.
+        let store = Store::open_in_memory().unwrap();
+        put(&store, "books", &deleted_book_mi("b", None));
+        put(&store, "books", &deleted_book_mi("a", Some("b")));
+        put(&store, "notes", &note("n1", Some("a"), &[], 1));
+
+        let (rehomed, detached) = reconcile_stranded_notes(&store).unwrap();
+
+        assert_eq!((rehomed, detached), (0, 1));
+        assert_eq!(book_id_of(&store, "n1"), None);
+    }
+
+    #[test]
+    fn absent_survivor_is_rehomed_and_materializes_next_pull() {
+        // The pointer names a survivor this device hasn't pulled yet. It's the real target:
+        // rehome onto it (staged), and the row itself arrives on the next pull — same
+        // absent-is-live rule as the PWA's guard.
+        let store = Store::open_in_memory().unwrap();
+        put(&store, "books", &deleted_book_mi("l1", Some("not-yet-pulled")));
+        put(&store, "notes", &note("n1", Some("l1"), &[], 1));
+
+        let (rehomed, _) = reconcile_stranded_notes(&store).unwrap();
+
+        assert_eq!(rehomed, 1);
+        assert_eq!(book_id_of(&store, "n1").as_deref(), Some("not-yet-pulled"));
+        assert!(collapsed_payload(&store, "notes", "n1").is_some(), "pushed");
+    }
+
+    #[test]
+    fn merge_books_stamps_merged_into_on_the_local_row_and_the_wire() {
+        let store = Store::open_in_memory().unwrap();
+        put(&store, "books", &book_at("s", 100));
+        put(&store, "books", &book_at("l1", 50));
+
+        merge_books(&store, "s", &["l1".into()]).unwrap();
+
+        let row = store.get_row("books", "l1").unwrap().unwrap();
+        assert_eq!(row.get("merged_into"), Some(&Value::String("s".into())));
+        let wire = collapsed_payload(&store, "books", "l1").expect("tombstone queued");
+        assert_eq!(
+            wire.get("merged_into").and_then(Value::as_str),
+            Some("s"),
+            "the pointer rides the tombstone fleet-wide"
+        );
+    }
+
+    #[test]
+    fn unmerge_nulls_merged_into_locally_and_on_the_wire_and_stops_rehoming() {
+        let store = Store::open_in_memory().unwrap();
+        put(&store, "books", &book_at("s", 100));
+        put(&store, "books", &book_at("l1", 50));
+        put(&store, "notes", &note("n1", Some("l1"), &[], 1));
+
+        let undo = merge_books(&store, "s", &["l1".into()]).unwrap();
+        unmerge_books(&store, &undo).unwrap();
+
+        let row = store.get_row("books", "l1").unwrap().unwrap();
+        assert_eq!(row.get("merged_into"), Some(&Value::Null));
+        let wire = collapsed_payload(&store, "books", "l1").expect("resurrection queued");
+        assert_eq!(
+            wire.get("merged_into"),
+            Some(&Value::Null),
+            "the cleared pointer propagates so the fleet stops rehoming"
+        );
+
+        // Device B pulls the resurrected loser: live book → nothing stranded → no rehome.
+        let dev_b = Store::open_in_memory().unwrap();
+        put(&dev_b, "books", &book_at("s", 100));
+        put(
+            &dev_b,
+            "books",
+            &json!({ "id": "l1", "title": "T", "merged_into": null,
+                     "created_at": 50, "updated_at": 999, "deleted": false }),
+        );
+        put(&dev_b, "notes", &note("n1", Some("l1"), &[], 1));
+        let (rehomed, detached) = reconcile_stranded_notes(&dev_b).unwrap();
+        assert_eq!((rehomed, detached), (0, 0), "undo stops the convergence");
+    }
+
+    #[test]
+    fn tombstone_skip_then_backfill_then_rehome_converges_in_two_steps() {
+        // The ticket's pull-ordering caveat: pull skips a tombstone with no local row, but
+        // reconcile_books backfills the loser (fetch_by_ids returns owner tombstones) WITH
+        // its merged_into — so the stranded pass right after it rehomes in the same
+        // reconcile(). This is the map-less device's end-to-end convergence shape.
+        let store = Store::open_in_memory().unwrap();
+        put(&store, "books", &book_at("s", 5));
+        put(&store, "notes", &note("n1", Some("l1"), &[], 1)); // l1 has NO local row
+        let sink = StubSink::new().with(
+            "books",
+            vec![json!({ "id": "l1", "title": "T", "merged_into": "s",
+                         "created_at": 5, "updated_at": 9, "deleted": true })],
+        );
+
+        let backfilled = block(reconcile_books(&store, &sink)).unwrap();
+        assert_eq!(backfilled, 1, "loser tombstone materialized locally");
+        let l1 = store.get_row("books", "l1").unwrap().unwrap();
+        assert_eq!(l1.get("merged_into"), Some(&Value::String("s".into())));
+
+        let (rehomed, _) = reconcile_stranded_notes(&store).unwrap();
+        assert_eq!(rehomed, 1);
+        assert_eq!(book_id_of(&store, "n1").as_deref(), Some("s"));
     }
 
     #[test]

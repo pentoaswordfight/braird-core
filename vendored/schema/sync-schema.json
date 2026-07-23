@@ -8,6 +8,7 @@
     "deleted": "bool",
     "id": "text",
     "isbn": "text",
+    "merged_into": "text",
     "title": "text",
     "updated_at": "int"
   },
