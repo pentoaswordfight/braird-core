@@ -6,6 +6,24 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-07-23
+
+Twenty-second release batch. Minor release: SUR-916 Option 1 part B — core consumes the
+synced `books.merged_into` pointer (added PWA-side in surfc#362, v0.12.0 re-vendors it),
+so a device that pulled a book merge without the device-local `mergedBookIds` map now
+converges a stranded note onto the survivor instead of only detaching it. Ships core's
+**first generic local-DB column migration** (`init_schema` diffs `PRAGMA table_info`
+against the descriptor and `ALTER TABLE … ADD COLUMN`s anything missing — the next additive
+column needs no new code), a PWA-mirrored liveness guard (a survivor that resolves onto a
+still-deleted terminus detaches; an unmaterialized survivor is deferred, never pushed), and
+a SUR-954-class wire-shape fix (staged books patches now carry the full NOT-NULL shape, so a
+merge touching a pulled book can't 23502-wedge the outbox). No FFI or record-shape change →
+no bindings regen; consumers bump their pin to v0.12.0, no host code changes required — the
+convergence and the accepted undo-window residual both land on the pin bump alone
+(SUR-863/877). One accepted residual: a book-merge undo can't reverse a cross-device
+straggler another device rehomed via `merged_into` during the undo window (best-effort
+within the window, shared with the PWA; see `unmerge_books`).
+
 ### Added
 
 - **SUR-1005 — consume the synced `books.merged_into` pointer for stranded-note
