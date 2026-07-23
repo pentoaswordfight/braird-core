@@ -6,6 +6,57 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+### Added
+
+- **SUR-1005 — consume the synced `books.merged_into` pointer for stranded-note
+  convergence (SUR-916 Option 1 part B).** A book-merge's loser→survivor mapping
+  previously lived only in the device-local `mergedBookIds` map, so a device that
+  pulled the merge without the map could only *detach* a stranded note. The books
+  descriptor now carries `merged_into` (re-vendored from surfc/main after part A,
+  surfc#362), `merge_books` stamps it on loser tombstones, `unmerge_books` nulls it
+  so undo propagates, and `reconcile_stranded_notes` resolves the survivor from BOTH
+  sources — the stored row's `merged_into` first (fleet-wide record), the local map
+  as fallback — walking chained A→B→C transitively with `resolve_book_id`'s hop-cap
+  discipline, then rehoming via a staged outbox write. A PWA-mirrored liveness guard
+  detaches instead of parking a note on a still-deleted terminus (merge cycle /
+  plain-deleted chain end); a survivor not materialized locally is DEFERRED (left for
+  a later pass), never pushed — core's pull skips absent-row tombstones, so an absent
+  terminal's liveness is unknown and a rehome onto it could park the fleet on a ghost
+  the later local-only detach can't correct. This is the always-to-survivor convergence the PWA
+  gained in surfc#362; deploy order: surfc release → this core release → app pin
+  bumps (SUR-863/877 — no host code change expected). **Accepted residual** (founder,
+  2026-07-23): a book-merge undo reverses only the reassignments in this device's undo
+  token, so a cross-device straggler another device rehomed onto the survivor via the
+  synced `merged_into` during the undo window stays on the survivor after undo — a
+  best-effort-within-the-window limit shared with the PWA (see `unmerge_books` docs). The
+  clean fix (delay fleet-visibility until the window is final) is deferred to a PWA+core
+  follow-up.
+
+- **SUR-1005 — generic additive local-DB column migration in `init_schema`.** Core
+  had no local-schema migration path: a descriptor-only column addition broke
+  existing devices at `apply_row` ("no column named …") because every store
+  read/write names the full descriptor column set. `init_schema` now diffs `PRAGMA
+  table_info` against the descriptor per synced table and `ALTER TABLE … ADD
+  COLUMN`s anything missing (NULL-backfilled, idempotent, order-independent — no
+  reader uses `SELECT *`). The next additive descriptor column needs no new code.
+  Deliberate skips: `BookRecord`/FFI unchanged (hosts don't consume the pointer; no
+  bindings regen, no `touches-ffi`), export/import column maps unchanged (a dropped
+  `mergedInto` on import re-materializes from the cloud via `reconcile_books`).
+
+### Fixed
+
+- **SUR-1005 — books staged patches now carry the stored row's full shape (the
+  SUR-954 note_links class).** `merge_books`' survivor bump + loser tombstones and
+  `unmerge_books`' resurrection + survivor restore staged sparse books patches
+  (`{id, deleted/created_at, updated_at}`). `books.title`/`created_at` are NOT NULL
+  without defaults server-side, and a PostgREST upsert NOT-NULL-checks its INSERT
+  candidate before conflict resolution — so any merge touching a PULLED book (its
+  full-shape create no longer queued in front) would 23502 and permanently wedge
+  the outbox. Latent today only because no host consumer ships merge yet
+  (SUR-863/877). Each site now overlays its changes on the stored row — also the
+  PWA's wire contract (`upsertBook` always sends the full record). Wire-payload
+  only; local semantics unchanged (`stage_local_write` already merges partials).
+
 ## [0.11.1] - 2026-07-23
 
 Twenty-first release batch. Patch release: two sync-engine fixes on the `note_links` /

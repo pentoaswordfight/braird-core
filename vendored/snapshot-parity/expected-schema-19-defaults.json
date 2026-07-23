@@ -98,6 +98,7 @@
         "cover_url": null,
         "cover_source": null,
         "cover_resolved_at": null,
+        "merged_into": null,
         "created_at": null,
         "updated_at": 1700000000000,
         "deleted": false
