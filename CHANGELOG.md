@@ -34,6 +34,20 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   bindings regen, no `touches-ffi`), export/import column maps unchanged (a dropped
   `mergedInto` on import re-materializes from the cloud via `reconcile_books`).
 
+### Fixed
+
+- **SUR-1005 — books staged patches now carry the stored row's full shape (the
+  SUR-954 note_links class).** `merge_books`' survivor bump + loser tombstones and
+  `unmerge_books`' resurrection + survivor restore staged sparse books patches
+  (`{id, deleted/created_at, updated_at}`). `books.title`/`created_at` are NOT NULL
+  without defaults server-side, and a PostgREST upsert NOT-NULL-checks its INSERT
+  candidate before conflict resolution — so any merge touching a PULLED book (its
+  full-shape create no longer queued in front) would 23502 and permanently wedge
+  the outbox. Latent today only because no host consumer ships merge yet
+  (SUR-863/877). Each site now overlays its changes on the stored row — also the
+  PWA's wire contract (`upsertBook` always sends the full record). Wire-payload
+  only; local semantics unchanged (`stage_local_write` already merges partials).
+
 ## [0.11.1] - 2026-07-23
 
 Twenty-first release batch. Patch release: two sync-engine fixes on the `note_links` /

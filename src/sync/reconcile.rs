@@ -1271,7 +1271,9 @@ pub fn merge_books(
     //     the earlier-moved notes.
     // Every loser we tombstone goes in `to_tombstone`; only faithfully-undoable ones (and their note
     // reassignments) go in `undo.loser_ids` / `undo.reassignments`. ──
-    let mut to_tombstone: Vec<String> = Vec::new();
+    // Each entry carries the loser's stored row — the tombstone stages its full shape
+    // (see the SUR-1005 wire-shape comment at step 3).
+    let mut to_tombstone: Vec<(String, Map<String, Value>)> = Vec::new();
     for lid in &losers {
         let loser = match store
             .get_row("books", lid)
@@ -1307,7 +1309,7 @@ pub fn merge_books(
                 });
             }
         }
-        to_tombstone.push(lid.clone());
+        to_tombstone.push((lid.clone(), loser));
         if !resumed {
             undo.loser_ids.push(lid.clone());
         }
@@ -1322,8 +1324,17 @@ pub fn merge_books(
 
     // ── 3. Survivor keeps the earliest created_at across the cluster (mirrors the oracle, which
     // always writes it — LWW-safe even when unchanged). ──
-    let mut sp = Map::new();
-    sp.insert("id".into(), json!(survivor_id));
+    //
+    // SUR-1005 — every books patch below stages the STORED row's full shape with the changes
+    // overlaid, not a sparse patch. Two reasons, both oracle contracts: (a) the PWA's
+    // `upsertBook` always sends the full record, so sparse core payloads were a wire
+    // divergence; (b) `books.title`/`created_at` are NOT NULL without defaults, and a
+    // PostgREST upsert NOT-NULL-checks its INSERT candidate before conflict resolution — a
+    // sparse patch 23502-wedges the outbox the moment the book's own full-shape create is no
+    // longer queued in front of it (any PULLED book — the SUR-954 note_links class exactly).
+    // Wire-payload-only: `stage_local_write` already merges partials onto the stored row
+    // locally, so carrying the stored columns changes nothing local.
+    let mut sp = survivor.clone();
     sp.insert("created_at".into(), json!(earliest));
     sp.insert("updated_at".into(), json!(now));
     store
@@ -1331,9 +1342,8 @@ pub fn merge_books(
         .map_err(|e| format!("merge_books: stage survivor created_at: {e}"))?;
 
     // ── 4. Tombstone every merged loser (undoable or resumed) — only now that every rehome staged. ──
-    for lid in &to_tombstone {
-        let mut patch = Map::new();
-        patch.insert("id".into(), json!(lid));
+    for (lid, loser_row) in &to_tombstone {
+        let mut patch = loser_row.clone(); // full stored shape (see the step-3 wire-shape comment)
         patch.insert("deleted".into(), json!(true));
         // SUR-1005 — the synced loser→survivor pointer (SUR-916 Option 1): rides the
         // tombstone fleet-wide so a device without this merge's local map still converges
@@ -1379,8 +1389,17 @@ pub fn unmerge_books(store: &Store, undo: &BookMergeUndo) -> Result<(), String> 
         // `deleted:true`. `stage_local_write_resurrecting` drops the pending tombstone and stages the
         // `deleted:false` write in ONE transaction — a crash can't leave the row soft-deleted with
         // the tombstone gone but the resurrection unqueued (the ephemeral undo token can't retry).
-        let mut patch = Map::new();
-        patch.insert("id".into(), json!(lid));
+        // Full stored shape (the merge_books step-3 wire-shape contract) — the loser row
+        // always exists locally (this device merged it); a missing row falls back to the
+        // sparse patch rather than failing the undo.
+        let mut patch = store
+            .get_row("books", lid)
+            .map_err(|e| format!("unmerge_books: get loser {lid}: {e}"))?
+            .unwrap_or_else(|| {
+                let mut p = Map::new();
+                p.insert("id".into(), json!(lid));
+                p
+            });
         patch.insert("deleted".into(), json!(false));
         // SUR-1005 — clear the synced pointer so the undo propagates fleet-wide: a device
         // that already pulled `merged_into` stops rehoming stragglers onto the survivor.
@@ -1414,8 +1433,15 @@ pub fn unmerge_books(store: &Store, undo: &BookMergeUndo) -> Result<(), String> 
                 }
             }
         }
-        let mut sp = Map::new();
-        sp.insert("id".into(), json!(undo.survivor_id));
+        // Full stored shape (the merge_books step-3 wire-shape contract).
+        let mut sp = store
+            .get_row("books", &undo.survivor_id)
+            .map_err(|e| format!("unmerge_books: get survivor {}: {e}", undo.survivor_id))?
+            .unwrap_or_else(|| {
+                let mut p = Map::new();
+                p.insert("id".into(), json!(undo.survivor_id));
+                p
+            });
         sp.insert("created_at".into(), json!(earliest));
         sp.insert("updated_at".into(), json!(now));
         store
@@ -3295,7 +3321,11 @@ mod tests {
     // ── SUR-1005: synced merged_into consumption (SUR-916 Option 1 part B) ──
 
     /// The collapsed outbox payload for one record — the row as it would flush.
-    fn collapsed_payload(store: &Store, table: &str, record_id: &str) -> Option<Map<String, Value>> {
+    fn collapsed_payload(
+        store: &Store,
+        table: &str,
+        record_id: &str,
+    ) -> Option<Map<String, Value>> {
         let items: Vec<crate::sync::outbox::OutboxItem> = store
             .outbox_items()
             .unwrap()
@@ -3330,7 +3360,11 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         put(&store, "books", &book_at("s", 5));
         put(&store, "books", &deleted_book_mi("l1", Some("s")));
-        put(&store, "notes", &note_ct("n1", Some("l1"), "STALE-TAG", &[]));
+        put(
+            &store,
+            "notes",
+            &note_ct("n1", Some("l1"), "STALE-TAG", &[]),
+        );
 
         let (rehomed, detached) = reconcile_stranded_notes(&store).unwrap();
 
@@ -3436,7 +3470,11 @@ mod tests {
         // rehome onto it (staged), and the row itself arrives on the next pull — same
         // absent-is-live rule as the PWA's guard.
         let store = Store::open_in_memory().unwrap();
-        put(&store, "books", &deleted_book_mi("l1", Some("not-yet-pulled")));
+        put(
+            &store,
+            "books",
+            &deleted_book_mi("l1", Some("not-yet-pulled")),
+        );
         put(&store, "notes", &note("n1", Some("l1"), &[], 1));
 
         let (rehomed, _) = reconcile_stranded_notes(&store).unwrap();
@@ -3495,6 +3533,47 @@ mod tests {
         put(&dev_b, "notes", &note("n1", Some("l1"), &[], 1));
         let (rehomed, detached) = reconcile_stranded_notes(&dev_b).unwrap();
         assert_eq!((rehomed, detached), (0, 0), "undo stops the convergence");
+    }
+
+    #[test]
+    fn books_wire_payloads_carry_the_full_not_null_shape() {
+        // PULLED books (create not queued in front — put() applies without enqueueing): the
+        // staged patches are each row's ONLY outbox entries, so the collapsed payload is the
+        // exact upsert INSERT candidate. title + created_at are NOT NULL without defaults
+        // server-side — a sparse candidate 23502-wedges the outbox (the SUR-954 note_links
+        // class) — and the PWA's upsertBook always sends the full record.
+        let store = Store::open_in_memory().unwrap();
+        put(&store, "books", &book_at("s", 100));
+        put(&store, "books", &book_at("l1", 50));
+
+        let undo = merge_books(&store, "s", &["l1".into()]).unwrap();
+
+        let tomb = collapsed_payload(&store, "books", "l1").expect("tombstone queued");
+        assert_eq!(tomb.get("title").and_then(Value::as_str), Some("T"));
+        assert_eq!(tomb.get("created_at").and_then(Value::as_i64), Some(50));
+        assert_eq!(tomb.get("merged_into").and_then(Value::as_str), Some("s"));
+        assert!(matches!(tomb.get("deleted"), Some(Value::Bool(true))));
+        let sp = collapsed_payload(&store, "books", "s").expect("survivor bump queued");
+        assert_eq!(sp.get("title").and_then(Value::as_str), Some("T"));
+        assert_eq!(
+            sp.get("created_at").and_then(Value::as_i64),
+            Some(50),
+            "survivor carries the cluster's earliest"
+        );
+
+        unmerge_books(&store, &undo).unwrap();
+        let res = collapsed_payload(&store, "books", "l1").expect("resurrection queued");
+        assert_eq!(res.get("title").and_then(Value::as_str), Some("T"));
+        assert_eq!(res.get("created_at").and_then(Value::as_i64), Some(50));
+        assert!(matches!(res.get("deleted"), Some(Value::Bool(false))));
+        assert_eq!(res.get("merged_into"), Some(&Value::Null));
+        let sr = collapsed_payload(&store, "books", "s").expect("survivor restore queued");
+        assert_eq!(sr.get("title").and_then(Value::as_str), Some("T"));
+        assert_eq!(
+            sr.get("created_at").and_then(Value::as_i64),
+            Some(100),
+            "undo restores the survivor's prior created_at"
+        );
     }
 
     #[test]
