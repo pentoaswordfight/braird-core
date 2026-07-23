@@ -13,11 +13,15 @@
 //!    `mergeCloudRecords`) — no local mutation is created, so nothing is staged to the outbox.
 //! 2. **`reconcile_stranded_notes`** (`useAuth.js` step 2c, `rehomeStrandedNotes` in `db.js`) — a
 //!    live note pointing at a book that IS present locally but soft-deleted (an offline
-//!    book-merge survivor a device didn't itself perform) is repointed to the merge survivor if
-//!    the local `mergedBookIds` map (persisted in `meta`, mirroring the PWA's device-local merge
-//!    map) knows one, else detached (`book_id` → null). Only a real rehome-to-survivor is a
-//!    genuine mutation other clients must learn about (staged via [`super::mod::stage_local_write`]
-//!    equivalent below); a map-less detach stays local-only, exactly mirroring the oracle's
+//!    book-merge survivor a device didn't itself perform) is repointed to the merge survivor,
+//!    resolved from TWO sources per hop (SUR-1005): the loser row's synced `merged_into` pointer
+//!    first (the fleet-wide record — so a device that never received the merge map still
+//!    converges), then the local `mergedBookIds` map (persisted in `meta`, mirroring the PWA's
+//!    device-local merge map) as fallback; else detached (`book_id` → null). A survivor that
+//!    resolves onto a still-deleted book (merge cycle / plain-deleted chain end) also detaches —
+//!    the liveness guard, mirroring surfc#362. Only a real rehome-to-survivor is a genuine
+//!    mutation other clients must learn about (staged via [`super::mod::stage_local_write`]
+//!    equivalent below); a survivor-less detach stays local-only, exactly mirroring the oracle's
 //!    documented LWW-safety rule (`useAuth.js`: "letting it win the LWW race would overwrite the
 //!    survivor truth a map-holding device is converging toward").
 //! 3. **`reconcile_dropped_tags`** (`useAuth.js` step 2d, `preserveDroppedTagsAsCustom` in
