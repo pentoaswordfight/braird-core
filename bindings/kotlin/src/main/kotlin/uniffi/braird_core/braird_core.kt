@@ -1300,7 +1300,7 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_braird_core_checksum_method_syncengine_counts() != 34830.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_braird_core_checksum_method_syncengine_embed_pending() != 7184.toShort()) {
+    if (lib.uniffi_braird_core_checksum_method_syncengine_embed_pending() != 57921.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_book() != 62499.toShort()) {
@@ -2350,6 +2350,18 @@ public interface SyncEngineInterface {
      * next edit re-queues it. Orphan vectors are swept once per pass. Re-registering a
      * different embedder mid-pass is benign: a stale-key row written by the old pass is
      * invisible to the scan and re-embedded via the derived queue.
+     *
+     * FAILURE DEPRIORITIZATION (SUR-1010). A note whose embed failed (`Runtime`, wrong
+     * dimension, degenerate output) is remembered in-process and selected only after
+     * every OTHER pending note has been attempted — without this, the deterministic
+     * newest-first selection re-serves a failing head note to every small chunked drain
+     * and the rest of the corpus starves. Once the whole queue has been attempted, the
+     * memory clears and the next call retries from the top (a lone failing note still
+     * retries every call rather than idling). An edit to a failed note retries it
+     * immediately; re-registering an embedder or restarting the process retries
+     * everything. `Unavailable` is never remembered — the runtime was gone, not the note.
+     * A pass whose embedder was replaced mid-callback discards its failure records (they
+     * describe the departed embedder, and must not deprioritize notes for its successor).
      */
     fun `embedPending`(`maxItems`: kotlin.UInt): EmbedSummary
     
@@ -3001,6 +3013,18 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
      * next edit re-queues it. Orphan vectors are swept once per pass. Re-registering a
      * different embedder mid-pass is benign: a stale-key row written by the old pass is
      * invisible to the scan and re-embedded via the derived queue.
+     *
+     * FAILURE DEPRIORITIZATION (SUR-1010). A note whose embed failed (`Runtime`, wrong
+     * dimension, degenerate output) is remembered in-process and selected only after
+     * every OTHER pending note has been attempted — without this, the deterministic
+     * newest-first selection re-serves a failing head note to every small chunked drain
+     * and the rest of the corpus starves. Once the whole queue has been attempted, the
+     * memory clears and the next call retries from the top (a lone failing note still
+     * retries every call rather than idling). An edit to a failed note retries it
+     * immediately; re-registering an embedder or restarting the process retries
+     * everything. `Unavailable` is never remembered — the runtime was gone, not the note.
+     * A pass whose embedder was replaced mid-callback discards its failure records (they
+     * describe the departed embedder, and must not deprioritize notes for its successor).
      */
     @Throws(SyncException::class)override fun `embedPending`(`maxItems`: kotlin.UInt): EmbedSummary {
             return FfiConverterTypeEmbedSummary.lift(
@@ -4797,7 +4821,9 @@ data class EmbedSummary (
      */
     var `skipped`: kotlin.UInt, 
     /**
-     * Embeds that failed (host error, wrong dimension, non-finite output). Still queued.
+     * Embeds that failed (host error, wrong dimension, non-finite output). Still queued,
+     * but deprioritized: a failed note is re-attempted only after every other pending
+     * note has had its turn, so a failing head can't starve chunked drains (SUR-1010).
      */
     var `failed`: kotlin.UInt, 
     /**

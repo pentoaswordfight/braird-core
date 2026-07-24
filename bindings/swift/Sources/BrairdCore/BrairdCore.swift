@@ -903,6 +903,18 @@ public protocol SyncEngineProtocol : AnyObject {
      * next edit re-queues it. Orphan vectors are swept once per pass. Re-registering a
      * different embedder mid-pass is benign: a stale-key row written by the old pass is
      * invisible to the scan and re-embedded via the derived queue.
+     *
+     * FAILURE DEPRIORITIZATION (SUR-1010). A note whose embed failed (`Runtime`, wrong
+     * dimension, degenerate output) is remembered in-process and selected only after
+     * every OTHER pending note has been attempted — without this, the deterministic
+     * newest-first selection re-serves a failing head note to every small chunked drain
+     * and the rest of the corpus starves. Once the whole queue has been attempted, the
+     * memory clears and the next call retries from the top (a lone failing note still
+     * retries every call rather than idling). An edit to a failed note retries it
+     * immediately; re-registering an embedder or restarting the process retries
+     * everything. `Unavailable` is never remembered — the runtime was gone, not the note.
+     * A pass whose embedder was replaced mid-callback discards its failure records (they
+     * describe the departed embedder, and must not deprioritize notes for its successor).
      */
     func embedPending(maxItems: UInt32) throws  -> EmbedSummary
     
@@ -1521,6 +1533,18 @@ open func counts()throws  -> StoreCounts {
      * next edit re-queues it. Orphan vectors are swept once per pass. Re-registering a
      * different embedder mid-pass is benign: a stale-key row written by the old pass is
      * invisible to the scan and re-embedded via the derived queue.
+     *
+     * FAILURE DEPRIORITIZATION (SUR-1010). A note whose embed failed (`Runtime`, wrong
+     * dimension, degenerate output) is remembered in-process and selected only after
+     * every OTHER pending note has been attempted — without this, the deterministic
+     * newest-first selection re-serves a failing head note to every small chunked drain
+     * and the rest of the corpus starves. Once the whole queue has been attempted, the
+     * memory clears and the next call retries from the top (a lone failing note still
+     * retries every call rather than idling). An edit to a failed note retries it
+     * immediately; re-registering an embedder or restarting the process retries
+     * everything. `Unavailable` is never remembered — the runtime was gone, not the note.
+     * A pass whose embedder was replaced mid-callback discards its failure records (they
+     * describe the departed embedder, and must not deprioritize notes for its successor).
      */
 open func embedPending(maxItems: UInt32)throws  -> EmbedSummary {
     return try  FfiConverterTypeEmbedSummary.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
@@ -3301,7 +3325,9 @@ public struct EmbedSummary {
      */
     public var skipped: UInt32
     /**
-     * Embeds that failed (host error, wrong dimension, non-finite output). Still queued.
+     * Embeds that failed (host error, wrong dimension, non-finite output). Still queued,
+     * but deprioritized: a failed note is re-attempted only after every other pending
+     * note has had its turn, so a failing head can't starve chunked drains (SUR-1010).
      */
     public var failed: UInt32
     /**
@@ -3323,7 +3349,9 @@ public struct EmbedSummary {
          * mid-embed (they re-queue with the new token).
          */skipped: UInt32, 
         /**
-         * Embeds that failed (host error, wrong dimension, non-finite output). Still queued.
+         * Embeds that failed (host error, wrong dimension, non-finite output). Still queued,
+         * but deprioritized: a failed note is re-attempted only after every other pending
+         * note has had its turn, so a failing head can't starve chunked drains (SUR-1010).
          */failed: UInt32, 
         /**
          * The derived queue size after this pass.
@@ -6362,7 +6390,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_braird_core_checksum_method_syncengine_counts() != 34830) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_braird_core_checksum_method_syncengine_embed_pending() != 7184) {
+    if (uniffi_braird_core_checksum_method_syncengine_embed_pending() != 57921) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_enqueue_book() != 62499) {

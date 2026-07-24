@@ -6,6 +6,32 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+### Fixed
+- **Embed-queue head-of-line starvation under chunked drains (SUR-1010).** `Runtime`,
+  wrong-dimension, and degenerate-vector failures wrote no marker or attempt state, while
+  `embed_pending`'s selection was deterministic newest-first — so a host draining with
+  `embed_pending(1)` re-attempted the same failing head note every call and the rest of the
+  corpus never embedded, even though every pass reported `attempted: 1`. The engine now keeps
+  an **in-memory, token-keyed failure memory** (deliberately not durable — ADR 0006's derived
+  queue governs what persists; a process restart is a natural retry): failed notes are
+  selected only after every other pending note has been attempted, then the memory clears and
+  the next generation retries from the top (a lone failing note still retries every call
+  rather than idling on `attempted: 0`). An edit to a failed note retries it immediately (the
+  memory keys on the content token, which the edit moves); `register_embedder` clears the
+  memory; `Unavailable` is never remembered (the runtime's fault, not the note's).
+  `Store::pending_embeddings` now returns `(id, token)` pairs so selection filters without
+  per-candidate re-queries. The memory is additionally **registration-generation-scoped**
+  (founder-caught follow-up): a pass holds its embedder clone across the lock-free host
+  callback, so a mid-callback `register_embedder` could otherwise clear the memory and then
+  receive the OLD embedder's late failure record — making a freshly-fixed embedder
+  deprioritize the very head note it should retry first; stale-generation inserts are now
+  dropped (deterministically repro'd via a reentrant mid-callback swap; the exhaustion clear
+  deliberately does NOT bump the generation, since a same-registration failure is always
+  current). No FFI signature change — `embed_pending` / `EmbedSummary.failed` docstrings
+  gained the deprioritization contract (bindings regenerated). Six new tests pin the repro
+  and each semantic (starvation, lone-note generation retry, edit-retry, register-clear,
+  Unavailable-exempt, stale-pass generation drop).
+
 ## [0.13.0] - 2026-07-24
 
 Twenty-third release batch. Minor release: SUR-997 — the semantic-embedding foundation (the

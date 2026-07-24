@@ -27,6 +27,7 @@ pub mod push;
 mod read;
 mod reconcile;
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -338,6 +339,36 @@ pub struct SyncEngine {
     /// at registration so no later call re-crosses the FFI for it. `None` until
     /// [`SyncEngine::register_embedder`]; every embedding method requires it.
     embedder: Mutex<Option<RegisteredEmbedder>>,
+    /// SUR-1010 — the in-memory embed-failure memory (see [`EmbedFailureMemory`]).
+    /// Deliberately NOT durable state — ADR 0006 decision 3 (the derived queue) governs
+    /// what persists, and a process restart is a natural retry. Never held across a host
+    /// callback.
+    embed_failures: Mutex<EmbedFailureMemory>,
+}
+
+/// SUR-1010 — which pending notes failed to embed, and under WHICH registration.
+///
+/// `by_note` maps note id → the content token that failed (`Runtime` / wrong-dimension /
+/// degenerate output; NEVER `Unavailable`, which is the runtime's fault, not the note's).
+/// Selection deprioritizes these so a failing head note can't starve small chunked drains;
+/// once every pending note has been attempted the map clears and the next sweep retries
+/// from the top. Token-keyed, so an EDIT to a failed note retries it immediately.
+///
+/// `registration_generation` scopes the entries to the registration that recorded them.
+/// An `embed_pending` pass holds its `RegisteredEmbedder` clone across the (lock-free)
+/// host callback, so `register_embedder` can install a replacement and clear this map
+/// while the OLD embedder's call is still in flight — and the old pass's failure would
+/// then be recorded into the NEW registration's memory, making a freshly-fixed embedder
+/// deprioritize the very head note it should retry first. Every insert therefore checks
+/// that the pass's generation is still current ([`SyncEngine::record_embed_failure`]) and
+/// drops the record otherwise; the exhaustion clear does NOT bump the generation (a
+/// same-registration failure is always current information).
+#[derive(Default)]
+struct EmbedFailureMemory {
+    /// Bumped (under the same lock as the clear) by every [`SyncEngine::register_embedder`].
+    registration_generation: u64,
+    /// note id → the content token that failed under this generation's embedder.
+    by_note: HashMap<String, String>,
 }
 
 /// A registered embedder plus its cached identity. `descriptor()` is a foreign call — it
@@ -347,6 +378,9 @@ struct RegisteredEmbedder {
     embedder: Arc<dyn Embedder>,
     corpus_key: String,
     dims: u32,
+    /// The [`EmbedFailureMemory::registration_generation`] this registration was installed
+    /// under — a pass carrying a stale generation drops its failure records (SUR-1010).
+    generation: u64,
 }
 
 macro_rules! lock {
@@ -384,6 +418,7 @@ impl SyncEngine {
             vault,
             runtime,
             embedder: Mutex::new(None),
+            embed_failures: Mutex::new(EmbedFailureMemory::default()),
         }))
     }
 
@@ -2320,6 +2355,18 @@ impl SyncEngine {
             .ok_or(SyncError::EmbedderNotRegistered)
     }
 
+    /// Record one embed failure into the memory — IFF the recording pass's registration is
+    /// still the current one. A pass whose embedder was replaced mid-callback carries a
+    /// stale generation; its failure describes an embedder that is gone, and recording it
+    /// would make the freshly registered (possibly fixed) embedder deprioritize the very
+    /// head note it should retry first (SUR-1010).
+    fn record_embed_failure(&self, reg: &RegisteredEmbedder, id: &str, token: &str) {
+        let mut failures = lock!(self.embed_failures);
+        if failures.registration_generation == reg.generation {
+            failures.by_note.insert(id.to_string(), token.to_string());
+        }
+    }
+
     /// Brute-force cosine top-k over the sealed live corpus (SUR-529: no ANN below ~100k
     /// docs). Vectors are opened with the vault (AAD = their note id) OUTSIDE the store
     /// lock; a blob that fails to open or decode is hard-deleted so the pending derivation
@@ -2396,10 +2443,22 @@ impl SyncEngine {
             ));
         }
         let corpus_key = embeddings::corpus_key(&descriptor);
+        // A new (or re-registered) embedder may succeed where the old one failed — start
+        // the failure memory fresh, and bump the generation UNDER THE SAME LOCK so an
+        // in-flight pass's late insert (it still holds the old RegisteredEmbedder clone
+        // across the host callback) is dropped by the generation check rather than
+        // poisoning this registration's memory (SUR-1010).
+        let generation = {
+            let mut failures = lock!(self.embed_failures);
+            failures.by_note.clear();
+            failures.registration_generation += 1;
+            failures.registration_generation
+        };
         *lock!(self.embedder) = Some(RegisteredEmbedder {
             embedder,
             corpus_key: corpus_key.clone(),
             dims: descriptor.dims,
+            generation,
         });
         let store = lock!(self.store);
         let invalidated = store
@@ -2441,14 +2500,50 @@ impl SyncEngine {
     /// next edit re-queues it. Orphan vectors are swept once per pass. Re-registering a
     /// different embedder mid-pass is benign: a stale-key row written by the old pass is
     /// invisible to the scan and re-embedded via the derived queue.
+    ///
+    /// FAILURE DEPRIORITIZATION (SUR-1010). A note whose embed failed (`Runtime`, wrong
+    /// dimension, degenerate output) is remembered in-process and selected only after
+    /// every OTHER pending note has been attempted — without this, the deterministic
+    /// newest-first selection re-serves a failing head note to every small chunked drain
+    /// and the rest of the corpus starves. Once the whole queue has been attempted, the
+    /// memory clears and the next call retries from the top (a lone failing note still
+    /// retries every call rather than idling). An edit to a failed note retries it
+    /// immediately; re-registering an embedder or restarting the process retries
+    /// everything. `Unavailable` is never remembered — the runtime was gone, not the note.
+    /// A pass whose embedder was replaced mid-callback discards its failure records (they
+    /// describe the departed embedder, and must not deprioritize notes for its successor).
     pub fn embed_pending(&self, max_items: u32) -> Result<EmbedSummary, SyncError> {
         let reg = self.registered_embedder()?;
-        let ids = {
+        let all_pending = {
             let store = lock!(self.store);
             store.sweep_orphan_embeddings().map_err(store_err)?;
+            // The FULL queue, not LIMIT max_items: the failure filter below must be able
+            // to select past a failing head. Ids + tokens only — trivial at archive scale.
             store
-                .pending_embeddings(&reg.corpus_key, i64::from(max_items))
+                .pending_embeddings(&reg.corpus_key, -1)
                 .map_err(store_err)?
+        };
+        let ids: Vec<String> = {
+            let mut failures = lock!(self.embed_failures);
+            let fresh: Vec<&(String, String)> = all_pending
+                .iter()
+                .filter(|(id, token)| failures.by_note.get(id) != Some(token))
+                .collect();
+            let sweep = if fresh.is_empty() && !all_pending.is_empty() {
+                // Every pending note has failed — clear and retry from the top rather
+                // than idling forever on attempted: 0. Deliberately does NOT bump the
+                // registration generation: a same-registration failure recorded by a
+                // concurrent pass is still current information.
+                failures.by_note.clear();
+                all_pending.iter().collect()
+            } else {
+                fresh
+            };
+            sweep
+                .into_iter()
+                .take(max_items as usize)
+                .map(|(id, _)| id.clone())
+                .collect()
         };
         let (mut attempted, mut embedded, mut skipped, mut failed) = (0u32, 0u32, 0u32, 0u32);
         'pass: for id in ids {
@@ -2486,19 +2581,24 @@ impl SyncEngine {
                 Ok(v) => v,
                 Err(EmbedderError::Runtime) => {
                     failed += 1;
+                    // Remember (id → token) so selection deprioritizes it (SUR-1010).
+                    self.record_embed_failure(&reg, &id, &token);
                     continue;
                 }
                 Err(EmbedderError::Unavailable) => {
                     failed += 1;
-                    break 'pass; // the runtime is gone; the host re-drains later
+                    // Deliberately NOT remembered: the runtime was gone, not the note.
+                    break 'pass; // the host re-drains later
                 }
             };
             if vector.len() != reg.dims as usize {
                 failed += 1; // dims contract violated — never store a mis-sized vector
+                self.record_embed_failure(&reg, &id, &token);
                 continue;
             }
             let Some(unit) = embeddings::normalize(vector) else {
                 failed += 1; // zero/NaN/Inf output — unusable
+                self.record_embed_failure(&reg, &id, &token);
                 continue;
             };
             let sealed = self
@@ -7526,6 +7626,244 @@ mod tests {
             engine.semantic_search("q".into(), 5).unwrap_err(),
             SyncError::Embed(_)
         ));
+    }
+
+    /// Fails any text containing "poison"; embeds everything else. Local to the SUR-1010
+    /// starvation tests.
+    struct PoisonEmbedder;
+    impl Embedder for PoisonEmbedder {
+        fn descriptor(&self) -> EmbedderDescriptor {
+            EmbedderDescriptor {
+                model_id: "poison".into(),
+                dims: DIMS,
+                quantization: "test".into(),
+            }
+        }
+        fn embed_document(&self, text: String) -> Result<Vec<f32>, EmbedderError> {
+            if text.contains("poison") {
+                Err(EmbedderError::Runtime)
+            } else {
+                Ok(histogram(&text))
+            }
+        }
+        fn embed_query(&self, text: String) -> Result<Vec<f32>, EmbedderError> {
+            Ok(histogram(&text))
+        }
+    }
+
+    fn stamped(id: &str, text: &str, created_at: i64) -> NoteUpsert {
+        NoteUpsert {
+            created_at,
+            ..note_upsert(id, text)
+        }
+    }
+
+    #[test]
+    fn a_failing_head_note_does_not_starve_chunked_drains() {
+        // SUR-1010 regression: the newest pending note fails every embed, and a host
+        // draining with embed_pending(1) must still reach the older notes — pre-fix, the
+        // deterministic newest-first selection re-served the poison head every call and
+        // the rest of the corpus never embedded.
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, _) = embed_engine(&dir, "starvation");
+        engine
+            .enqueue_note(stamped("n-poison", "poison", 30))
+            .unwrap();
+        engine.enqueue_note(stamped("n-good1", "aaaa", 20)).unwrap();
+        engine.enqueue_note(stamped("n-good2", "bbbb", 10)).unwrap();
+        engine.register_embedder(Arc::new(PoisonEmbedder)).unwrap();
+
+        // Pass 1 attempts (and fails) the poison head; the failure memory then
+        // deprioritizes it, so passes 2–3 reach BOTH older notes.
+        for _ in 0..3 {
+            assert_eq!(engine.embed_pending(1).unwrap().attempted, 1);
+        }
+        assert_eq!(
+            engine.semantic_search("aaaa".into(), 10).unwrap()[0].note_id,
+            "n-good1"
+        );
+        assert_eq!(
+            engine.semantic_search("bbbb".into(), 10).unwrap()[0].note_id,
+            "n-good2"
+        );
+        assert_eq!(
+            engine.pending_embed_count().unwrap(),
+            1,
+            "only the poison note remains pending"
+        );
+    }
+
+    #[test]
+    fn a_lone_failing_note_retries_every_call_instead_of_idling() {
+        // Generation semantics: when EVERY pending note has failed, the memory clears and
+        // the next call retries from the top — attempted stays 1, never 0.
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, _) = embed_engine(&dir, "lone-poison");
+        engine
+            .enqueue_note(note_upsert("n-poison", "poison"))
+            .unwrap();
+        engine.register_embedder(Arc::new(PoisonEmbedder)).unwrap();
+
+        for _ in 0..3 {
+            let p = engine.embed_pending(1).unwrap();
+            assert_eq!((p.attempted, p.failed, p.pending), (1, 1, 1));
+        }
+    }
+
+    #[test]
+    fn an_edit_to_a_failed_note_retries_it_immediately() {
+        // The memory is TOKEN-keyed: an edit moves the token, so the note stops matching
+        // its failure entry and is selected first again (it's newest).
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, _) = embed_engine(&dir, "edit-retry");
+        engine
+            .enqueue_note(stamped("n-flaky", "poison", 30))
+            .unwrap();
+        engine.enqueue_note(stamped("n-good", "aaaa", 20)).unwrap();
+        engine.register_embedder(Arc::new(PoisonEmbedder)).unwrap();
+
+        assert_eq!(engine.embed_pending(1).unwrap().failed, 1, "head fails");
+        // The edit fixes the text (content_tag recomputes → token moves).
+        engine.enqueue_note(stamped("n-flaky", "cccc", 30)).unwrap();
+        let p = engine.embed_pending(1).unwrap();
+        assert_eq!(
+            (p.attempted, p.embedded),
+            (1, 1),
+            "edited note retried first"
+        );
+        assert_eq!(
+            engine.semantic_search("cccc".into(), 10).unwrap()[0].note_id,
+            "n-flaky"
+        );
+    }
+
+    #[test]
+    fn register_embedder_clears_the_failure_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, _) = embed_engine(&dir, "reregister-retry");
+        engine
+            .enqueue_note(stamped("n-poison", "poison", 30))
+            .unwrap();
+        engine.enqueue_note(stamped("n-good", "aaaa", 20)).unwrap();
+        engine.register_embedder(Arc::new(PoisonEmbedder)).unwrap();
+        assert_eq!(engine.embed_pending(1).unwrap().failed, 1, "head fails");
+
+        // Same descriptor, fresh registration — the memory must clear, so the (still
+        // newest) poison note is selected FIRST again rather than the good note.
+        engine.register_embedder(Arc::new(PoisonEmbedder)).unwrap();
+        let p = engine.embed_pending(1).unwrap();
+        assert_eq!((p.attempted, p.failed, p.embedded), (1, 1, 0));
+        assert_eq!(
+            engine.pending_embed_count().unwrap(),
+            2,
+            "good note still pending — the retried head was the poison note"
+        );
+    }
+
+    #[test]
+    fn a_stale_pass_cannot_poison_a_new_registrations_failure_memory() {
+        // The mid-callback re-registration race: pass A (old embedder) is inside the host
+        // callback — holding its RegisteredEmbedder clone, no engine lock — when
+        // register_embedder installs a replacement and clears the failure memory; pass
+        // A's failure then tries to record into the NEW registration's memory. The
+        // generation check must drop that insert — otherwise the freshly registered
+        // (fixed) embedder deprioritizes the failed head note behind the whole tail and
+        // a chunk-1 drain works through unrelated notes first.
+        struct SwapThenFail {
+            engine: Mutex<Option<Arc<SyncEngine>>>,
+        }
+        impl Embedder for SwapThenFail {
+            fn descriptor(&self) -> EmbedderDescriptor {
+                EmbedderDescriptor {
+                    model_id: "old-broken".into(),
+                    dims: DIMS,
+                    quantization: "test".into(),
+                }
+            }
+            fn embed_document(&self, _text: String) -> Result<Vec<f32>, EmbedderError> {
+                // Mid-callback, the host swaps in a fixed embedder…
+                let engine = self.engine.lock().unwrap().clone().unwrap();
+                engine
+                    .register_embedder(HistogramEmbedder::new("fixed-model"))
+                    .unwrap();
+                // …then the OLD embedder's in-flight embed fails.
+                Err(EmbedderError::Runtime)
+            }
+            fn embed_query(&self, text: String) -> Result<Vec<f32>, EmbedderError> {
+                Ok(histogram(&text))
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, _) = embed_engine(&dir, "stale-pass");
+        engine.enqueue_note(stamped("n-head", "aaaa", 30)).unwrap();
+        engine.enqueue_note(stamped("n-tail", "bbbb", 20)).unwrap();
+        let swapper = Arc::new(SwapThenFail {
+            engine: Mutex::new(None),
+        });
+        engine.register_embedder(swapper.clone()).unwrap();
+        *swapper.engine.lock().unwrap() = Some(engine.clone());
+
+        let p = engine.embed_pending(1).unwrap();
+        assert_eq!(
+            (p.attempted, p.failed),
+            (1, 1),
+            "old embedder failed the head"
+        );
+
+        // The FIXED embedder retries the head note FIRST — a poisoned memory would send
+        // this chunk-1 drain to the tail instead.
+        let p = engine.embed_pending(1).unwrap();
+        assert_eq!((p.attempted, p.embedded), (1, 1));
+        assert_eq!(
+            engine.semantic_search("aaaa".into(), 10).unwrap()[0].note_id,
+            "n-head",
+            "the head embedded on the first post-swap drain"
+        );
+    }
+
+    #[test]
+    fn unavailable_is_never_remembered_as_a_note_failure() {
+        // Unavailable is the RUNTIME's fault: the same head note must be re-attempted
+        // first on the next call, not deprioritized behind the queue.
+        struct GoneEmbedder {
+            attempts: Mutex<Vec<String>>,
+        }
+        impl Embedder for GoneEmbedder {
+            fn descriptor(&self) -> EmbedderDescriptor {
+                EmbedderDescriptor {
+                    model_id: "gone".into(),
+                    dims: DIMS,
+                    quantization: "test".into(),
+                }
+            }
+            fn embed_document(&self, text: String) -> Result<Vec<f32>, EmbedderError> {
+                self.attempts.lock().unwrap().push(text);
+                Err(EmbedderError::Unavailable)
+            }
+            fn embed_query(&self, text: String) -> Result<Vec<f32>, EmbedderError> {
+                Ok(histogram(&text))
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, _) = embed_engine(&dir, "gone-retry");
+        engine
+            .enqueue_note(stamped("n-head", "head text", 30))
+            .unwrap();
+        engine
+            .enqueue_note(stamped("n-tail", "tail text", 20))
+            .unwrap();
+        let embedder = Arc::new(GoneEmbedder {
+            attempts: Mutex::new(Vec::new()),
+        });
+        engine.register_embedder(embedder.clone()).unwrap();
+
+        engine.embed_pending(1).unwrap();
+        engine.embed_pending(1).unwrap();
+        assert_eq!(
+            *embedder.attempts.lock().unwrap(),
+            vec!["head text".to_string(), "head text".to_string()],
+            "both calls attempt the HEAD note — Unavailable never deprioritizes it"
+        );
     }
 
     #[test]

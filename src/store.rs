@@ -1110,21 +1110,25 @@ impl Store {
         )
     }
 
-    /// The derived embed queue: live notes whose vector is missing, keyed to a different
-    /// corpus, or embedded from different text (token mismatch — see
-    /// [`Store::note_content_token`]). Newest-first (recent notes become searchable first),
-    /// `limit < 0` = no limit.
+    /// The derived embed queue as `(note id, current content token)` pairs: live notes
+    /// whose vector is missing, keyed to a different corpus, or embedded from different
+    /// text (token mismatch — see [`Store::note_content_token`]). Newest-first (recent
+    /// notes become searchable first), `limit < 0` = no limit. The token rides along so
+    /// the engine's failure memory (SUR-1010) can deprioritize by `(id, token)` without a
+    /// per-candidate re-query.
     pub(crate) fn pending_embeddings(
         &self,
         corpus_key: &str,
         limit: i64,
-    ) -> rusqlite::Result<Vec<String>> {
+    ) -> rusqlite::Result<Vec<(String, String)>> {
         let sql = format!(
             "{} ORDER BY n.created_at DESC, n.id DESC LIMIT ?2",
-            pending_embeddings_sql("n.id"),
+            pending_embeddings_sql(&format!("n.id, {}", content_token_sql("n"))),
         );
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(rusqlite::params![corpus_key, limit], |row| row.get(0))?;
+        let rows = stmt.query_map(rusqlite::params![corpus_key, limit], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
         rows.collect()
     }
 
@@ -2010,7 +2014,12 @@ mod tests {
             .upsert_embedding_if_current("marker", KEY, "tag-e", None, 10)
             .unwrap();
 
-        let mut pending = store.pending_embeddings(KEY, -1).unwrap();
+        let mut pending: Vec<String> = store
+            .pending_embeddings(KEY, -1)
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
         pending.sort();
         assert_eq!(
             pending,
@@ -2018,10 +2027,11 @@ mod tests {
         );
         assert_eq!(store.pending_embedding_count(KEY).unwrap(), 4);
         // Newest-first ordering + limit (the re-seeded stale-text row now carries the
-        // newest created_at, 30 — apply_row is a full-row replace).
+        // newest created_at, 30 — apply_row is a full-row replace), and each id rides
+        // with its CURRENT content token (SUR-1010: the failure memory keys on it).
         assert_eq!(
             store.pending_embeddings(KEY, 1).unwrap(),
-            vec!["stale-text"]
+            vec![("stale-text".to_string(), "tag-c3".to_string())]
         );
 
         // The tagless fallback token really is u:{updated_at}: embedding under it drains it.
