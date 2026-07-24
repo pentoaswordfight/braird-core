@@ -20,10 +20,17 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
   memory keys on the content token, which the edit moves); `register_embedder` clears the
   memory; `Unavailable` is never remembered (the runtime's fault, not the note's).
   `Store::pending_embeddings` now returns `(id, token)` pairs so selection filters without
-  per-candidate re-queries. No FFI signature change — `embed_pending` / `EmbedSummary.failed`
-  docstrings gained the deprioritization contract (bindings regenerated). Five new tests pin
-  the repro and each semantic (starvation, lone-note generation retry, edit-retry,
-  register-clear, Unavailable-exempt).
+  per-candidate re-queries. The memory is additionally **registration-generation-scoped**
+  (founder-caught follow-up): a pass holds its embedder clone across the lock-free host
+  callback, so a mid-callback `register_embedder` could otherwise clear the memory and then
+  receive the OLD embedder's late failure record — making a freshly-fixed embedder
+  deprioritize the very head note it should retry first; stale-generation inserts are now
+  dropped (deterministically repro'd via a reentrant mid-callback swap; the exhaustion clear
+  deliberately does NOT bump the generation, since a same-registration failure is always
+  current). No FFI signature change — `embed_pending` / `EmbedSummary.failed` docstrings
+  gained the deprioritization contract (bindings regenerated). Six new tests pin the repro
+  and each semantic (starvation, lone-note generation retry, edit-retry, register-clear,
+  Unavailable-exempt, stale-pass generation drop).
 
 ## [0.13.0] - 2026-07-24
 

@@ -913,6 +913,8 @@ public protocol SyncEngineProtocol : AnyObject {
      * retries every call rather than idling). An edit to a failed note retries it
      * immediately; re-registering an embedder or restarting the process retries
      * everything. `Unavailable` is never remembered — the runtime was gone, not the note.
+     * A pass whose embedder was replaced mid-callback discards its failure records (they
+     * describe the departed embedder, and must not deprioritize notes for its successor).
      */
     func embedPending(maxItems: UInt32) throws  -> EmbedSummary
     
@@ -1541,6 +1543,8 @@ open func counts()throws  -> StoreCounts {
      * retries every call rather than idling). An edit to a failed note retries it
      * immediately; re-registering an embedder or restarting the process retries
      * everything. `Unavailable` is never remembered — the runtime was gone, not the note.
+     * A pass whose embedder was replaced mid-callback discards its failure records (they
+     * describe the departed embedder, and must not deprioritize notes for its successor).
      */
 open func embedPending(maxItems: UInt32)throws  -> EmbedSummary {
     return try  FfiConverterTypeEmbedSummary.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
@@ -6386,7 +6390,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_braird_core_checksum_method_syncengine_counts() != 34830) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_braird_core_checksum_method_syncengine_embed_pending() != 15398) {
+    if (uniffi_braird_core_checksum_method_syncengine_embed_pending() != 57921) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_braird_core_checksum_method_syncengine_enqueue_book() != 62499) {

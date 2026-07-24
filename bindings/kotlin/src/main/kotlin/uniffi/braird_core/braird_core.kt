@@ -1300,7 +1300,7 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_braird_core_checksum_method_syncengine_counts() != 34830.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_braird_core_checksum_method_syncengine_embed_pending() != 15398.toShort()) {
+    if (lib.uniffi_braird_core_checksum_method_syncengine_embed_pending() != 57921.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_book() != 62499.toShort()) {
@@ -2360,6 +2360,8 @@ public interface SyncEngineInterface {
      * retries every call rather than idling). An edit to a failed note retries it
      * immediately; re-registering an embedder or restarting the process retries
      * everything. `Unavailable` is never remembered — the runtime was gone, not the note.
+     * A pass whose embedder was replaced mid-callback discards its failure records (they
+     * describe the departed embedder, and must not deprioritize notes for its successor).
      */
     fun `embedPending`(`maxItems`: kotlin.UInt): EmbedSummary
     
@@ -3021,6 +3023,8 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
      * retries every call rather than idling). An edit to a failed note retries it
      * immediately; re-registering an embedder or restarting the process retries
      * everything. `Unavailable` is never remembered — the runtime was gone, not the note.
+     * A pass whose embedder was replaced mid-callback discards its failure records (they
+     * describe the departed embedder, and must not deprioritize notes for its successor).
      */
     @Throws(SyncException::class)override fun `embedPending`(`maxItems`: kotlin.UInt): EmbedSummary {
             return FfiConverterTypeEmbedSummary.lift(
