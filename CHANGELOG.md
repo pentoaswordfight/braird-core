@@ -6,6 +6,20 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+## [0.13.1] - 2026-07-24
+
+Twenty-fourth release batch. Patch release, two fixes merged since v0.13.0 — **hosts should
+pin this over v0.13.0**. SUR-1009 (founder-found on a real device): the flush's
+targeted-PATCH arm was hard-coded to `notes`, so any other table's sparse patch upserted and
+PostgREST rejected the incomplete INSERT shape — a partial `books` payload wedged its outbox
+group and, via `fk_deps`, every dependent note, silently and forever; now per-table
+`required_insert_columns` routes any partial patch down the PATCH arm and wedged rows
+self-heal on the next flush. SUR-1010: the embed queue's failure paths wrote no state, so a
+failing head note starved chunked drains (`embed_pending(1)` — precisely the Android drain
+shape); an in-memory, token-keyed, registration-generation-scoped failure memory now
+deprioritizes failed notes until the rest of the queue has been attempted. No FFI signature
+changes — current hosts pin-bump with no code changes.
+
 ### Fixed
 - **A sparse `books` patch could never push, wedging its notes forever (SUR-1009).** The flush's
   targeted-PATCH arm was hard-coded to `notes` missing `text`, so every other table always
