@@ -124,7 +124,9 @@ pub struct EmbedSummary {
     /// Notes that produced a skip marker (empty text, decrypt failure) or whose text moved
     /// mid-embed (they re-queue with the new token).
     pub skipped: u32,
-    /// Embeds that failed (host error, wrong dimension, non-finite output). Still queued.
+    /// Embeds that failed (host error, wrong dimension, non-finite output). Still queued,
+    /// but deprioritized: a failed note is re-attempted only after every other pending
+    /// note has had its turn, so a failing head can't starve chunked drains (SUR-1010).
     pub failed: u32,
     /// The derived queue size after this pass.
     pub pending: u32,
