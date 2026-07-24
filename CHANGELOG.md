@@ -7,6 +7,20 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 ## [Unreleased]
 
 ### Fixed
+- **A sparse `books` patch could never push, wedging its notes forever (SUR-1009).** The flush's
+  targeted-PATCH arm was hard-coded to `notes` missing `text`, so every other table always
+  upserted — and PostgREST validates an upsert's INSERT shape *before* its `on_conflict` UPDATE.
+  `books.title` is `not null` with **no default**, so any partial book payload (a cover
+  resolution, a merge tombstone) was rejected on every flush, forever, with no retry ceiling and
+  no signal. Worse, `fk_deps` then held back every note whose `book_id` pointed at that book, so
+  a book-merge dedup's note tombstones never reached the server either: found on a device with
+  **15 rows wedged for two days** and six notes silently diverged, still showing as duplicates on
+  the other clients while the writing device looked correct. The PATCH-vs-upsert decision is now
+  driven by a per-table `required_insert_columns` (each synced table's `not null`-without-default
+  columns, minus the JWT-injected `user_id`), so any table's partial patch takes the PATCH arm;
+  a group carrying its full insert shape still upserts, so an offline create still inserts. The
+  wedged rows self-heal on the next flush — no migration or manual repair. `notes` keeps `text`
+  in its list so SUR-724's empirical finding can't be quietly weakened.
 - **Embed-queue head-of-line starvation under chunked drains (SUR-1010).** `Runtime`,
   wrong-dimension, and degenerate-vector failures wrote no marker or attempt state, while
   `embed_pending`'s selection was deterministic newest-first — so a host draining with

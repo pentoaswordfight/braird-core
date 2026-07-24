@@ -9,8 +9,9 @@
 //!   4. a row whose FK points at a failed/held parent this run stays queued (no server FK
 //!      violation); on success a book records temp→server in the persisted remap, saved after the
 //!      books pass and before any child table needs it;
-//!   5. a collapsed notes group with no `text` uses targeted PATCH, because PostgREST upsert checks
-//!      the NOT-NULL insert shape before conflict update; a group carrying `text` still upserts;
+//!   5. a collapsed group missing any of its table's [`required_insert_columns`] uses targeted
+//!      PATCH, because PostgREST upsert checks the NOT-NULL insert shape before conflict update; a
+//!      group carrying the full shape still upserts (so an offline create can still insert);
 //!   6. clear only the succeeded outbox ids; failed/held groups stay queued for the next flush.
 //!
 //! One ordered pass replaces SUR-724's hard-coded books-then-notes loops. It also closes a latent
@@ -39,6 +40,36 @@ fn on_conflict_for(table: &str) -> &'static str {
     match table {
         "note_signals" => "note_id",
         _ => "id",
+    }
+}
+
+/// The columns a table's INSERT shape requires, so a collapsed group missing ANY of them cannot
+/// upsert: PostgREST validates the insert candidate BEFORE its `on_conflict` UPDATE, so a sparse
+/// payload is rejected outright instead of falling through to an update that would have preserved
+/// the stored value. Such a group dispatches as a targeted PATCH against the existing row.
+///
+/// These are each synced table's `not null` columns (surfc migration 0001 onward) minus `user_id`,
+/// which [`upsert_group`] injects from the JWT on every row, and minus columns whose server default
+/// makes absence harmless. `created_at` is `not null` with no default on every table except
+/// `custom_ideas`; `title`/`name` likewise. `notes.text` does carry `default ''` but stays listed:
+/// SUR-724 established empirically that a plaintext-free notes payload must never upsert, and this
+/// list must not quietly weaken that.
+///
+/// SUR-1009: `books` was the gap. `books.title` is `not null` with NO default, so every sparse book
+/// patch — a cover resolution, a merge tombstone — was rejected on every flush, forever. Worse, the
+/// [`fk_deps`] hold-back then kept every note pointing at that book queued too, so a dedup's note
+/// tombstones never reached the server and other clients kept showing the duplicates.
+fn required_insert_columns(table: &str) -> &'static [&'static str] {
+    match table {
+        "books" => &["title", "created_at"],
+        "notes" => &["text", "created_at"],
+        "custom_ideas" => &["name"],
+        "lenses" => &["name", "created_at"],
+        "collections" => &["name", "created_at"],
+        "collection_memberships" => &["note_id", "collection_id", "created_at"],
+        "note_links" => &["from_note_id", "to_note_id", "created_at"],
+        "note_signals" => &["created_at"],
+        _ => &[],
     }
 }
 
@@ -143,7 +174,13 @@ pub async fn flush<S: PostgrestSink>(
                 continue;
             }
 
-            let write_result = if table == "notes" && !group.payload.contains_key("text") {
+            // A group that cannot satisfy the table's INSERT shape patches the existing row instead
+            // of upserting (see [`required_insert_columns`]). Was `notes`-only, which left every
+            // sparse `books` patch permanently rejected and its notes held behind it (SUR-1009).
+            let sparse = required_insert_columns(table)
+                .iter()
+                .any(|column| !group.payload.contains_key(*column));
+            let write_result = if sparse {
                 patch_group(sink, &group, on_conflict_for(table), &record_id).await
             } else {
                 upsert_group(sink, &group, user_id).await
@@ -311,9 +348,23 @@ mod tests {
 
     /// Enqueue a minimal valid row for `table` keyed `record_id`. `extra` fields (e.g. FK columns)
     /// merge over the pk so a test can wire parent/child edges. Used by the SUR-726 fan-out tests.
+    ///
+    /// Carries every [`required_insert_columns`] entry, so the row dispatches as an UPSERT: these
+    /// tests are about dispatch ORDER and FK hold-back, and a row missing its insert shape would
+    /// silently take the sparse-PATCH arm instead (SUR-1009). A real create always carries the full
+    /// shape — only a partial patch is sparse — so a test row must too. `extra` still wins, letting a
+    /// test override an FK column.
     fn enqueue_row(store: &Store, table: &str, pk_col: &str, record_id: &str, extra: Value) {
         let mut payload = serde_json::Map::new();
         payload.insert(pk_col.to_string(), json!(record_id));
+        for column in required_insert_columns(table) {
+            let value = if *column == "created_at" {
+                json!(1)
+            } else {
+                json!(format!("{column}-value"))
+            };
+            payload.insert((*column).to_string(), value);
+        }
         if let Value::Object(fields) = extra {
             for (k, v) in fields {
                 payload.insert(k, v);
@@ -332,12 +383,17 @@ mod tests {
             .enqueue(
                 "notes",
                 "n1",
-                r#"{"id":"n1","book_id":"b1","text":"enc:v2:x"}"#,
+                r#"{"id":"n1","book_id":"b1","text":"enc:v2:x","created_at":1}"#,
                 100,
             )
             .unwrap();
         store
-            .enqueue("books", "b1", r#"{"id":"b1","title":"T"}"#, 90)
+            .enqueue(
+                "books",
+                "b1",
+                r#"{"id":"b1","title":"T","created_at":1}"#,
+                90,
+            )
             .unwrap();
         let s = sink(None);
         let res = block(flush(&store, &s, "user-1")).unwrap();
@@ -406,6 +462,134 @@ mod tests {
         );
     }
 
+    /// SUR-1009: a sparse BOOK patch must not upsert. `books.title` is `not null` with **no
+    /// default** (surfc 0001), so PostgREST validates the insert shape and rejects the row before
+    /// its conflict UPDATE could preserve the stored title — the same failure the notes arm already
+    /// avoids, on a table that never got the treatment. A cover-resolution patch or a
+    /// `deleted:true` tombstone carries no title, so it was rejected on every flush forever.
+    #[test]
+    fn partial_book_flush_uses_targeted_patch() {
+        let store = Store::open_in_memory().unwrap();
+        // Verbatim the shape found wedged on the founder's device: a cover-resolution patch.
+        store
+            .enqueue(
+                "books",
+                "b1",
+                r#"{"id":"b1","cover_url":"https://example.test/c.jpg","cover_source":"openlibrary","updated_at":20}"#,
+                100,
+            )
+            .unwrap();
+
+        let sink = sink(None);
+        let result = block(flush(&store, &sink, "user-1")).unwrap();
+
+        assert!(
+            sink.calls.borrow().is_empty(),
+            "a book patch with no title must not upsert"
+        );
+        let patches = sink.patches.borrow();
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0].0, "books");
+        assert_eq!(patches[0].1, "id");
+        assert_eq!(patches[0].2, "b1");
+        assert_eq!(
+            patches[0].3["cover_url"],
+            json!("https://example.test/c.jpg")
+        );
+        assert!(
+            patches[0].3.get("id").is_none(),
+            "pk is the filter, not the body"
+        );
+        assert!(
+            patches[0].3.get("user_id").is_none(),
+            "patch must not inject user_id"
+        );
+        assert_eq!(result.ok.len(), 1);
+        assert!(result.failed.is_empty());
+    }
+
+    /// The counterpart guard: a book group carrying the full insert shape still UPSERTS, so an
+    /// offline-created book can still be inserted (a PATCH would match no row and never create it).
+    #[test]
+    fn full_book_flush_still_upserts() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .enqueue(
+                "books",
+                "b1",
+                r#"{"id":"b1","title":"Thinking in Systems","created_at":10,"updated_at":20,"deleted":false}"#,
+                100,
+            )
+            .unwrap();
+
+        let sink = sink(None);
+        let result = block(flush(&store, &sink, "user-1")).unwrap();
+
+        assert_eq!(sink.calls.borrow().as_slice(), ["books"]);
+        assert!(
+            sink.patches.borrow().is_empty(),
+            "a complete book row must insert, not patch"
+        );
+        assert_eq!(result.ok.len(), 1);
+    }
+
+    /// SUR-1009's actual damage: the sparse book FAILED, and `fk_deps` then held every note whose
+    /// `book_id` pointed at it — so six note tombstones from a dedup sat queued for days while the
+    /// other client kept showing the duplicates. Dispatching the book as a PATCH unblocks them.
+    #[test]
+    fn partial_book_does_not_wedge_its_notes() {
+        let store = Store::open_in_memory().unwrap();
+        // The book: a merged-away tombstone, no title (device shape).
+        store
+            .enqueue(
+                "books",
+                "b1",
+                r#"{"id":"b1","deleted":true,"updated_at":20}"#,
+                100,
+            )
+            .unwrap();
+        // The note: re-homed onto b1, then tombstoned — collapse makes `deleted` sticky.
+        store
+            .enqueue(
+                "notes",
+                "n1",
+                r#"{"id":"n1","book_id":"b1","updated_at":21,"deleted":false}"#,
+                101,
+            )
+            .unwrap();
+        store
+            .enqueue(
+                "notes",
+                "n1",
+                r#"{"id":"n1","updated_at":22,"deleted":true}"#,
+                102,
+            )
+            .unwrap();
+
+        let sink = sink(None);
+        let result = block(flush(&store, &sink, "user-1")).unwrap();
+
+        assert_eq!(result.failed.len(), 0, "nothing may be held back");
+        assert_eq!(
+            result.ok.len(),
+            3,
+            "the book patch and both note rows clear"
+        );
+        assert!(
+            store.outbox_items().unwrap().is_empty(),
+            "the wedge is gone — the outbox drains"
+        );
+        let patches = sink.patches.borrow();
+        assert_eq!(patches.len(), 2, "both the book and the sparse note patch");
+        assert_eq!(patches[0].0, "books", "parent dispatches before its child");
+        assert_eq!(patches[1].0, "notes");
+        assert_eq!(
+            patches[1].3["deleted"],
+            json!(true),
+            "sticky delete survives collapse"
+        );
+    }
+
     #[test]
     fn unflushed_note_create_then_patch_still_upserts_the_collapsed_full_row() {
         let store = Store::open_in_memory().unwrap();
@@ -439,13 +623,18 @@ mod tests {
     fn note_held_back_when_parent_book_flush_fails() {
         let store = Store::open_in_memory().unwrap();
         store
-            .enqueue("books", "b1", r#"{"id":"b1","title":"T"}"#, 90)
+            .enqueue(
+                "books",
+                "b1",
+                r#"{"id":"b1","title":"T","created_at":1}"#,
+                90,
+            )
             .unwrap();
         store
             .enqueue(
                 "notes",
                 "n1",
-                r#"{"id":"n1","book_id":"b1","text":"enc:v2:x"}"#,
+                r#"{"id":"n1","book_id":"b1","text":"enc:v2:x","created_at":1}"#,
                 100,
             )
             .unwrap();
