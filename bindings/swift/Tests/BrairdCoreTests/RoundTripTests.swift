@@ -787,4 +787,124 @@ final class RoundTripTests: XCTestCase {
         XCTAssertFalse(source.localizedCaseInsensitiveContains("func replaceSnapshot("))
         XCTAssertFalse(source.contains("syncengine_import_replace"))
     }
+
+    // ── SUR-997: the foreign-implemented Embedder trait ──────────────────────
+    // The ONLY exercise of the Rust→Swift call direction in the suite: core drives a
+    // Swift-implemented callback trait with decrypted plaintext and stores the sealed result.
+
+    /// Deterministic byte-histogram embedder over 8 buckets: same text → cosine 1.0,
+    /// disjoint byte sets → orthogonal. Counts calls so tests can pin what core invoked.
+    private final class HistogramEmbedder: Embedder {
+        private(set) var documentCalls = 0
+
+        func descriptor() -> EmbedderDescriptor {
+            EmbedderDescriptor(modelId: "swift-fake", dims: 8, quantization: "test")
+        }
+
+        private func histogram(_ text: String) -> [Float] {
+            var v = [Float](repeating: 0, count: 8)
+            for byte in Array(text.utf8) { v[Int(byte) % 8] += 1 }
+            return v
+        }
+
+        func embedDocument(text: String) throws -> [Float] {
+            documentCalls += 1
+            return histogram(text)
+        }
+
+        func embedQuery(text: String) throws -> [Float] { histogram(text) }
+    }
+
+    private func plainNote(_ id: String, _ plaintext: String) -> NoteUpsert {
+        NoteUpsert(
+            id: id, bookId: nil, plaintext: plaintext, page: nil, tags: [],
+            source: nil, sourceId: nil, sourceMetaJson: nil, chapter: nil,
+            imagePath: nil, inkCropPath: nil, createdAt: 0, deleted: false,
+            clearNullableFields: [])
+    }
+
+    func testEmbedderContractRoundTripOverFfi() throws {
+        let db = FileManager.default.temporaryDirectory
+            .appendingPathComponent("braird-embed-\(UUID().uuidString).sqlite")
+        let engine = try SyncEngine.open(
+            dbPath: db.path, supabaseUrl: "https://x.supabase.co", anonKey: "anon",
+            vault: Vault.generate())
+        try engine.enqueueNote(draft: plainNote("n-aaa", "aaaa"))
+        try engine.enqueueNote(draft: plainNote("n-bbb", "bbbb"))
+
+        // Registration crosses the descriptor Swift→Rust and reports the derived queue.
+        let embedder = HistogramEmbedder()
+        let registration = try engine.registerEmbedder(embedder: embedder)
+        XCTAssertFalse(registration.corpusChanged)
+        XCTAssertEqual(registration.invalidated, 0)
+        XCTAssertEqual(registration.pending, 2)
+        XCTAssertEqual(try engine.pendingEmbedCount(), 2)
+
+        // The drain calls BACK into this Swift embedder with the decrypted plaintext.
+        let progress = try engine.embedPending(maxItems: 10)
+        XCTAssertEqual(progress.embedded, 2)
+        XCTAssertEqual(progress.pending, 0)
+        XCTAssertEqual(embedder.documentCalls, 2)
+        XCTAssertEqual(try engine.pendingEmbedCount(), 0)
+
+        // The scan primitives read the sealed corpus back over the FFI.
+        let hits = try engine.semanticSearch(query: "aaaa", limit: 10)
+        XCTAssertEqual(hits.first?.noteId, "n-aaa")
+        XCTAssertGreaterThan(hits.first?.score ?? 0, 0.999, "identical text → cosine ~1")
+        let similar = try engine.similarNotes(noteId: "n-aaa", limit: 10)
+        XCTAssertFalse(similar.contains { $0.noteId == "n-aaa" }, "probe excluded")
+    }
+
+    /// A Swift-thrown EmbedError must lower cleanly into core's failure accounting — the
+    /// error leg of the reverse call direction.
+    func testEmbedderThrownErrorLowersIntoFailureCounts() throws {
+        final class FailingEmbedder: Embedder {
+            func descriptor() -> EmbedderDescriptor {
+                EmbedderDescriptor(modelId: "swift-failing", dims: 8, quantization: "test")
+            }
+            func embedDocument(text: String) throws -> [Float] { throw EmbedderError.Runtime }
+            func embedQuery(text: String) throws -> [Float] { throw EmbedderError.Runtime }
+        }
+        let db = FileManager.default.temporaryDirectory
+            .appendingPathComponent("braird-embed-err-\(UUID().uuidString).sqlite")
+        let engine = try SyncEngine.open(
+            dbPath: db.path, supabaseUrl: "https://x.supabase.co", anonKey: "anon",
+            vault: Vault.generate())
+        try engine.enqueueNote(draft: plainNote("n1", "some text"))
+        _ = try engine.registerEmbedder(embedder: FailingEmbedder())
+
+        let progress = try engine.embedPending(maxItems: 10)
+        XCTAssertEqual(progress.embedded, 0)
+        XCTAssertEqual(progress.failed, 1)
+        XCTAssertEqual(progress.pending, 1, "a failed note stays queued for the next pass")
+        XCTAssertThrowsError(try engine.semanticSearch(query: "query", limit: 5))
+    }
+
+    /// An UNDECLARED host error (not an EmbedderError) rides UniFFI's unexpected-error
+    /// lane; the From<UnexpectedUniFFICallbackError> impl must degrade it to Runtime —
+    /// counted as failed, never a panic, never the host's message transiting core.
+    func testUndeclaredEmbedderErrorDegradesToFailedNotPanic() throws {
+        struct HostError: Error {}
+        final class UndeclaredThrowingEmbedder: Embedder {
+            func descriptor() -> EmbedderDescriptor {
+                EmbedderDescriptor(modelId: "swift-undeclared", dims: 8, quantization: "test")
+            }
+            func embedDocument(text: String) throws -> [Float] { throw HostError() }
+            func embedQuery(text: String) throws -> [Float] { throw HostError() }
+        }
+        let db = FileManager.default.temporaryDirectory
+            .appendingPathComponent("braird-embed-undeclared-\(UUID().uuidString).sqlite")
+        let engine = try SyncEngine.open(
+            dbPath: db.path, supabaseUrl: "https://x.supabase.co", anonKey: "anon",
+            vault: Vault.generate())
+        try engine.enqueueNote(draft: plainNote("n1", "some text"))
+        _ = try engine.registerEmbedder(embedder: UndeclaredThrowingEmbedder())
+
+        // Must NOT throw — the pass completes with the item counted failed.
+        let progress = try engine.embedPending(maxItems: 10)
+        XCTAssertEqual(progress.embedded, 0)
+        XCTAssertEqual(progress.failed, 1)
+        XCTAssertEqual(progress.pending, 1)
+        XCTAssertThrowsError(try engine.semanticSearch(query: "query", limit: 5))
+    }
 }

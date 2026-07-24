@@ -122,6 +122,18 @@ fn schema_or_err(table: &str) -> rusqlite::Result<&'static TableSchema> {
     })
 }
 
+/// The outbox collapse's liberal `deleted`-flag semantics (Bool true / non-zero number /
+/// non-empty string other than `"false"`/`"0"`), shared by the pending-tombstone drop and the
+/// `apply_row` embedding-delete hook so the two can't drift.
+fn truthy(v: Option<&Value>) -> bool {
+    match v {
+        Some(Value::Bool(b)) => *b,
+        Some(Value::Number(n)) => n.as_f64().map(|f| f != 0.0).unwrap_or(false),
+        Some(Value::String(s)) => !s.is_empty() && s != "false" && s != "0",
+        _ => false,
+    }
+}
+
 /// Coerce one incoming JSON column value to the SQLite value for its declared [`ColType`].
 /// Absent / null → SQL NULL. `Json` columns (`tags`, `source_meta`) are stored as their JSON
 /// TEXT (≡ the cloud `jsonb`/`text[]`). Off-type values fall back to NULL rather than guessing.
@@ -363,6 +375,7 @@ const LOCAL_ONLY_DDL: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS embeddings (\
         note_id TEXT PRIMARY KEY, \
         model_version TEXT, \
+        content_token TEXT, \
         encrypted_vector BLOB, \
         updated_at INTEGER, \
         deleted INTEGER);",
@@ -428,32 +441,47 @@ impl Store {
     fn init_schema(&self) -> rusqlite::Result<()> {
         for t in synced_schema() {
             self.conn.execute_batch(&create_table_sql(t))?;
-            // SUR-1005 — additive local-DB migration. `CREATE IF NOT EXISTS` is a no-op on
-            // an existing store, but `apply_row`/`get_row`/`list_live` name EVERY descriptor
-            // column, so a store predating a descriptor column would fail its first
-            // pull-apply ("no column named …"). Diff the live table against the descriptor
-            // and `ALTER TABLE … ADD COLUMN` the missing ones (NULL-backfilled, matching the
-            // cloud's additive-nullable column contract). Generic: the next descriptor
-            // column is picked up with no new code. Dropped/renamed descriptor columns are
-            // NOT handled — those are breaking cloud migrations, not additive drift.
-            let existing: BTreeSet<String> = self
-                .table_columns(t.name)?
-                .into_iter()
-                .map(|(name, _)| name)
+            // SUR-1005 — additive local-DB migration (see `ensure_columns`): a store
+            // predating a descriptor column would fail its first pull-apply
+            // ("no column named …") because `apply_row`/`get_row`/`list_live` name EVERY
+            // descriptor column. Generic: the next descriptor column is picked up with no
+            // new code.
+            let wanted: Vec<(&str, &str)> = t
+                .columns
+                .iter()
+                .map(|(name, ty)| (*name, ty.sqlite()))
                 .collect();
-            for (name, ty) in t.columns {
-                if !existing.contains(*name) {
-                    self.conn.execute_batch(&format!(
-                        "ALTER TABLE {} ADD COLUMN {name} {};",
-                        t.name,
-                        ty.sqlite(),
-                    ))?;
-                }
-            }
+            self.ensure_columns(t.name, &wanted)?;
             self.conn.execute_batch(&create_updated_at_index_sql(t))?;
         }
         for ddl in LOCAL_ONLY_DDL {
             self.conn.execute_batch(ddl)?;
+        }
+        // SUR-997 — the same additive migration for the local-only `embeddings` table:
+        // `content_token` postdates the original DDL, and every store created before it
+        // (the table has existed, writer-less, since SUR-723) needs the ALTER on open.
+        self.ensure_columns("embeddings", &[("content_token", "TEXT")])?;
+        Ok(())
+    }
+
+    /// Additive column migration (SUR-1005, generalized for SUR-997): diff the live table
+    /// against the wanted `(column, affinity)` set and `ALTER TABLE … ADD COLUMN` each
+    /// missing one (NULL-backfilled, matching the cloud's additive-nullable column
+    /// contract). `CREATE IF NOT EXISTS` is a no-op on an existing store, so this is the
+    /// only path by which an already-created table gains a new column. Dropped/renamed
+    /// columns are NOT handled — those are breaking migrations, not additive drift.
+    fn ensure_columns(&self, table: &str, wanted: &[(&str, &str)]) -> rusqlite::Result<()> {
+        let existing: BTreeSet<String> = self
+            .table_columns(table)?
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        for (name, affinity) in wanted {
+            if !existing.contains(*name) {
+                self.conn.execute_batch(&format!(
+                    "ALTER TABLE {table} ADD COLUMN {name} {affinity};",
+                ))?;
+            }
         }
         Ok(())
     }
@@ -537,16 +565,11 @@ impl Store {
         };
         let mut dropped = 0;
         for (id, payload) in entries {
-            // Match the collapse's `truthy` semantics (Bool true / non-zero number / non-empty
-            // string other than "false"/"0"); the enqueue paths write a JSON bool, but be liberal.
+            // Match the collapse's `truthy` semantics (see [`truthy`]); the enqueue paths write
+            // a JSON bool, but be liberal.
             let is_delete = serde_json::from_str::<Value>(&payload)
                 .ok()
-                .map(|v| match v.get("deleted") {
-                    Some(Value::Bool(b)) => *b,
-                    Some(Value::Number(n)) => n.as_f64().map(|f| f != 0.0).unwrap_or(false),
-                    Some(Value::String(s)) => !s.is_empty() && s != "false" && s != "0",
-                    _ => false,
-                })
+                .map(|v| truthy(v.get("deleted")))
                 .unwrap_or(false);
             if is_delete {
                 self.conn
@@ -704,6 +727,16 @@ impl Store {
     /// unknown key would otherwise make the generated INSERT reference a non-existent column and
     /// fail the whole pull. `INSERT OR REPLACE` is a full-row replace (last-write-wins is decided
     /// by the caller before this runs), mirroring the JS `db.<table>.put({...})`.
+    ///
+    /// **Embedding lifetime (SUR-997).** A `notes` tombstone also hard-deletes the note's sealed
+    /// embedding vector, here rather than at any call site: `apply_row` is the single choke point
+    /// every note write funnels through (`stage_write_inner`, `apply_row_rebasing_outbox`,
+    /// `stage_import_batch`, and the pull loop), so one guard covers local deletes, pulled foreign
+    /// deletes, and imports alike — a plaintext-derived artifact must not outlive its note. Rides
+    /// the caller's transaction when one is open; standalone, a crash between the two statements
+    /// leaves at worst an orphan vector, which `sweep_orphan_embeddings` heals on the next embed
+    /// pass. The branch is a table-name compare + one indexed DELETE, only on the tombstone path —
+    /// nothing on the hot live-row path.
     pub fn apply_row(&self, table: &str, row: &Map<String, Value>) -> rusqlite::Result<()> {
         let schema = schema_or_err(table)?;
         let cols: Vec<&str> = schema.columns.iter().map(|(n, _)| *n).collect();
@@ -723,6 +756,12 @@ impl Store {
         );
         self.conn
             .execute(&sql, rusqlite::params_from_iter(values))?;
+        if table == "notes" && truthy(row.get("deleted")) {
+            if let Some(id) = row.get("id").and_then(Value::as_str) {
+                self.conn
+                    .execute("DELETE FROM embeddings WHERE note_id = ?1", [id])?;
+            }
+        }
         Ok(())
     }
 
@@ -983,6 +1022,181 @@ impl Store {
         self.meta_set(&sync_seq_key(table), &seq.to_string())?;
         self.meta_delete(&sync_cursor_key(table))
     }
+
+    // ── sealed embedding store (SUR-997) ─────────────────────────────────────
+    // The local-only `embeddings` table's read/write surface. DEVICE-LOCAL by construction:
+    // nothing here touches the outbox, so vectors can never sync (the mirror of the PWA's
+    // embeddings-sync-exclusion posture — vectors are derived from E2EE plaintext and must
+    // not leak to the server). `encrypted_vector` is ALWAYS a vault-sealed blob (or NULL, a
+    // skip marker); raw vector bytes never reach this layer. The "queue" is DERIVED, not
+    // staged: a note needs (re)embedding iff this one JOIN says so — no mutable queue state,
+    // no invalidation hooks in enqueue/pull/reconcile, self-healing after any of them.
+
+    /// A note's embedding staleness token: `content_tag` (the HMAC of its normalized
+    /// plaintext — free change detection, no decrypt) with an `u:{updated_at}` fallback for
+    /// the rare tagless row. `None` when the note is absent or tombstoned. One SQL
+    /// definition ([`content_token_sql`]) shared with the pending derivation, so the queue
+    /// and the write-time revalidation can't drift.
+    pub(crate) fn note_content_token(&self, note_id: &str) -> rusqlite::Result<Option<String>> {
+        self.conn
+            .query_row(
+                &format!(
+                    "SELECT {} FROM notes WHERE id = ?1 AND deleted = 0",
+                    content_token_sql("notes")
+                ),
+                [note_id],
+                |row| row.get(0),
+            )
+            .optional()
+    }
+
+    /// Upsert a note's sealed vector (or a NULL skip marker) — but ONLY if the note is still
+    /// live and its source token still equals `content_token` (the value read before the host
+    /// embed ran). Returns whether the write happened. The embed pipeline releases the store
+    /// lock across the host callback (~0.8 s on CPU), so the note can be edited, deleted, or
+    /// pulled over in that window; a stale vector written anyway would carry a CURRENT token
+    /// and never re-queue. Check + write run under the engine's store mutex, so nothing
+    /// interleaves.
+    pub(crate) fn upsert_embedding_if_current(
+        &self,
+        note_id: &str,
+        corpus_key: &str,
+        content_token: &str,
+        sealed: Option<&[u8]>,
+        updated_at: i64,
+    ) -> rusqlite::Result<bool> {
+        if self.note_content_token(note_id)?.as_deref() != Some(content_token) {
+            return Ok(false);
+        }
+        self.conn.execute(
+            "INSERT OR REPLACE INTO embeddings \
+             (note_id, model_version, content_token, encrypted_vector, updated_at, deleted) \
+             VALUES (?1, ?2, ?3, ?4, ?5, 0)",
+            rusqlite::params![note_id, corpus_key, content_token, sealed, updated_at],
+        )?;
+        Ok(true)
+    }
+
+    /// Hard-delete one note's vector (the scan's self-heal for a blob that fails to open or
+    /// decode — dropping it re-queues the note via the pending derivation).
+    pub(crate) fn delete_embedding(&self, note_id: &str) -> rusqlite::Result<()> {
+        self.conn
+            .execute("DELETE FROM embeddings WHERE note_id = ?1", [note_id])?;
+        Ok(())
+    }
+
+    /// Corpus invalidation (SUR-997): hard-delete every vector NOT keyed to `corpus_key`,
+    /// returning the count. `IS NOT` (null-safe) so a junk row with a NULL key is also
+    /// swept. Model upgrade = the key changes = the old corpus drops here and the pending
+    /// derivation re-queues everything.
+    pub(crate) fn delete_embeddings_not_matching(
+        &self,
+        corpus_key: &str,
+    ) -> rusqlite::Result<usize> {
+        self.conn.execute(
+            "DELETE FROM embeddings WHERE model_version IS NOT ?1",
+            [corpus_key],
+        )
+    }
+
+    /// Sweep vectors whose note no longer exists live (a hard-deleted or vacuumed row the
+    /// [`Store::apply_row`] tombstone hook didn't see — e.g. a crash between its two
+    /// statements). Best-effort hygiene, run once per embed pass.
+    pub(crate) fn sweep_orphan_embeddings(&self) -> rusqlite::Result<usize> {
+        self.conn.execute(
+            "DELETE FROM embeddings WHERE NOT EXISTS \
+             (SELECT 1 FROM notes n WHERE n.id = embeddings.note_id AND n.deleted = 0)",
+            [],
+        )
+    }
+
+    /// The derived embed queue: live notes whose vector is missing, keyed to a different
+    /// corpus, or embedded from different text (token mismatch — see
+    /// [`Store::note_content_token`]). Newest-first (recent notes become searchable first),
+    /// `limit < 0` = no limit.
+    pub(crate) fn pending_embeddings(
+        &self,
+        corpus_key: &str,
+        limit: i64,
+    ) -> rusqlite::Result<Vec<String>> {
+        let sql = format!(
+            "{} ORDER BY n.created_at DESC, n.id DESC LIMIT ?2",
+            pending_embeddings_sql("n.id"),
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params![corpus_key, limit], |row| row.get(0))?;
+        rows.collect()
+    }
+
+    /// How many notes the derived queue currently holds — the host's durable
+    /// rebuild/progress signal (survives a process restart, unlike a registration-time
+    /// flag). Same derivation as [`Store::pending_embeddings`], by construction.
+    pub(crate) fn pending_embedding_count(&self, corpus_key: &str) -> rusqlite::Result<i64> {
+        self.conn
+            .query_row(&pending_embeddings_sql("count(*)"), [corpus_key], |row| {
+                row.get(0)
+            })
+    }
+
+    /// The scannable corpus: `(note_id, sealed vector)` for every current-key, non-marker
+    /// vector whose note is still live. The live-note JOIN makes "deleted notes never
+    /// surface" structural rather than reliant on the delete hook having run.
+    pub(crate) fn live_embeddings(
+        &self,
+        corpus_key: &str,
+    ) -> rusqlite::Result<Vec<(String, Vec<u8>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT e.note_id, e.encrypted_vector FROM embeddings e \
+             JOIN notes n ON n.id = e.note_id AND n.deleted = 0 \
+             WHERE e.model_version = ?1 AND e.encrypted_vector IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([corpus_key], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+        rows.collect()
+    }
+
+    /// One note's sealed current-key vector (the `similar_notes` probe), or `None` when the
+    /// note has no vector yet, only a skip marker, or a stale-key vector. The live-note
+    /// JOIN mirrors [`Store::live_embeddings`]: a deleted note can never be probed, even
+    /// via an orphan vector no delete path has swept yet — the invariant holds
+    /// structurally, not by "no caller currently does this" (crypto-review hardening).
+    pub(crate) fn sealed_embedding(
+        &self,
+        note_id: &str,
+        corpus_key: &str,
+    ) -> rusqlite::Result<Option<Vec<u8>>> {
+        self.conn
+            .query_row(
+                "SELECT e.encrypted_vector FROM embeddings e \
+                 JOIN notes n ON n.id = e.note_id AND n.deleted = 0 \
+                 WHERE e.note_id = ?1 AND e.model_version = ?2 \
+                   AND e.encrypted_vector IS NOT NULL",
+                rusqlite::params![note_id, corpus_key],
+                |row| row.get(0),
+            )
+            .optional()
+    }
+
+    /// One `embeddings` row read back for tests: `(corpus key, source token,
+    /// sealed vector — `None` = skip marker)`, or `None` when the note has no row at all.
+    /// Test-only (both this module's and `sync`'s test modules) — no production reader
+    /// wants the raw row.
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn embedding_row(
+        &self,
+        note_id: &str,
+    ) -> rusqlite::Result<Option<(Option<String>, Option<String>, Option<Vec<u8>>)>> {
+        self.conn
+            .query_row(
+                "SELECT model_version, content_token, encrypted_vector \
+                 FROM embeddings WHERE note_id = ?1",
+                [note_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+    }
 }
 
 /// The `meta` key holding a table's incremental-pull cursor (server `change_seq` watermark).
@@ -994,6 +1208,29 @@ fn sync_seq_key(table: &str) -> String {
 /// delete it on the first change_seq pull.
 fn sync_cursor_key(table: &str) -> String {
     format!("sync:cursor:{table}")
+}
+
+/// The SQL expression for a note's embedding staleness token, parameterized on the notes
+/// table's alias in the enclosing query. ONE definition — used by the pending derivation,
+/// the pending count, and the write-time revalidation — so the three can't drift. The inner
+/// `COALESCE(updated_at, 0)` keeps a junk NULL-`updated_at` row from producing a NULL token
+/// (`'u:' || NULL` is NULL) that could never match anything.
+fn content_token_sql(alias: &str) -> String {
+    format!("COALESCE({alias}.content_tag, 'u:' || COALESCE({alias}.updated_at, 0))")
+}
+
+/// The derived embed queue's one query body, parameterized on the SELECT expression — the
+/// list (`n.id`) and the count (`count(*)`) share it verbatim, so the two can't drift.
+/// `?1` = the corpus key. `IS NOT` (null-safe) keeps a NULL stored key/token from wedging a
+/// row out of the queue forever (`<>` against NULL is never true in SQL).
+fn pending_embeddings_sql(select: &str) -> String {
+    format!(
+        "SELECT {select} FROM notes n LEFT JOIN embeddings e ON e.note_id = n.id \
+         WHERE n.deleted = 0 AND (e.note_id IS NULL \
+           OR e.model_version IS NOT ?1 \
+           OR e.content_token IS NOT {token})",
+        token = content_token_sql("n"),
+    )
 }
 
 #[cfg(test)]
@@ -1694,5 +1931,264 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         store.stage_import_batch(&[], 99).unwrap();
         assert!(store.outbox_items().unwrap().is_empty());
+    }
+
+    // ── SUR-997 sealed embedding store ───────────────────────────────────────
+
+    const KEY: &str = "fake-model|4|test|f32le-v1";
+
+    /// A live note with a content tag; `apply_row` is the pull sink, so this is exactly a
+    /// pulled row's shape.
+    fn seed_note(store: &Store, id: &str, content_tag: Option<&str>, updated_at: i64) {
+        use serde_json::json;
+        let row = json!({
+            "id": id, "text": "enc:v2:cipher", "content_tag": content_tag,
+            "created_at": updated_at, "updated_at": updated_at, "deleted": false,
+        });
+        store.apply_row("notes", row.as_object().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn init_schema_alters_a_pre_content_token_embeddings_table() {
+        // A store created before `content_token` existed (the table has been in
+        // LOCAL_ONLY_DDL, writer-less, since SUR-723): hand-create the old shape, then run
+        // the normal open path — `ensure_columns` must add the missing column, idempotently.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE embeddings (note_id TEXT PRIMARY KEY, model_version TEXT, \
+             encrypted_vector BLOB, updated_at INTEGER, deleted INTEGER);",
+        )
+        .unwrap();
+        let store = Store::from_conn(conn).unwrap();
+
+        let cols = store.table_columns("embeddings").unwrap();
+        assert!(
+            cols.iter()
+                .any(|(n, a)| n == "content_token" && a == "TEXT"),
+            "ALTER must add content_token TEXT"
+        );
+        // Idempotent, and a fresh store agrees on the column SET (order may differ — ALTER appends).
+        store.init_schema().unwrap();
+        assert_eq!(store.table_columns("embeddings").unwrap(), cols);
+        let fresh = Store::open_in_memory().unwrap();
+        let set = |s: &Store| -> BTreeSet<(String, String)> {
+            s.table_columns("embeddings").unwrap().into_iter().collect()
+        };
+        assert_eq!(set(&fresh), set(&store));
+    }
+
+    #[test]
+    fn pending_embeddings_derives_the_queue_from_metadata() {
+        let store = Store::open_in_memory().unwrap();
+        seed_note(&store, "missing", Some("tag-a"), 1); // no vector row → queued
+        seed_note(&store, "stale-key", Some("tag-b"), 2); // vector at another key → queued
+        seed_note(&store, "stale-text", Some("tag-c2"), 3); // token moved since embed → queued
+        seed_note(&store, "current", Some("tag-d"), 4); // vector current → NOT queued
+        seed_note(&store, "marker", Some("tag-e"), 5); // skip marker current → NOT queued
+        seed_note(&store, "tagless", None, 6); // NULL tag → u:{updated_at} fallback → queued
+        store
+            .apply_row(
+                "notes",
+                serde_json::json!({"id":"gone","content_tag":"tag-f","created_at":7,"updated_at":7,"deleted":true})
+                    .as_object()
+                    .unwrap(),
+            )
+            .unwrap(); // tombstoned → NOT queued
+
+        store
+            .upsert_embedding_if_current("stale-key", "other|key", "tag-b", Some(&[1]), 10)
+            .unwrap();
+        store
+            .upsert_embedding_if_current("stale-text", KEY, "tag-c2", Some(&[2]), 10)
+            .unwrap();
+        // …then the note's text changes (new content_tag) — the stored token is now stale.
+        seed_note(&store, "stale-text", Some("tag-c3"), 30);
+        store
+            .upsert_embedding_if_current("current", KEY, "tag-d", Some(&[3]), 10)
+            .unwrap();
+        store
+            .upsert_embedding_if_current("marker", KEY, "tag-e", None, 10)
+            .unwrap();
+
+        let mut pending = store.pending_embeddings(KEY, -1).unwrap();
+        pending.sort();
+        assert_eq!(
+            pending,
+            vec!["missing", "stale-key", "stale-text", "tagless"]
+        );
+        assert_eq!(store.pending_embedding_count(KEY).unwrap(), 4);
+        // Newest-first ordering + limit (the re-seeded stale-text row now carries the
+        // newest created_at, 30 — apply_row is a full-row replace).
+        assert_eq!(
+            store.pending_embeddings(KEY, 1).unwrap(),
+            vec!["stale-text"]
+        );
+
+        // The tagless fallback token really is u:{updated_at}: embedding under it drains it.
+        assert_eq!(
+            store.note_content_token("tagless").unwrap().as_deref(),
+            Some("u:6")
+        );
+        store
+            .upsert_embedding_if_current("tagless", KEY, "u:6", Some(&[4]), 10)
+            .unwrap();
+        assert_eq!(store.pending_embedding_count(KEY).unwrap(), 3);
+    }
+
+    #[test]
+    fn upsert_embedding_if_current_rejects_a_moved_token_and_a_dead_note() {
+        let store = Store::open_in_memory().unwrap();
+        seed_note(&store, "n1", Some("tag-1"), 1);
+
+        // Token moved between read and write (the host-callback window) → nothing written.
+        assert!(!store
+            .upsert_embedding_if_current("n1", KEY, "tag-0", Some(&[9]), 10)
+            .unwrap());
+        assert!(store.embedding_row("n1").unwrap().is_none());
+
+        // Current token → written.
+        assert!(store
+            .upsert_embedding_if_current("n1", KEY, "tag-1", Some(&[9]), 10)
+            .unwrap());
+        let (key, token, sealed) = store.embedding_row("n1").unwrap().unwrap();
+        assert_eq!(
+            (key.as_deref(), token.as_deref()),
+            (Some(KEY), Some("tag-1"))
+        );
+        assert_eq!(sealed, Some(vec![9]));
+
+        // A tombstoned target writes nothing (note_content_token excludes deleted rows).
+        store
+            .apply_row(
+                "notes",
+                serde_json::json!({"id":"n2","content_tag":"tag-2","updated_at":2,"deleted":true})
+                    .as_object()
+                    .unwrap(),
+            )
+            .unwrap();
+        assert!(!store
+            .upsert_embedding_if_current("n2", KEY, "tag-2", Some(&[9]), 10)
+            .unwrap());
+    }
+
+    #[test]
+    fn a_notes_tombstone_through_apply_row_hard_deletes_its_vector() {
+        use serde_json::json;
+        let store = Store::open_in_memory().unwrap();
+        seed_note(&store, "n1", Some("tag-1"), 1);
+        seed_note(&store, "n2", Some("tag-2"), 2);
+        store
+            .upsert_embedding_if_current("n1", KEY, "tag-1", Some(&[1]), 10)
+            .unwrap();
+        store
+            .upsert_embedding_if_current("n2", KEY, "tag-2", Some(&[2]), 10)
+            .unwrap();
+
+        // A pulled tombstone (JSON bool) — the pull sink IS apply_row.
+        store
+            .apply_row(
+                "notes",
+                json!({"id":"n1","content_tag":"tag-1","updated_at":20,"deleted":true})
+                    .as_object()
+                    .unwrap(),
+            )
+            .unwrap();
+        assert!(store.embedding_row("n1").unwrap().is_none());
+        assert!(store.embedding_row("n2").unwrap().is_some(), "others kept");
+
+        // A numeric `deleted` (liberal truthy — foreign rows may carry 1, not true).
+        store
+            .apply_row(
+                "notes",
+                json!({"id":"n2","content_tag":"tag-2","updated_at":21,"deleted":1})
+                    .as_object()
+                    .unwrap(),
+            )
+            .unwrap();
+        assert!(store.embedding_row("n2").unwrap().is_none());
+
+        // A LIVE note write and a books tombstone never touch the embeddings table.
+        seed_note(&store, "n3", Some("tag-3"), 3);
+        store
+            .upsert_embedding_if_current("n3", KEY, "tag-3", Some(&[3]), 10)
+            .unwrap();
+        seed_note(&store, "n3", Some("tag-3b"), 30); // live re-apply
+        store
+            .apply_row(
+                "books",
+                json!({"id":"n3","updated_at":1,"deleted":true})
+                    .as_object()
+                    .unwrap(),
+            )
+            .unwrap(); // same id, different table
+        assert!(store.embedding_row("n3").unwrap().is_some());
+    }
+
+    #[test]
+    fn sweep_and_invalidation_clean_the_corpus() {
+        let store = Store::open_in_memory().unwrap();
+        seed_note(&store, "live", Some("tag-l"), 1);
+        store
+            .upsert_embedding_if_current("live", KEY, "tag-l", Some(&[1]), 10)
+            .unwrap();
+        // An orphan vector (note row never existed — e.g. a crash between the hook's two
+        // statements) and a NULL-key junk row, inserted raw.
+        store
+            .conn
+            .execute(
+                "INSERT INTO embeddings (note_id, model_version, content_token, encrypted_vector, updated_at, deleted) \
+                 VALUES ('ghost', ?1, 't', x'01', 0, 0), ('junk', NULL, NULL, x'02', 0, 0)",
+                [KEY],
+            )
+            .unwrap();
+
+        assert_eq!(store.sweep_orphan_embeddings().unwrap(), 2);
+        assert!(store.embedding_row("live").unwrap().is_some());
+
+        // Invalidation: a different key sweeps the survivor too (IS NOT catches NULL keys).
+        assert_eq!(store.delete_embeddings_not_matching("new|key").unwrap(), 1);
+        assert!(store.embedding_row("live").unwrap().is_none());
+    }
+
+    #[test]
+    fn live_embeddings_and_sealed_embedding_scope_to_current_key_live_notes_and_real_vectors() {
+        let store = Store::open_in_memory().unwrap();
+        seed_note(&store, "scan", Some("tag-s"), 1);
+        seed_note(&store, "marker", Some("tag-m"), 2);
+        seed_note(&store, "stale", Some("tag-x"), 3);
+        seed_note(&store, "dying", Some("tag-d"), 4);
+        store
+            .upsert_embedding_if_current("scan", KEY, "tag-s", Some(&[7, 7]), 10)
+            .unwrap();
+        store
+            .upsert_embedding_if_current("marker", KEY, "tag-m", None, 10)
+            .unwrap();
+        store
+            .upsert_embedding_if_current("stale", "old|key", "tag-x", Some(&[8]), 10)
+            .unwrap();
+        store
+            .upsert_embedding_if_current("dying", KEY, "tag-d", Some(&[9]), 10)
+            .unwrap();
+        // Tombstone `dying` via raw UPDATE — the belt for the scan's live-note JOIN even
+        // when the apply_row hook didn't run.
+        store
+            .conn
+            .execute("UPDATE notes SET deleted = 1 WHERE id = 'dying'", [])
+            .unwrap();
+
+        let rows = store.live_embeddings(KEY).unwrap();
+        assert_eq!(rows, vec![("scan".to_string(), vec![7, 7])]);
+
+        assert_eq!(
+            store.sealed_embedding("scan", KEY).unwrap(),
+            Some(vec![7, 7])
+        );
+        assert_eq!(store.sealed_embedding("marker", KEY).unwrap(), None);
+        assert_eq!(store.sealed_embedding("stale", KEY).unwrap(), None);
+        assert_eq!(
+            store.sealed_embedding("dying", KEY).unwrap(),
+            None,
+            "a deleted note can never be probed, even via an unswept orphan vector"
+        );
     }
 }

@@ -40,6 +40,8 @@ The two highest-lock-in choices are **#1** (the decrypt boundary — a crypto-re
 
 The index is the in-memory `Vec<SearchDoc>` corpus, built from the live store each call and discarded. No plaintext note text is ever written to disk (AC #4) — there is no on-disk index at all. This is the laziest correct posture: no cached state, no invalidation, no coupling into `enqueue`/`pull`.
 
+> **Amended by ADR 0006 (SUR-997):** a vault-**sealed** semantic-embedding corpus now persists on disk (the core's first persistent derived-from-plaintext artifact). The *lexical* index remains in-memory-only exactly as decided here, and the load-bearing half of this decision — plaintext never rests — still holds repo-wide: the persisted vectors are sealed under the vault key. Cite 0006, not this section, for the sealed-artifact posture.
+
 ## Consequences
 
 - The crypto boundary stays crisp: `Store`/`pull`/`push` are ciphertext-only; `Vault` is the only thing that sees plaintext, and only transiently per read. `src/search.rs` is pure text (no crypto, no store) — the decrypt happens one layer up in `sync::read` before docs are handed to it.

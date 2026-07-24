@@ -37,6 +37,12 @@ pub mod sync;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod search;
 
+// Host-embedder contract + sealed-vector primitives (SUR-997, ADR 0006). Native-only like
+// `sync` (its consumer): the PWA's sunset embedding stack stays JS-side, and gating the
+// module keeps the `Embedder` foreign trait out of the wasm binding surface.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod embeddings;
+
 pub use vault::Vault;
 
 uniffi::setup_scaffolding!();

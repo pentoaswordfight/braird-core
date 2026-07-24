@@ -654,6 +654,56 @@ internal open class UniffiForeignFutureStructVoid(
 internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
     fun callback(`callbackData`: Long,`result`: UniffiForeignFutureStructVoid.UniffiByValue,)
 }
+internal interface UniffiCallbackInterfaceEmbedderMethod0 : com.sun.jna.Callback {
+    fun callback(`uniffiHandle`: Long,`uniffiOutReturn`: RustBuffer,uniffiCallStatus: UniffiRustCallStatus,)
+}
+internal interface UniffiCallbackInterfaceEmbedderMethod1 : com.sun.jna.Callback {
+    fun callback(`uniffiHandle`: Long,`text`: RustBuffer.ByValue,`uniffiOutReturn`: RustBuffer,uniffiCallStatus: UniffiRustCallStatus,)
+}
+internal interface UniffiCallbackInterfaceEmbedderMethod2 : com.sun.jna.Callback {
+    fun callback(`uniffiHandle`: Long,`text`: RustBuffer.ByValue,`uniffiOutReturn`: RustBuffer,uniffiCallStatus: UniffiRustCallStatus,)
+}
+@Structure.FieldOrder("descriptor", "embedDocument", "embedQuery", "uniffiFree")
+internal open class UniffiVTableCallbackInterfaceEmbedder(
+    @JvmField internal var `descriptor`: UniffiCallbackInterfaceEmbedderMethod0? = null,
+    @JvmField internal var `embedDocument`: UniffiCallbackInterfaceEmbedderMethod1? = null,
+    @JvmField internal var `embedQuery`: UniffiCallbackInterfaceEmbedderMethod2? = null,
+    @JvmField internal var `uniffiFree`: UniffiCallbackInterfaceFree? = null,
+) : Structure() {
+    class UniffiByValue(
+        `descriptor`: UniffiCallbackInterfaceEmbedderMethod0? = null,
+        `embedDocument`: UniffiCallbackInterfaceEmbedderMethod1? = null,
+        `embedQuery`: UniffiCallbackInterfaceEmbedderMethod2? = null,
+        `uniffiFree`: UniffiCallbackInterfaceFree? = null,
+    ): UniffiVTableCallbackInterfaceEmbedder(`descriptor`,`embedDocument`,`embedQuery`,`uniffiFree`,), Structure.ByValue
+
+   internal fun uniffiSetValue(other: UniffiVTableCallbackInterfaceEmbedder) {
+        `descriptor` = other.`descriptor`
+        `embedDocument` = other.`embedDocument`
+        `embedQuery` = other.`embedQuery`
+        `uniffiFree` = other.`uniffiFree`
+    }
+
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -832,6 +882,7 @@ internal interface UniffiLib : Library {
             .also { lib: UniffiLib ->
                 uniffiCheckContractApiVersion(lib)
                 uniffiCheckApiChecksums(lib)
+                uniffiCallbackInterfaceEmbedder.register(lib)
                 }
         }
         
@@ -841,6 +892,18 @@ internal interface UniffiLib : Library {
         }
     }
 
+    fun uniffi_braird_core_fn_clone_embedder(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): Pointer
+    fun uniffi_braird_core_fn_free_embedder(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    fun uniffi_braird_core_fn_init_callback_vtable_embedder(`vtable`: UniffiVTableCallbackInterfaceEmbedder,
+    ): Unit
+    fun uniffi_braird_core_fn_method_embedder_descriptor(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_braird_core_fn_method_embedder_embed_document(`ptr`: Pointer,`text`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_braird_core_fn_method_embedder_embed_query(`ptr`: Pointer,`text`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_clone_syncengine(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Pointer
     fun uniffi_braird_core_fn_free_syncengine(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
@@ -852,6 +915,8 @@ internal interface UniffiLib : Library {
     fun uniffi_braird_core_fn_method_syncengine_collection_note_counts(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_syncengine_counts(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_braird_core_fn_method_syncengine_embed_pending(`ptr`: Pointer,`maxItems`: Int,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_syncengine_enqueue_book(`ptr`: Pointer,`draft`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
@@ -903,18 +968,26 @@ internal interface UniffiLib : Library {
     ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_syncengine_notes_this_week(`ptr`: Pointer,`nowMs`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Int
+    fun uniffi_braird_core_fn_method_syncengine_pending_embed_count(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): Int
     fun uniffi_braird_core_fn_method_syncengine_pull(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_syncengine_recent_note(`ptr`: Pointer,`nowMs`: Long,`seed`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_syncengine_record_note_signal(`ptr`: Pointer,`noteId`: RustBuffer.ByValue,`kind`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Byte
+    fun uniffi_braird_core_fn_method_syncengine_register_embedder(`ptr`: Pointer,`embedder`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_syncengine_replace_handwritten_annotations(`ptr`: Pointer,`parentId`: RustBuffer.ByValue,`children`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Int
     fun uniffi_braird_core_fn_method_syncengine_search(`ptr`: Pointer,`query`: RustBuffer.ByValue,`limit`: Int,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
+    fun uniffi_braird_core_fn_method_syncengine_semantic_search(`ptr`: Pointer,`query`: RustBuffer.ByValue,`limit`: Int,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_syncengine_set_access_token(`ptr`: Pointer,`jwt`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
+    fun uniffi_braird_core_fn_method_syncengine_similar_notes(`ptr`: Pointer,`noteId`: RustBuffer.ByValue,`limit`: Int,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     fun uniffi_braird_core_fn_method_syncengine_soft_delete_signals_for_note(`ptr`: Pointer,`noteId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     fun uniffi_braird_core_fn_method_syncengine_sync(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
@@ -1069,11 +1142,19 @@ internal interface UniffiLib : Library {
     ): Unit
     fun uniffi_braird_core_checksum_func_membership_id(
     ): Short
+    fun uniffi_braird_core_checksum_method_embedder_descriptor(
+    ): Short
+    fun uniffi_braird_core_checksum_method_embedder_embed_document(
+    ): Short
+    fun uniffi_braird_core_checksum_method_embedder_embed_query(
+    ): Short
     fun uniffi_braird_core_checksum_method_syncengine_collection_ids_for_note(
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_collection_note_counts(
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_counts(
+    ): Short
+    fun uniffi_braird_core_checksum_method_syncengine_embed_pending(
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_enqueue_book(
     ): Short
@@ -1125,17 +1206,25 @@ internal interface UniffiLib : Library {
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_notes_this_week(
     ): Short
+    fun uniffi_braird_core_checksum_method_syncengine_pending_embed_count(
+    ): Short
     fun uniffi_braird_core_checksum_method_syncengine_pull(
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_recent_note(
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_record_note_signal(
     ): Short
+    fun uniffi_braird_core_checksum_method_syncengine_register_embedder(
+    ): Short
     fun uniffi_braird_core_checksum_method_syncengine_replace_handwritten_annotations(
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_search(
     ): Short
+    fun uniffi_braird_core_checksum_method_syncengine_semantic_search(
+    ): Short
     fun uniffi_braird_core_checksum_method_syncengine_set_access_token(
+    ): Short
+    fun uniffi_braird_core_checksum_method_syncengine_similar_notes(
     ): Short
     fun uniffi_braird_core_checksum_method_syncengine_soft_delete_signals_for_note(
     ): Short
@@ -1193,6 +1282,15 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_braird_core_checksum_func_membership_id() != 9610.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_braird_core_checksum_method_embedder_descriptor() != 22797.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_braird_core_checksum_method_embedder_embed_document() != 56375.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_braird_core_checksum_method_embedder_embed_query() != 23940.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_braird_core_checksum_method_syncengine_collection_ids_for_note() != 41507.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1200,6 +1298,9 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_counts() != 34830.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_braird_core_checksum_method_syncengine_embed_pending() != 7184.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_enqueue_book() != 62499.toShort()) {
@@ -1277,6 +1378,9 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_braird_core_checksum_method_syncengine_notes_this_week() != 50990.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_braird_core_checksum_method_syncengine_pending_embed_count() != 26076.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_braird_core_checksum_method_syncengine_pull() != 8960.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1286,13 +1390,22 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_braird_core_checksum_method_syncengine_record_note_signal() != 34401.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_braird_core_checksum_method_syncengine_register_embedder() != 9334.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_braird_core_checksum_method_syncengine_replace_handwritten_annotations() != 3703.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_search() != 14411.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_braird_core_checksum_method_syncengine_semantic_search() != 25564.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_braird_core_checksum_method_syncengine_set_access_token() != 47386.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_braird_core_checksum_method_syncengine_similar_notes() != 52094.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_syncengine_soft_delete_signals_for_note() != 38804.toShort()) {
@@ -1328,7 +1441,7 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_braird_core_checksum_method_vault_rewrap() != 61446.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_braird_core_checksum_method_vault_seal_bytes() != 63933.toShort()) {
+    if (lib.uniffi_braird_core_checksum_method_vault_seal_bytes() != 46732.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_braird_core_checksum_method_vault_wrap_with_prf() != 28929.toShort()) {
@@ -1462,6 +1575,29 @@ public object FfiConverterLong: FfiConverter<Long, Long> {
 
     override fun write(value: Long, buf: ByteBuffer) {
         buf.putLong(value)
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterFloat: FfiConverter<Float, Float> {
+    override fun lift(value: Float): Float {
+        return value
+    }
+
+    override fun read(buf: ByteBuffer): Float {
+        return buf.getFloat()
+    }
+
+    override fun lower(value: Float): Float {
+        return value
+    }
+
+    override fun allocationSize(value: Float) = 4UL
+
+    override fun write(value: Float, buf: ByteBuffer) {
+        buf.putFloat(value)
     }
 }
 
@@ -1750,6 +1886,426 @@ private class JavaLangRefCleanable(
     override fun clean() = cleanable.clean()
 }
 /**
+ * The host-registered embedder (SUR-997 item 1): core calls it with **plaintext** and gets
+ * a vector back. Implemented by the host's native runtime (LiteRT on Android, LiteRT/Core
+ * ML on iOS) and registered via `SyncEngine::register_embedder`.
+ *
+ * **Crypto boundary (ADR 0006).** These calls are the one place decrypted note text leaves
+ * core other than the display DTOs. The host must treat the text as it treats displayed
+ * note content: never persist it, never log it, never transmit it. Core never holds a lock
+ * across these calls, and hands over at most one note's plaintext at a time.
+ *
+ * Two embed methods, not one: EmbeddingGemma prompts documents and queries differently,
+ * and the templates live with the runtime that owns the tokenizer (see
+ * [`EmbedderDescriptor`]'s template contract). Both take exactly one argument — see the
+ * module's arm64 caution.
+ */
+public interface Embedder {
+    
+    /**
+     * The embedder's identity. Called once at registration; must be constant for the
+     * lifetime of the registration and must never throw.
+     */
+    fun `descriptor`(): EmbedderDescriptor
+    
+    /**
+     * Embed one note's plaintext for storage (the document prompt template). Must return
+     * exactly `descriptor().dims` values; the output need not be pre-normalized (core
+     * normalizes defensively).
+     */
+    fun `embedDocument`(`text`: kotlin.String): List<kotlin.Float>
+    
+    /**
+     * Embed a search query (the query prompt template). Same length contract.
+     */
+    fun `embedQuery`(`text`: kotlin.String): List<kotlin.Float>
+    
+    companion object
+}
+
+/**
+ * The host-registered embedder (SUR-997 item 1): core calls it with **plaintext** and gets
+ * a vector back. Implemented by the host's native runtime (LiteRT on Android, LiteRT/Core
+ * ML on iOS) and registered via `SyncEngine::register_embedder`.
+ *
+ * **Crypto boundary (ADR 0006).** These calls are the one place decrypted note text leaves
+ * core other than the display DTOs. The host must treat the text as it treats displayed
+ * note content: never persist it, never log it, never transmit it. Core never holds a lock
+ * across these calls, and hands over at most one note's plaintext at a time.
+ *
+ * Two embed methods, not one: EmbeddingGemma prompts documents and queries differently,
+ * and the templates live with the runtime that owns the tokenizer (see
+ * [`EmbedderDescriptor`]'s template contract). Both take exactly one argument — see the
+ * module's arm64 caution.
+ */
+open class EmbedderImpl: Disposable, AutoCloseable, Embedder {
+
+    constructor(pointer: Pointer) {
+        this.pointer = pointer
+        this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(pointer))
+    }
+
+    /**
+     * This constructor can be used to instantiate a fake object. Only used for tests. Any
+     * attempt to actually use an object constructed this way will fail as there is no
+     * connected Rust object.
+     */
+    @Suppress("UNUSED_PARAMETER")
+    constructor(noPointer: NoPointer) {
+        this.pointer = null
+        this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(pointer))
+    }
+
+    protected val pointer: Pointer?
+    protected val cleanable: UniffiCleaner.Cleanable
+
+    private val wasDestroyed = AtomicBoolean(false)
+    private val callCounter = AtomicLong(1)
+
+    override fun destroy() {
+        // Only allow a single call to this method.
+        // TODO: maybe we should log a warning if called more than once?
+        if (this.wasDestroyed.compareAndSet(false, true)) {
+            // This decrement always matches the initial count of 1 given at creation time.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable.clean()
+            }
+        }
+    }
+
+    @Synchronized
+    override fun close() {
+        this.destroy()
+    }
+
+    internal inline fun <R> callWithPointer(block: (ptr: Pointer) -> R): R {
+        // Check and increment the call counter, to keep the object alive.
+        // This needs a compare-and-set retry loop in case of concurrent updates.
+        do {
+            val c = this.callCounter.get()
+            if (c == 0L) {
+                throw IllegalStateException("${this.javaClass.simpleName} object has already been destroyed")
+            }
+            if (c == Long.MAX_VALUE) {
+                throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
+            }
+        } while (! this.callCounter.compareAndSet(c, c + 1L))
+        // Now we can safely do the method call without the pointer being freed concurrently.
+        try {
+            return block(this.uniffiClonePointer())
+        } finally {
+            // This decrement always matches the increment we performed above.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable.clean()
+            }
+        }
+    }
+
+    // Use a static inner class instead of a closure so as not to accidentally
+    // capture `this` as part of the cleanable's action.
+    private class UniffiCleanAction(private val pointer: Pointer?) : Runnable {
+        override fun run() {
+            pointer?.let { ptr ->
+                uniffiRustCall { status ->
+                    UniffiLib.INSTANCE.uniffi_braird_core_fn_free_embedder(ptr, status)
+                }
+            }
+        }
+    }
+
+    fun uniffiClonePointer(): Pointer {
+        return uniffiRustCall() { status ->
+            UniffiLib.INSTANCE.uniffi_braird_core_fn_clone_embedder(pointer!!, status)
+        }
+    }
+
+    
+    /**
+     * The embedder's identity. Called once at registration; must be constant for the
+     * lifetime of the registration and must never throw.
+     */override fun `descriptor`(): EmbedderDescriptor {
+            return FfiConverterTypeEmbedderDescriptor.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_braird_core_fn_method_embedder_descriptor(
+        it, _status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * Embed one note's plaintext for storage (the document prompt template). Must return
+     * exactly `descriptor().dims` values; the output need not be pre-normalized (core
+     * normalizes defensively).
+     */
+    @Throws(EmbedderException::class)override fun `embedDocument`(`text`: kotlin.String): List<kotlin.Float> {
+            return FfiConverterSequenceFloat.lift(
+    callWithPointer {
+    uniffiRustCallWithError(EmbedderException) { _status ->
+    UniffiLib.INSTANCE.uniffi_braird_core_fn_method_embedder_embed_document(
+        it, FfiConverterString.lower(`text`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * Embed a search query (the query prompt template). Same length contract.
+     */
+    @Throws(EmbedderException::class)override fun `embedQuery`(`text`: kotlin.String): List<kotlin.Float> {
+            return FfiConverterSequenceFloat.lift(
+    callWithPointer {
+    uniffiRustCallWithError(EmbedderException) { _status ->
+    UniffiLib.INSTANCE.uniffi_braird_core_fn_method_embedder_embed_query(
+        it, FfiConverterString.lower(`text`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+
+    
+    
+    companion object
+    
+}
+// Magic number for the Rust proxy to call using the same mechanism as every other method,
+// to free the callback once it's dropped by Rust.
+internal const val IDX_CALLBACK_FREE = 0
+// Callback return codes
+internal const val UNIFFI_CALLBACK_SUCCESS = 0
+internal const val UNIFFI_CALLBACK_ERROR = 1
+internal const val UNIFFI_CALLBACK_UNEXPECTED_ERROR = 2
+
+/**
+ * @suppress
+ */
+public abstract class FfiConverterCallbackInterface<CallbackInterface: Any>: FfiConverter<CallbackInterface, Long> {
+    internal val handleMap = UniffiHandleMap<CallbackInterface>()
+
+    internal fun drop(handle: Long) {
+        handleMap.remove(handle)
+    }
+
+    override fun lift(value: Long): CallbackInterface {
+        return handleMap.get(value)
+    }
+
+    override fun read(buf: ByteBuffer) = lift(buf.getLong())
+
+    override fun lower(value: CallbackInterface) = handleMap.insert(value)
+
+    override fun allocationSize(value: CallbackInterface) = 8UL
+
+    override fun write(value: CallbackInterface, buf: ByteBuffer) {
+        buf.putLong(lower(value))
+    }
+}
+
+// Put the implementation in an object so we don't pollute the top-level namespace
+internal object uniffiCallbackInterfaceEmbedder {
+    internal object `descriptor`: UniffiCallbackInterfaceEmbedderMethod0 {
+        override fun callback(`uniffiHandle`: Long,`uniffiOutReturn`: RustBuffer,uniffiCallStatus: UniffiRustCallStatus,) {
+            val uniffiObj = FfiConverterTypeEmbedder.handleMap.get(uniffiHandle)
+            val makeCall = { ->
+                uniffiObj.`descriptor`(
+                )
+            }
+            val writeReturn = { value: EmbedderDescriptor -> uniffiOutReturn.setValue(FfiConverterTypeEmbedderDescriptor.lower(value)) }
+            uniffiTraitInterfaceCall(uniffiCallStatus, makeCall, writeReturn)
+        }
+    }
+    internal object `embedDocument`: UniffiCallbackInterfaceEmbedderMethod1 {
+        override fun callback(`uniffiHandle`: Long,`text`: RustBuffer.ByValue,`uniffiOutReturn`: RustBuffer,uniffiCallStatus: UniffiRustCallStatus,) {
+            val uniffiObj = FfiConverterTypeEmbedder.handleMap.get(uniffiHandle)
+            val makeCall = { ->
+                uniffiObj.`embedDocument`(
+                    FfiConverterString.lift(`text`),
+                )
+            }
+            val writeReturn = { value: List<kotlin.Float> -> uniffiOutReturn.setValue(FfiConverterSequenceFloat.lower(value)) }
+            uniffiTraitInterfaceCallWithError(
+                uniffiCallStatus,
+                makeCall,
+                writeReturn,
+                { e: EmbedderException -> FfiConverterTypeEmbedderError.lower(e) }
+            )
+        }
+    }
+    internal object `embedQuery`: UniffiCallbackInterfaceEmbedderMethod2 {
+        override fun callback(`uniffiHandle`: Long,`text`: RustBuffer.ByValue,`uniffiOutReturn`: RustBuffer,uniffiCallStatus: UniffiRustCallStatus,) {
+            val uniffiObj = FfiConverterTypeEmbedder.handleMap.get(uniffiHandle)
+            val makeCall = { ->
+                uniffiObj.`embedQuery`(
+                    FfiConverterString.lift(`text`),
+                )
+            }
+            val writeReturn = { value: List<kotlin.Float> -> uniffiOutReturn.setValue(FfiConverterSequenceFloat.lower(value)) }
+            uniffiTraitInterfaceCallWithError(
+                uniffiCallStatus,
+                makeCall,
+                writeReturn,
+                { e: EmbedderException -> FfiConverterTypeEmbedderError.lower(e) }
+            )
+        }
+    }
+
+    internal object uniffiFree: UniffiCallbackInterfaceFree {
+        override fun callback(handle: Long) {
+            FfiConverterTypeEmbedder.handleMap.remove(handle)
+        }
+    }
+
+    internal var vtable = UniffiVTableCallbackInterfaceEmbedder.UniffiByValue(
+        `descriptor`,
+        `embedDocument`,
+        `embedQuery`,
+        uniffiFree,
+    )
+
+    // Registers the foreign callback with the Rust side.
+    // This method is generated for each callback interface.
+    internal fun register(lib: UniffiLib) {
+        lib.uniffi_braird_core_fn_init_callback_vtable_embedder(vtable)
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeEmbedder: FfiConverter<Embedder, Pointer> {
+    internal val handleMap = UniffiHandleMap<Embedder>()
+
+    override fun lower(value: Embedder): Pointer {
+        return Pointer(handleMap.insert(value))
+    }
+
+    override fun lift(value: Pointer): Embedder {
+        return EmbedderImpl(value)
+    }
+
+    override fun read(buf: ByteBuffer): Embedder {
+        // The Rust code always writes pointers as 8 bytes, and will
+        // fail to compile if they don't fit.
+        return lift(Pointer(buf.getLong()))
+    }
+
+    override fun allocationSize(value: Embedder) = 8UL
+
+    override fun write(value: Embedder, buf: ByteBuffer) {
+        // The Rust code always expects pointers written as 8 bytes,
+        // and will fail to compile if they don't fit.
+        buf.putLong(Pointer.nativeValue(lower(value)))
+    }
+}
+
+
+// This template implements a class for working with a Rust struct via a Pointer/Arc<T>
+// to the live Rust struct on the other side of the FFI.
+//
+// Each instance implements core operations for working with the Rust `Arc<T>` and the
+// Kotlin Pointer to work with the live Rust struct on the other side of the FFI.
+//
+// There's some subtlety here, because we have to be careful not to operate on a Rust
+// struct after it has been dropped, and because we must expose a public API for freeing
+// theq Kotlin wrapper object in lieu of reliable finalizers. The core requirements are:
+//
+//   * Each instance holds an opaque pointer to the underlying Rust struct.
+//     Method calls need to read this pointer from the object's state and pass it in to
+//     the Rust FFI.
+//
+//   * When an instance is no longer needed, its pointer should be passed to a
+//     special destructor function provided by the Rust FFI, which will drop the
+//     underlying Rust struct.
+//
+//   * Given an instance, calling code is expected to call the special
+//     `destroy` method in order to free it after use, either by calling it explicitly
+//     or by using a higher-level helper like the `use` method. Failing to do so risks
+//     leaking the underlying Rust struct.
+//
+//   * We can't assume that calling code will do the right thing, and must be prepared
+//     to handle Kotlin method calls executing concurrently with or even after a call to
+//     `destroy`, and to handle multiple (possibly concurrent!) calls to `destroy`.
+//
+//   * We must never allow Rust code to operate on the underlying Rust struct after
+//     the destructor has been called, and must never call the destructor more than once.
+//     Doing so may trigger memory unsafety.
+//
+//   * To mitigate many of the risks of leaking memory and use-after-free unsafety, a `Cleaner`
+//     is implemented to call the destructor when the Kotlin object becomes unreachable.
+//     This is done in a background thread. This is not a panacea, and client code should be aware that
+//      1. the thread may starve if some there are objects that have poorly performing
+//     `drop` methods or do significant work in their `drop` methods.
+//      2. the thread is shared across the whole library. This can be tuned by using `android_cleaner = true`,
+//         or `android = true` in the [`kotlin` section of the `uniffi.toml` file](https://mozilla.github.io/uniffi-rs/kotlin/configuration.html).
+//
+// If we try to implement this with mutual exclusion on access to the pointer, there is the
+// possibility of a race between a method call and a concurrent call to `destroy`:
+//
+//    * Thread A starts a method call, reads the value of the pointer, but is interrupted
+//      before it can pass the pointer over the FFI to Rust.
+//    * Thread B calls `destroy` and frees the underlying Rust struct.
+//    * Thread A resumes, passing the already-read pointer value to Rust and triggering
+//      a use-after-free.
+//
+// One possible solution would be to use a `ReadWriteLock`, with each method call taking
+// a read lock (and thus allowed to run concurrently) and the special `destroy` method
+// taking a write lock (and thus blocking on live method calls). However, we aim not to
+// generate methods with any hidden blocking semantics, and a `destroy` method that might
+// block if called incorrectly seems to meet that bar.
+//
+// So, we achieve our goals by giving each instance an associated `AtomicLong` counter to track
+// the number of in-flight method calls, and an `AtomicBoolean` flag to indicate whether `destroy`
+// has been called. These are updated according to the following rules:
+//
+//    * The initial value of the counter is 1, indicating a live object with no in-flight calls.
+//      The initial value for the flag is false.
+//
+//    * At the start of each method call, we atomically check the counter.
+//      If it is 0 then the underlying Rust struct has already been destroyed and the call is aborted.
+//      If it is nonzero them we atomically increment it by 1 and proceed with the method call.
+//
+//    * At the end of each method call, we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+//    * When `destroy` is called, we atomically flip the flag from false to true.
+//      If the flag was already true we silently fail.
+//      Otherwise we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+// Astute readers may observe that this all sounds very similar to the way that Rust's `Arc<T>` works,
+// and indeed it is, with the addition of a flag to guard against multiple calls to `destroy`.
+//
+// The overall effect is that the underlying Rust struct is destroyed only when `destroy` has been
+// called *and* all in-flight method calls have completed, avoiding violating any of the expectations
+// of the underlying Rust code.
+//
+// This makes a cleaner a better alternative to _not_ calling `destroy()` as
+// and when the object is finished with, but the abstraction is not perfect: if the Rust object's `drop`
+// method is slow, and/or there are many objects to cleanup, and it's on a low end Android device, then the cleaner
+// thread may be starved, and the app will leak memory.
+//
+// In this case, `destroy`ing manually may be a better solution.
+//
+// The cleaner can live side by side with the manual calling of `destroy`. In the order of responsiveness, uniffi objects
+// with Rust peers are reclaimed:
+//
+// 1. By calling the `destroy` method of the object, which calls `rustObject.free()`. If that doesn't happen:
+// 2. When the object becomes unreachable, AND the Cleaner thread gets to call `rustObject.free()`. If the thread is starved then:
+// 3. The memory is reclaimed when the process terminates.
+//
+// [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
+//
+
+
+/**
  * The on-device sync engine. Owns the SQLite [`Store`], the [`PostgrestClient`], the crypto
  * [`Vault`] (for seal-at-write), and a tokio current-thread runtime. `Arc<SyncEngine>` is the
  * UniFFI handle; the interior `Mutex`es make it `Send + Sync` for Swift/Kotlin callers on any
@@ -1777,6 +2333,25 @@ public interface SyncEngineInterface {
      * count of distinct idea tags on live notes (the Home stat row, SUR-806).
      */
     fun `counts`(): StoreCounts
+    
+    /**
+     * Drain up to `max_items` of the derived embed queue (SUR-997 item 5): per note —
+     * read + decrypt in core, hand the PLAINTEXT to the host embedder (the one place note
+     * text leaves core other than display DTOs; no lock held across the call), validate
+     * length + normalize, seal with the vault key (AAD = `emb:{note id}`, domain-separated
+     * from enc:v2), and store — via a write-if-current store check, so a note edited or
+     * deleted during the ~0.8 s embed re-queues instead of storing a stale vector.
+     *
+     * Hosts own the schedule (WorkManager / BGProcessingTask): call in chunks, stop
+     * between calls. One failed embed never halts the pass (counted `failed`, still
+     * queued); [`EmbedderError::Unavailable`] aborts the whole pass. A note with empty text
+     * or undecryptable ciphertext writes a NULL-vector skip marker (mirrors ADR 0005
+     * dropping decrypt failures from the lexical index) so the queue actually drains; its
+     * next edit re-queues it. Orphan vectors are swept once per pass. Re-registering a
+     * different embedder mid-pass is benign: a stale-key row written by the old pass is
+     * invisible to the scan and re-embedded via the derived queue.
+     */
+    fun `embedPending`(`maxItems`: kotlin.UInt): EmbedSummary
     
     /**
      * Enqueue a book upsert. `updated_at` is stamped in epoch ms at enqueue (never omitted —
@@ -2017,6 +2592,13 @@ public interface SyncEngineInterface {
     fun `notesThisWeek`(`nowMs`: kotlin.Long): kotlin.UInt
     
     /**
+     * The derived embed queue's current size — the host's durable rebuild/progress signal
+     * (survives a process restart, unlike [`RegisterEmbedderSummary::corpus_changed`]; drive
+     * any persistent "search index is rebuilding" UI off this). Zero = corpus current.
+     */
+    fun `pendingEmbedCount`(): kotlin.UInt
+    
+    /**
      * Pull incrementally from Supabase for **all eight synced tables** (SUR-726 —
      * [`synced_table_names`] is the one source of the pull scope). Merges last-write-wins by
      * `updated_at`, applies tombstones without resurrecting soft-deleted rows, **rebases the outbox**
@@ -2073,6 +2655,21 @@ public interface SyncEngineInterface {
      * wrong prior forever.
      */
     fun `recordNoteSignal`(`noteId`: kotlin.String, `kind`: NoteSignalKind): kotlin.Boolean
+    
+    /**
+     * Register the host's embedder (SUR-997 item 1) and reconcile the corpus to its
+     * identity: vectors keyed to a DIFFERENT corpus key are hard-deleted here (their notes
+     * re-enter the derived queue), which is the whole model-upgrade path — the rebuild is
+     * progressive, not a blackout, because the scan filters on the current key and
+     * re-embedded notes return immediately.
+     *
+     * Core refuses a mismatched embedder in three concrete ways rather than a model
+     * allowlist: the descriptor is validated here (non-empty `|`-free identity, dims
+     * 1..=4096); every embed's returned length is checked against the declared dims; and a
+     * corpus-key change invalidates + re-queues. See [`RegisterEmbedderSummary`] for which
+     * returned signal drives which notification UI.
+     */
+    fun `registerEmbedder`(`embedder`: Embedder): RegisterEmbedderSummary
     
     /**
      * Atomically replace a note's handwritten margins (SUR-952, the SUR-928 "Add the margins"
@@ -2158,10 +2755,30 @@ public interface SyncEngineInterface {
     fun `search`(`query`: kotlin.String, `limit`: kotlin.UInt): List<SearchHit>
     
     /**
+     * Semantic search (SUR-997 item 4 → SUR-157): embed the query via the host embedder
+     * (its query prompt template), then brute-force cosine top-k over the sealed live
+     * corpus, decrypting vectors only in core. Mid-rebuild this returns the already
+     * re-embedded notes — partial, not empty ([`SyncEngine::pending_embed_count`] reports
+     * the gap). Empty/whitespace queries return `[]` without an embed (the lexical
+     * engine's "no search-everything surprise", and a query embed costs ~0.8 s on CPU).
+     */
+    fun `semanticSearch`(`query`: kotlin.String, `limit`: kotlin.UInt): List<SemanticHit>
+    
+    /**
      * Hand the core a GoTrue-issued access token (JWT). The core makes its OWN authenticated
      * PostgREST calls with it; the `user_id` stamped on each row is the token's `sub` claim.
      */
     fun `setAccessToken`(`jwt`: kotlin.String)
+    
+    /**
+     * Notes semantically nearest to `note_id` (SUR-997 item 4 → SUR-647/SUR-996's
+     * embedding upgrades), probing with its STORED vector — no embed call, so this is
+     * cheap. The probe note is excluded from its own results. `[]` when the note has no
+     * current-key vector yet (not embedded, skip marker, or stale key) — indistinguishable
+     * here from "no neighbours", by design: the host's rebuild signal is
+     * [`SyncEngine::pending_embed_count`], not this.
+     */
+    fun `similarNotes`(`noteId`: kotlin.String, `limit`: kotlin.UInt): List<SemanticHit>
     
     /**
      * Tombstone a note's `note_signals` row on note delete (SUR-966), mirroring the surfc oracle.
@@ -2361,6 +2978,36 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
     uniffiRustCallWithError(SyncException) { _status ->
     UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_counts(
         it, _status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * Drain up to `max_items` of the derived embed queue (SUR-997 item 5): per note —
+     * read + decrypt in core, hand the PLAINTEXT to the host embedder (the one place note
+     * text leaves core other than display DTOs; no lock held across the call), validate
+     * length + normalize, seal with the vault key (AAD = `emb:{note id}`, domain-separated
+     * from enc:v2), and store — via a write-if-current store check, so a note edited or
+     * deleted during the ~0.8 s embed re-queues instead of storing a stale vector.
+     *
+     * Hosts own the schedule (WorkManager / BGProcessingTask): call in chunks, stop
+     * between calls. One failed embed never halts the pass (counted `failed`, still
+     * queued); [`EmbedderError::Unavailable`] aborts the whole pass. A note with empty text
+     * or undecryptable ciphertext writes a NULL-vector skip marker (mirrors ADR 0005
+     * dropping decrypt failures from the lexical index) so the queue actually drains; its
+     * next edit re-queues it. Orphan vectors are swept once per pass. Re-registering a
+     * different embedder mid-pass is benign: a stale-key row written by the old pass is
+     * invisible to the scan and re-embedded via the derived queue.
+     */
+    @Throws(SyncException::class)override fun `embedPending`(`maxItems`: kotlin.UInt): EmbedSummary {
+            return FfiConverterTypeEmbedSummary.lift(
+    callWithPointer {
+    uniffiRustCallWithError(SyncException) { _status ->
+    UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_embed_pending(
+        it, FfiConverterUInt.lower(`maxItems`),_status)
 }
     }
     )
@@ -2874,6 +3521,24 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
 
     
     /**
+     * The derived embed queue's current size — the host's durable rebuild/progress signal
+     * (survives a process restart, unlike [`RegisterEmbedderSummary::corpus_changed`]; drive
+     * any persistent "search index is rebuilding" UI off this). Zero = corpus current.
+     */
+    @Throws(SyncException::class)override fun `pendingEmbedCount`(): kotlin.UInt {
+            return FfiConverterUInt.lift(
+    callWithPointer {
+    uniffiRustCallWithError(SyncException) { _status ->
+    UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_pending_embed_count(
+        it, _status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
      * Pull incrementally from Supabase for **all eight synced tables** (SUR-726 —
      * [`synced_table_names`] is the one source of the pull scope). Merges last-write-wins by
      * `updated_at`, applies tombstones without resurrecting soft-deleted rows, **rebases the outbox**
@@ -2957,6 +3622,32 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
     uniffiRustCallWithError(SyncException) { _status ->
     UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_record_note_signal(
         it, FfiConverterString.lower(`noteId`),FfiConverterTypeNoteSignalKind.lower(`kind`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * Register the host's embedder (SUR-997 item 1) and reconcile the corpus to its
+     * identity: vectors keyed to a DIFFERENT corpus key are hard-deleted here (their notes
+     * re-enter the derived queue), which is the whole model-upgrade path — the rebuild is
+     * progressive, not a blackout, because the scan filters on the current key and
+     * re-embedded notes return immediately.
+     *
+     * Core refuses a mismatched embedder in three concrete ways rather than a model
+     * allowlist: the descriptor is validated here (non-empty `|`-free identity, dims
+     * 1..=4096); every embed's returned length is checked against the declared dims; and a
+     * corpus-key change invalidates + re-queues. See [`RegisterEmbedderSummary`] for which
+     * returned signal drives which notification UI.
+     */
+    @Throws(SyncException::class)override fun `registerEmbedder`(`embedder`: Embedder): RegisterEmbedderSummary {
+            return FfiConverterTypeRegisterEmbedderSummary.lift(
+    callWithPointer {
+    uniffiRustCallWithError(SyncException) { _status ->
+    UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_register_embedder(
+        it, FfiConverterTypeEmbedder.lower(`embedder`),_status)
 }
     }
     )
@@ -3070,6 +3761,27 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
 
     
     /**
+     * Semantic search (SUR-997 item 4 → SUR-157): embed the query via the host embedder
+     * (its query prompt template), then brute-force cosine top-k over the sealed live
+     * corpus, decrypting vectors only in core. Mid-rebuild this returns the already
+     * re-embedded notes — partial, not empty ([`SyncEngine::pending_embed_count`] reports
+     * the gap). Empty/whitespace queries return `[]` without an embed (the lexical
+     * engine's "no search-everything surprise", and a query embed costs ~0.8 s on CPU).
+     */
+    @Throws(SyncException::class)override fun `semanticSearch`(`query`: kotlin.String, `limit`: kotlin.UInt): List<SemanticHit> {
+            return FfiConverterSequenceTypeSemanticHit.lift(
+    callWithPointer {
+    uniffiRustCallWithError(SyncException) { _status ->
+    UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_semantic_search(
+        it, FfiConverterString.lower(`query`),FfiConverterUInt.lower(`limit`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
      * Hand the core a GoTrue-issued access token (JWT). The core makes its OWN authenticated
      * PostgREST calls with it; the `user_id` stamped on each row is the token's `sub` claim.
      */override fun `setAccessToken`(`jwt`: kotlin.String)
@@ -3081,6 +3793,27 @@ open class SyncEngine: Disposable, AutoCloseable, SyncEngineInterface {
 }
     }
     
+    
+
+    
+    /**
+     * Notes semantically nearest to `note_id` (SUR-997 item 4 → SUR-647/SUR-996's
+     * embedding upgrades), probing with its STORED vector — no embed call, so this is
+     * cheap. The probe note is excluded from its own results. `[]` when the note has no
+     * current-key vector yet (not embedded, skip marker, or stale key) — indistinguishable
+     * here from "no neighbours", by design: the host's rebuild signal is
+     * [`SyncEngine::pending_embed_count`], not this.
+     */
+    @Throws(SyncException::class)override fun `similarNotes`(`noteId`: kotlin.String, `limit`: kotlin.UInt): List<SemanticHit> {
+            return FfiConverterSequenceTypeSemanticHit.lift(
+    callWithPointer {
+    uniffiRustCallWithError(SyncException) { _status ->
+    UniffiLib.INSTANCE.uniffi_braird_core_fn_method_syncengine_similar_notes(
+        it, FfiConverterString.lower(`noteId`),FfiConverterUInt.lower(`limit`),_status)
+}
+    }
+    )
+    }
     
 
     
@@ -3385,7 +4118,8 @@ public interface VaultInterface {
     
     /**
      * Seal arbitrary bytes (e.g. an embedding vector) at rest: `[0x02][IV][ct]`,
-     * AAD = noteId. Fresh random IV per call.
+     * AAD = the caller's context string (the embedding pipeline passes `emb:{noteId}`,
+     * domain-separated from enc:v2's bare-noteId AAD). Fresh random IV per call.
      */
     fun `sealBytes`(`bytes`: kotlin.ByteArray, `aad`: kotlin.String): kotlin.ByteArray
     
@@ -3576,7 +4310,8 @@ open class Vault: Disposable, AutoCloseable, VaultInterface {
     
     /**
      * Seal arbitrary bytes (e.g. an embedding vector) at rest: `[0x02][IV][ct]`,
-     * AAD = noteId. Fresh random IV per call.
+     * AAD = the caller's context string (the embedding pipeline passes `emb:{noteId}`,
+     * domain-separated from enc:v2's bare-noteId AAD). Fresh random IV per call.
      */override fun `sealBytes`(`bytes`: kotlin.ByteArray, `aad`: kotlin.String): kotlin.ByteArray {
             return FfiConverterByteArray.lift(
     callWithPointer {
@@ -4034,6 +4769,130 @@ public object FfiConverterTypeCustomIdeaRecord: FfiConverterRustBuffer<CustomIde
             FfiConverterOptionalString.write(value.`description`, buf)
             FfiConverterLong.write(value.`createdAt`, buf)
             FfiConverterLong.write(value.`updatedAt`, buf)
+    }
+}
+
+
+
+/**
+ * What one `embed_pending` pass did. `attempted = embedded + skipped + failed`;
+ * `pending` is the derived queue size after the pass — the host's durable
+ * rebuild/progress signal (it survives a process restart, unlike a registration-time
+ * flag), and the right driver for any "search index is rebuilding" UI. One word for the
+ * queue size everywhere: this field, `RegisterEmbedderSummary::pending`, and
+ * `pending_embed_count` all name the same number.
+ */
+data class EmbedSummary (
+    /**
+     * Queue items this pass processed (capped by `max_items`).
+     */
+    var `attempted`: kotlin.UInt, 
+    /**
+     * Vectors embedded, sealed, and stored.
+     */
+    var `embedded`: kotlin.UInt, 
+    /**
+     * Notes that produced a skip marker (empty text, decrypt failure) or whose text moved
+     * mid-embed (they re-queue with the new token).
+     */
+    var `skipped`: kotlin.UInt, 
+    /**
+     * Embeds that failed (host error, wrong dimension, non-finite output). Still queued.
+     */
+    var `failed`: kotlin.UInt, 
+    /**
+     * The derived queue size after this pass.
+     */
+    var `pending`: kotlin.UInt
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeEmbedSummary: FfiConverterRustBuffer<EmbedSummary> {
+    override fun read(buf: ByteBuffer): EmbedSummary {
+        return EmbedSummary(
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: EmbedSummary) = (
+            FfiConverterUInt.allocationSize(value.`attempted`) +
+            FfiConverterUInt.allocationSize(value.`embedded`) +
+            FfiConverterUInt.allocationSize(value.`skipped`) +
+            FfiConverterUInt.allocationSize(value.`failed`) +
+            FfiConverterUInt.allocationSize(value.`pending`)
+    )
+
+    override fun write(value: EmbedSummary, buf: ByteBuffer) {
+            FfiConverterUInt.write(value.`attempted`, buf)
+            FfiConverterUInt.write(value.`embedded`, buf)
+            FfiConverterUInt.write(value.`skipped`, buf)
+            FfiConverterUInt.write(value.`failed`, buf)
+            FfiConverterUInt.write(value.`pending`, buf)
+    }
+}
+
+
+
+/**
+ * The identity of a host embedder — everything the vector space depends on. Carried in
+ * the corpus key, so ANY change re-keys the corpus and re-queues every note.
+ *
+ * **Prompt-template contract (documented, not enforced):** EmbeddingGemma's query/document
+ * prompt templates and tokenization (BOS(2) + prompt + EOS(1), seq-fixed single-input
+ * exports) are part of the vector space too, but only the host can see them. A host that
+ * changes its template, tokenizer, or sequence length MUST change its declared `model_id`
+ * — silently keeping it produces a mixed-space corpus core cannot detect.
+ */
+data class EmbedderDescriptor (
+    /**
+     * The model identity, e.g. `"embeddinggemma-300m-seq512-mixed"`. Must be non-empty and
+     * `|`-free (it is a corpus-key segment).
+     */
+    var `modelId`: kotlin.String, 
+    /**
+     * Output dimensionality after any Matryoshka truncation (the SUR-529 target is 256).
+     */
+    var `dims`: kotlin.UInt, 
+    /**
+     * The quantization variant of the model artifact (e.g. `"q8-mixed"`). `|`-free.
+     */
+    var `quantization`: kotlin.String
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeEmbedderDescriptor: FfiConverterRustBuffer<EmbedderDescriptor> {
+    override fun read(buf: ByteBuffer): EmbedderDescriptor {
+        return EmbedderDescriptor(
+            FfiConverterString.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterString.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: EmbedderDescriptor) = (
+            FfiConverterString.allocationSize(value.`modelId`) +
+            FfiConverterUInt.allocationSize(value.`dims`) +
+            FfiConverterString.allocationSize(value.`quantization`)
+    )
+
+    override fun write(value: EmbedderDescriptor, buf: ByteBuffer) {
+            FfiConverterString.write(value.`modelId`, buf)
+            FfiConverterUInt.write(value.`dims`, buf)
+            FfiConverterString.write(value.`quantization`, buf)
     }
 }
 
@@ -4718,6 +5577,59 @@ public object FfiConverterTypeReconcileSummary: FfiConverterRustBuffer<Reconcile
 
 
 /**
+ * What registering an embedder did. `corpus_changed`/`invalidated` are the *immediate*
+ * "search model updated" signal (a corpus-key change hard-deletes every stale-key vector);
+ * `pending` is the durable one — on a relaunch mid-rebuild the key already matches the
+ * partially-rebuilt corpus, so `corpus_changed` is correctly `false` while `pending` still
+ * reports the remainder. Drive persistent notification UI off the pending count.
+ */
+data class RegisterEmbedderSummary (
+    /**
+     * The registered corpus key differs from (some of) what was stored — stale vectors
+     * were dropped and their notes re-queued.
+     */
+    var `corpusChanged`: kotlin.Boolean, 
+    /**
+     * How many stale-key vectors were dropped.
+     */
+    var `invalidated`: kotlin.UInt, 
+    /**
+     * The derived queue size after registration.
+     */
+    var `pending`: kotlin.UInt
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeRegisterEmbedderSummary: FfiConverterRustBuffer<RegisterEmbedderSummary> {
+    override fun read(buf: ByteBuffer): RegisterEmbedderSummary {
+        return RegisterEmbedderSummary(
+            FfiConverterBoolean.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: RegisterEmbedderSummary) = (
+            FfiConverterBoolean.allocationSize(value.`corpusChanged`) +
+            FfiConverterUInt.allocationSize(value.`invalidated`) +
+            FfiConverterUInt.allocationSize(value.`pending`)
+    )
+
+    override fun write(value: RegisterEmbedderSummary, buf: ByteBuffer) {
+            FfiConverterBoolean.write(value.`corpusChanged`, buf)
+            FfiConverterUInt.write(value.`invalidated`, buf)
+            FfiConverterUInt.write(value.`pending`, buf)
+    }
+}
+
+
+
+/**
  * One search result, shaped like the PWA's `runSearch` output: `refId → ref_id`, `type → kind`,
  * plus `title`/`snippet`/`score`. `snippet` is the content (or the title when the doc has no
  * body), matching `hit.content || hit.title`.
@@ -4760,6 +5672,42 @@ public object FfiConverterTypeSearchHit: FfiConverterRustBuffer<SearchHit> {
             FfiConverterString.write(value.`refId`, buf)
             FfiConverterString.write(value.`title`, buf)
             FfiConverterString.write(value.`snippet`, buf)
+            FfiConverterDouble.write(value.`score`, buf)
+    }
+}
+
+
+
+/**
+ * One semantic-scan result: a live note and its cosine similarity to the probe, in
+ * `[-1, 1]` (vectors are unit-norm, so the dot product IS the cosine). Best-first.
+ */
+data class SemanticHit (
+    var `noteId`: kotlin.String, 
+    var `score`: kotlin.Double
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeSemanticHit: FfiConverterRustBuffer<SemanticHit> {
+    override fun read(buf: ByteBuffer): SemanticHit {
+        return SemanticHit(
+            FfiConverterString.read(buf),
+            FfiConverterDouble.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: SemanticHit) = (
+            FfiConverterString.allocationSize(value.`noteId`) +
+            FfiConverterDouble.allocationSize(value.`score`)
+    )
+
+    override fun write(value: SemanticHit, buf: ByteBuffer) {
+            FfiConverterString.write(value.`noteId`, buf)
             FfiConverterDouble.write(value.`score`, buf)
     }
 }
@@ -5014,6 +5962,90 @@ public object FfiConverterTypeCryptoError : FfiConverterRustBuffer<CryptoExcepti
 
 
 
+
+
+/**
+ * How a host embed call failed — the error the *embedder* throws (`SyncError::Embed` is
+ * its engine-side counterpart, travelling the other direction). Deliberately
+ * **fieldless**: the error crosses foreign→Rust, and a host-authored message must never
+ * transit into core's error strings (the same no-host-content rule as `enqueue_note`'s
+ * `source_meta_json` handling) — the host already knows its own error; it threw it, and
+ * can log it host-side.
+ */
+sealed class EmbedderException: kotlin.Exception() {
+    
+    /**
+     * This embed failed (inference error, transient runtime fault). The pipeline counts it
+     * and moves on to the next note.
+     */
+    class Runtime(
+        ) : EmbedderException() {
+        override val message
+            get() = ""
+    }
+    
+    /**
+     * The runtime cannot serve at all right now (model not downloaded / unloaded / device
+     * constrained). The pipeline aborts the whole pass — the host re-drains later.
+     */
+    class Unavailable(
+        ) : EmbedderException() {
+        override val message
+            get() = ""
+    }
+    
+
+    companion object ErrorHandler : UniffiRustCallStatusErrorHandler<EmbedderException> {
+        override fun lift(error_buf: RustBuffer.ByValue): EmbedderException = FfiConverterTypeEmbedderError.lift(error_buf)
+    }
+
+    
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeEmbedderError : FfiConverterRustBuffer<EmbedderException> {
+    override fun read(buf: ByteBuffer): EmbedderException {
+        
+
+        return when(buf.getInt()) {
+            1 -> EmbedderException.Runtime()
+            2 -> EmbedderException.Unavailable()
+            else -> throw RuntimeException("invalid error enum value, something is very wrong!!")
+        }
+    }
+
+    override fun allocationSize(value: EmbedderException): ULong {
+        return when(value) {
+            is EmbedderException.Runtime -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL
+            )
+            is EmbedderException.Unavailable -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL
+            )
+        }
+    }
+
+    override fun write(value: EmbedderException, buf: ByteBuffer) {
+        when(value) {
+            is EmbedderException.Runtime -> {
+                buf.putInt(1)
+                Unit
+            }
+            is EmbedderException.Unavailable -> {
+                buf.putInt(2)
+                Unit
+            }
+        }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
+    }
+
+}
+
+
+
 /**
  * The kind of behavioural signal a host records for a note (SUR-966), mirroring surfc
  * `applyNoteSignal`. Collection lives HERE (not host-side) because `note_signals` is a
@@ -5147,6 +6179,27 @@ sealed class SyncException: kotlin.Exception() {
             get() = ""
     }
     
+    /**
+     * An embedding method was called before [`SyncEngine::register_embedder`] (SUR-997).
+     */
+    class EmbedderNotRegistered(
+        ) : SyncException() {
+        override val message
+            get() = ""
+    }
+    
+    /**
+     * An embedding operation failed (SUR-997). The message is always core-authored — a
+     * host's own error detail never transits through core ([`EmbedderError`] is fieldless).
+     */
+    class Embed(
+        
+        val v1: kotlin.String
+        ) : SyncException() {
+        override val message
+            get() = "v1=${ v1 }"
+    }
+    
 
     companion object ErrorHandler : UniffiRustCallStatusErrorHandler<SyncException> {
         override fun lift(error_buf: RustBuffer.ByValue): SyncException = FfiConverterTypeSyncError.lift(error_buf)
@@ -5173,6 +6226,10 @@ public object FfiConverterTypeSyncError : FfiConverterRustBuffer<SyncException> 
                 FfiConverterString.read(buf),
                 )
             4 -> SyncException.PatchTargetMissing()
+            5 -> SyncException.EmbedderNotRegistered()
+            6 -> SyncException.Embed(
+                FfiConverterString.read(buf),
+                )
             else -> throw RuntimeException("invalid error enum value, something is very wrong!!")
         }
     }
@@ -5198,6 +6255,15 @@ public object FfiConverterTypeSyncError : FfiConverterRustBuffer<SyncException> 
                 // Add the size for the Int that specifies the variant plus the size needed for all fields
                 4UL
             )
+            is SyncException.EmbedderNotRegistered -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL
+            )
+            is SyncException.Embed -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL
+                + FfiConverterString.allocationSize(value.v1)
+            )
         }
     }
 
@@ -5220,6 +6286,15 @@ public object FfiConverterTypeSyncError : FfiConverterRustBuffer<SyncException> 
             }
             is SyncException.PatchTargetMissing -> {
                 buf.putInt(4)
+                Unit
+            }
+            is SyncException.EmbedderNotRegistered -> {
+                buf.putInt(5)
+                Unit
+            }
+            is SyncException.Embed -> {
+                buf.putInt(6)
+                FfiConverterString.write(value.v1, buf)
                 Unit
             }
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
@@ -5351,6 +6426,34 @@ public object FfiConverterOptionalTypeNoteRecord: FfiConverterRustBuffer<NoteRec
         } else {
             buf.put(1)
             FfiConverterTypeNoteRecord.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceFloat: FfiConverterRustBuffer<List<kotlin.Float>> {
+    override fun read(buf: ByteBuffer): List<kotlin.Float> {
+        val len = buf.getInt()
+        return List<kotlin.Float>(len) {
+            FfiConverterFloat.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<kotlin.Float>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterFloat.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<kotlin.Float>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterFloat.write(it, buf)
         }
     }
 }
@@ -5687,6 +6790,34 @@ public object FfiConverterSequenceTypeSearchHit: FfiConverterRustBuffer<List<Sea
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterTypeSearchHit.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeSemanticHit: FfiConverterRustBuffer<List<SemanticHit>> {
+    override fun read(buf: ByteBuffer): List<SemanticHit> {
+        val len = buf.getInt()
+        return List<SemanticHit>(len) {
+            FfiConverterTypeSemanticHit.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<SemanticHit>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeSemanticHit.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<SemanticHit>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeSemanticHit.write(it, buf)
         }
     }
 }

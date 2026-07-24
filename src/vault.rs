@@ -126,7 +126,8 @@ impl Vault {
     }
 
     /// Seal arbitrary bytes (e.g. an embedding vector) at rest: `[0x02][IV][ct]`,
-    /// AAD = noteId. Fresh random IV per call.
+    /// AAD = the caller's context string (the embedding pipeline passes `emb:{noteId}`,
+    /// domain-separated from enc:v2's bare-noteId AAD). Fresh random IV per call.
     pub fn seal_bytes(&self, bytes: Vec<u8>, aad: String) -> Vec<u8> {
         let mut iv = [0u8; 12];
         fill_random(&mut iv);

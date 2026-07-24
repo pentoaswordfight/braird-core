@@ -1,4 +1,6 @@
-//! Embedding-vector seal (SUR-527): `[0x02][12B IV][AES-GCM ct]`, AAD = noteId.
+//! Embedding-vector seal (SUR-527): `[0x02][12B IV][AES-GCM ct]`, AAD = the caller's
+//! context string (SUR-997's pipeline passes `emb:{noteId}` — domain-separated from
+//! enc:v2's bare-noteId AAD under the shared MK; see `embeddings::embed_aad`).
 //! Device-local at-rest protection — the `embeddings` store never syncs, so this is
 //! not a cross-client parity surface, but it shares the MK and AES-GCM/AAD machinery.
 

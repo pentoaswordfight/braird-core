@@ -6,6 +6,40 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+### Added
+- **Host-embedder FFI contract, sealed vector store, corpus versioning, and the semantic scan
+  primitive (SUR-997, ADR 0006)** — the platform-neutral core leg of the SUR-529/SUR-986 native
+  embedding lane, and the repo's **first foreign-implemented trait**. Hosts register an
+  `Embedder` (`#[uniffi::export(with_foreign)]`: `descriptor()` + `embed_document`/`embed_query`,
+  one argument each — the SUR-843 arm64 caution applied to the reverse call direction) on the
+  `SyncEngine`; core owns *what* gets embedded and *when*, the host owns the runtime (LiteRT /
+  Core ML). Five new engine methods: `register_embedder` (descriptor validation; a corpus-key
+  change hard-deletes stale vectors and re-queues — the model-upgrade path, reported via
+  `RegisterEmbedderSummary`), `pending_embed_count` (the durable, restart-safe rebuild signal —
+  one word, `pending`, names the derived queue size across the whole surface),
+  `embed_pending(max_items)` (host-scheduled chunked drain → `EmbedSummary`), and the two scan
+  primitives `semantic_search(query, limit)` (SUR-157) and `similar_notes(note_id, limit)`
+  (SUR-647/SUR-996) — brute-force cosine top-k, no ANN (SUR-529: interactive past ~100k docs).
+  Posture (the ADR 0006 headline): vectors are the core's **first persistent
+  derived-from-plaintext artifact** — sealed with the vault key at rest (`0x02` seal,
+  AAD = `emb:{note id}`, domain-separated from enc:v2's bare-note-id AAD under the shared MK,
+  f32-LE inside), opened only in core, device-local by construction (never the outbox, never
+  snapshot export), hard-deleted with their note via a single `apply_row` choke-point hook plus
+  an orphan sweep. The (re)embed queue is **derived, not staged**: one metadata JOIN on
+  `(corpus key, content_tag-or-updated_at token)` — no decrypt to decide staleness, no
+  invalidation hooks in enqueue/pull/reconcile, self-healing after any write path. Empty-text and
+  undecryptable notes write NULL-vector skip markers so the queue drains; an edit moves the token
+  and re-queues. No engine mutex is ever held across a host embed call (reentrancy-pinned).
+  Store side: `embeddings.content_token` column (added via `ensure_columns`, the SUR-1005 ALTER
+  machinery extracted and extended to local-only tables) + the sealed-vector CRUD. New
+  `SyncError::EmbedderNotRegistered` / `SyncError::Embed`; `EmbedderError` is deliberately
+  fieldless on BOTH error lanes — a `From<UnexpectedUniFFICallbackError>` impl degrades an
+  UNDECLARED host exception to `Runtime` instead of panicking core with the host's message
+  (host-authored content never transits core error strings; round-trip-pinned on both bindings).
+  Ships no model asset, no scheduler, no UI — SUR-998/SUR-999 consume via pin bump. Shaped by the
+  four gate personas pre-PR (naming unification, AAD domain separation, the unexpected-error
+  lane, ADR completeness — see ADR 0006 and the amended ADR 0005 §3).
+
 ## [0.12.0] - 2026-07-23
 
 Twenty-second release batch. Minor release: SUR-916 Option 1 part B — core consumes the
