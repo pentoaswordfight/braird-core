@@ -6,6 +6,20 @@ entry under `[Unreleased]` (CI-enforced, dependabot-exempt).
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-07-24
+
+Twenty-third release batch. Minor release: SUR-997 — the semantic-embedding foundation (the
+platform-neutral core leg of the SUR-529/SUR-986 native embedding lane), and **the release
+SUR-998 (Android) / SUR-999 (iOS) pin to**. One feature PR (#72): the repo's first
+foreign-implemented trait (`Embedder`, `with_foreign`), the sealed vector store over the
+long-dormant `embeddings` table, corpus versioning, the derived (re)embed queue, and the two
+scan primitives (`semantic_search` / `similar_notes`). New FFI surface only — no existing
+method changes shape, so current hosts pin-bump with no code changes; hosts adopting
+embeddings implement `Embedder` and drive `register_embedder` → `embed_pending` on their own
+schedulers. Caveat carried on the record (ADR 0006): the Rust→foreign call direction is
+x86-64-CI-blind for the arm64 marshalling class (SUR-770/843, in reverse) — SUR-998's FTL
+device lane is the acceptance test, and a flaw found there ships as a patch release.
+
 ### Added
 - **Host-embedder FFI contract, sealed vector store, corpus versioning, and the semantic scan
   primitive (SUR-997, ADR 0006)** — the platform-neutral core leg of the SUR-529/SUR-986 native
