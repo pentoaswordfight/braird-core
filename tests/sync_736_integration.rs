@@ -162,7 +162,9 @@ fn a_genuinely_newer_local_edit_still_flushes_after_pull() {
         .stage_local_write(
             "books",
             "b1",
-            json!({ "id": "b1", "title": "local-newer", "updated_at": 5000, "deleted": false })
+            // Full insert shape — `created_at` is `not null` with no default, so omitting it would
+            // route this through the sparse-PATCH arm (SUR-1009) rather than the upsert this asserts.
+            json!({ "id": "b1", "title": "local-newer", "created_at": 1, "updated_at": 5000, "deleted": false })
                 .as_object()
                 .unwrap()
                 .clone(),
@@ -256,7 +258,10 @@ fn pull_then_flush_pulls_then_flushes_on_a_clean_pull() {
         .stage_local_write(
             "books",
             "b1",
-            json!({ "id": "b1", "title": "local", "updated_at": 5000, "deleted": false })
+            // `created_at` is `not null` with no default, so a book row without it cannot INSERT
+            // and dispatches as a targeted PATCH instead (SUR-1009). `enqueue_book` always sends
+            // it; a fixture that omits it would exercise the patch arm this test isn't about.
+            json!({ "id": "b1", "title": "local", "created_at": 1, "updated_at": 5000, "deleted": false })
                 .as_object()
                 .unwrap()
                 .clone(),
@@ -295,7 +300,10 @@ fn reconciliation_failure_does_not_abort_an_otherwise_clean_pull_then_flush() {
         .stage_local_write(
             "books",
             "b1",
-            json!({ "id": "b1", "title": "local", "updated_at": 5000, "deleted": false })
+            // `created_at` is `not null` with no default, so a book row without it cannot INSERT
+            // and dispatches as a targeted PATCH instead (SUR-1009). `enqueue_book` always sends
+            // it; a fixture that omits it would exercise the patch arm this test isn't about.
+            json!({ "id": "b1", "title": "local", "created_at": 1, "updated_at": 5000, "deleted": false })
                 .as_object()
                 .unwrap()
                 .clone(),
